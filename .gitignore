@@ -12,6 +12,9 @@ wheels/
 # OS
 .DS_Store
 
+# Secrets
+.env
+
 # Data files (large generated outputs)
 data/
 closed_markets.json

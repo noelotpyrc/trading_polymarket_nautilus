@@ -18,3 +18,6 @@ wheels/
 # Data files (large generated outputs)
 data/
 closed_markets.json
+
+# docs
+docs/vol_signal_spec.md

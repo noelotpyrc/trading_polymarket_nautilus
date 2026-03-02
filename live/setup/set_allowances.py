@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Step 3: Approve Polymarket exchange contracts to spend USDC from your trading wallet.
+Step 3: Approve Polymarket exchange contracts to spend from your trading wallet.
 
-Does two things:
-1. On-chain ERC20 approve() for each exchange contract (requires POL for gas)
-2. Syncs Polymarket's API record of your balance/allowance
+Does three things:
+1. On-chain ERC20 approve() for each exchange contract — allows spending USDC (for BUY orders)
+2. On-chain ERC1155 setApprovalForAll() on the CTF contract — allows transferring outcome tokens (for SELL orders)
+3. Syncs Polymarket's API record of your balance/allowance
 
 Run this once after funding your wallet.
 
@@ -29,7 +30,10 @@ ENV_PATH = Path(__file__).parents[2] / ".env"
 # USDC.e on Polygon
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
-# Polymarket exchange contracts that need USDC approval
+# CTF (Conditional Token Framework) contract — holds ERC1155 outcome tokens
+CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+# Polymarket exchange contracts that need both USDC + CTF approval
 EXCHANGE_CONTRACTS = [
     ("CTF Exchange",          "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"),
     ("Neg Risk CTF Exchange", "0xC5d563A36AE78145C45a50134d48A1215220f80a"),
@@ -57,6 +61,27 @@ ERC20_ABI = [
     },
 ]
 
+ERC1155_ABI = [
+    {
+        "name": "setApprovalForAll",
+        "type": "function",
+        "inputs": [
+            {"name": "operator", "type": "address"},
+            {"name": "approved", "type": "bool"},
+        ],
+        "outputs": [],
+    },
+    {
+        "name": "isApprovedForAll",
+        "type": "function",
+        "inputs": [
+            {"name": "account",  "type": "address"},
+            {"name": "operator", "type": "address"},
+        ],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+]
+
 MAX_UINT256 = 2**256 - 1
 
 
@@ -70,33 +95,58 @@ def load_env() -> dict:
     return env
 
 
-def approve_on_chain(w3: Web3, private_key: str, wallet: str) -> None:
+def approve_usdc(w3: Web3, private_key: str, wallet: str) -> None:
+    """ERC20 approve — lets exchange contracts spend USDC (required for BUY orders)."""
     usdc = w3.eth.contract(
         address=Web3.to_checksum_address(USDC_ADDRESS),
         abi=ERC20_ABI,
     )
+    wallet_cs = Web3.to_checksum_address(wallet)
 
     for name, contract_addr in EXCHANGE_CONTRACTS:
         contract_addr = Web3.to_checksum_address(contract_addr)
-
-        # Check if already approved
-        current = usdc.functions.allowance(
-            Web3.to_checksum_address(wallet), contract_addr
-        ).call()
+        current = usdc.functions.allowance(wallet_cs, contract_addr).call()
         if current > 0:
             print(f"  {name}: already approved ({current / 1e6:.2f} USDC allowance)")
             continue
 
-        print(f"  {name}: approving...")
+        print(f"  {name}: approving USDC...")
         tx = usdc.functions.approve(contract_addr, MAX_UINT256).build_transaction({
-            "from":  Web3.to_checksum_address(wallet),
-            "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(wallet)),
+            "from":  wallet_cs,
+            "nonce": w3.eth.get_transaction_count(wallet_cs),
             "gas":   100_000,
         })
         signed = w3.eth.account.sign_transaction(tx, private_key)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
         w3.eth.wait_for_transaction_receipt(tx_hash)
-        print(f"    tx: {tx_hash.hex()}")
+        print(f"    confirmed")
+
+
+def approve_ctf(w3: Web3, private_key: str, wallet: str) -> None:
+    """ERC1155 setApprovalForAll — lets exchange contracts transfer outcome tokens (required for SELL orders)."""
+    ctf = w3.eth.contract(
+        address=Web3.to_checksum_address(CTF_ADDRESS),
+        abi=ERC1155_ABI,
+    )
+    wallet_cs = Web3.to_checksum_address(wallet)
+
+    for name, contract_addr in EXCHANGE_CONTRACTS:
+        contract_addr = Web3.to_checksum_address(contract_addr)
+        already = ctf.functions.isApprovedForAll(wallet_cs, contract_addr).call()
+        if already:
+            print(f"  {name}: CTF already approved")
+            continue
+
+        print(f"  {name}: approving CTF (outcome tokens)...")
+        tx = ctf.functions.setApprovalForAll(contract_addr, True).build_transaction({
+            "from":  wallet_cs,
+            "nonce": w3.eth.get_transaction_count(wallet_cs),
+            "gas":   100_000,
+        })
+        signed = w3.eth.account.sign_transaction(tx, private_key)
+        tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
+        w3.eth.wait_for_transaction_receipt(tx_hash)
+        print(f"    confirmed")
 
 
 def sync_polymarket(client: ClobClient) -> None:
@@ -121,8 +171,11 @@ def main() -> None:
         print("ERROR: Cannot connect to Polygon RPC")
         sys.exit(1)
 
-    print("Setting on-chain USDC approvals (requires POL for gas)...")
-    approve_on_chain(w3, env["PRIVATE_KEY"], wallet)
+    print("Setting on-chain USDC approvals (required for BUY orders)...")
+    approve_usdc(w3, env["PRIVATE_KEY"], wallet)
+
+    print("\nSetting on-chain CTF approvals (required for SELL orders)...")
+    approve_ctf(w3, env["PRIVATE_KEY"], wallet)
 
     client = ClobClient(host=HOST, key=env["PRIVATE_KEY"], chain_id=CHAIN_ID, signature_type=0)
     client.set_api_creds(ApiCreds(

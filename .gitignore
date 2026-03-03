@@ -20,4 +20,5 @@ data/
 closed_markets.json
 
 # docs
-docs/vol_signal_spec.mddata/ws_recordings/**/*.jsonl
+docs/vol_signal_spec.md
+data/ws_recordings/**/*.jsonl

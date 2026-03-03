@@ -1,8 +1,11 @@
 """
 Record Polymarket WebSocket market feed to JSONL files.
 
-Only records during the active 15-minute trading window.
-One file per market slug.
+Logic:
+    1. Compute the slug for the currently-running window from UTC time
+       e.g. now=14:37 UTC → window_start=14:30 → slug=btc-updown-15m-{ts}
+    2. Look up that exact slug on gamma API to confirm it exists and get token_ids
+    3. Subscribe to those token_ids on the WS and record live data
 
 Usage:
     python historical/fetch/record_ws.py --slug-pattern btc-updown-15m
@@ -19,6 +22,7 @@ Message types recorded:
 import argparse
 import asyncio
 import json
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -30,14 +34,12 @@ import websockets
 PROJECT_ROOT = Path(__file__).parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+WS_URL    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
-DATA_DIR = PROJECT_ROOT / "data" / "ws_recordings"
+DATA_DIR  = PROJECT_ROOT / "data" / "ws_recordings"
 
-DISCOVERY_INTERVAL = 60     # seconds between gamma API polls
-SUBSCRIBE_BUFFER_SECS = 120 # subscribe this many seconds before window start
-KEEP_BUFFER_SECS = 60       # keep recording this many seconds after window end
-RELEVANT_EVENTS = {"book", "last_trade_price", "best_bid_ask"}
+DISCOVERY_INTERVAL = 15    # seconds between checks
+RELEVANT_EVENTS    = {"book", "last_trade_price", "best_bid_ask"}
 
 
 def _now() -> str:
@@ -45,7 +47,33 @@ def _now() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Window / slug computation
+# ---------------------------------------------------------------------------
+
+def _duration_from_pattern(slug_pattern: str) -> int | None:
+    """Extract duration in minutes from pattern like 'btc-updown-15m' → 15."""
+    m = re.search(r"(\d+)m", slug_pattern)
+    return int(m.group(1)) if m else None
+
+
+def _current_window_slug(slug_pattern: str) -> tuple[str, int, int] | None:
+    """
+    Compute (slug, window_start, window_end) for the currently-running window.
+    Returns None if duration cannot be parsed.
+    """
+    duration_min = _duration_from_pattern(slug_pattern)
+    if not duration_min:
+        return None
+    duration_sec  = duration_min * 60
+    now           = int(time.time())
+    window_start  = (now // duration_sec) * duration_sec
+    window_end    = window_start + duration_sec
+    slug          = f"{slug_pattern}-{window_start}"
+    return slug, window_start, window_end
+
+
+# ---------------------------------------------------------------------------
+# Market lookup
 # ---------------------------------------------------------------------------
 
 def _parse_token_ids(raw: str) -> list[str]:
@@ -55,81 +83,51 @@ def _parse_token_ids(raw: str) -> list[str]:
         return []
 
 
-def _parse_slug_timing(slug: str) -> tuple[int, int] | None:
-    """Parse 'btc-updown-15m-1772593200' → (trading_start_ts, duration_min)."""
-    parts = slug.split("-")
-    try:
-        ts = int(parts[-1])
-        for p in parts:
-            if p.endswith("m") and p[:-1].isdigit():
-                return (ts, int(p[:-1]))
-    except (ValueError, IndexError):
-        pass
-    return None
+def lookup_current_market(slug_pattern: str) -> dict | None:
+    """
+    Look up the market for the currently-running window.
+    Returns market dict or None if not found / not yet created.
+    """
+    result = _current_window_slug(slug_pattern)
+    if not result:
+        print(f"[{_now()}][discovery] cannot parse duration from '{slug_pattern}'")
+        return None
 
-
-def _is_in_trading_window(slug: str) -> bool:
-    """True if now falls within the market's trading window (with buffer)."""
-    timing = _parse_slug_timing(slug)
-    if not timing:
-        return False
-    trading_start, duration_min = timing
-    trading_end = trading_start + duration_min * 60
+    slug, window_start, window_end = result
     now = int(time.time())
-    return (trading_start - SUBSCRIBE_BUFFER_SECS) <= now <= (trading_end + KEEP_BUFFER_SECS)
+    secs_remaining = window_end - now
 
+    print(f"[{_now()}][discovery] current window: {slug}  ({secs_remaining}s remaining)")
 
-def find_trading_markets(slug_pattern: str) -> list[dict]:
-    """Return markets whose slug matches pattern AND are currently in trading window."""
+    if now >= window_end:
+        print(f"[{_now()}][discovery] window already ended, will pick up next window shortly")
+        return None
+
     try:
-        resp = requests.get(
-            GAMMA_URL,
-            params={"active": "true", "limit": 100, "order": "id", "ascending": "false"},
-            timeout=10,
-        )
+        resp = requests.get(GAMMA_URL, params={"slug": slug}, timeout=10)
         resp.raise_for_status()
+        markets = resp.json()
     except Exception as e:
         print(f"[{_now()}][discovery] gamma API error: {e}")
-        return []
+        return None
 
-    now = int(time.time())
-    candidates = [m for m in resp.json() if slug_pattern in m.get("slug", "")]
-    print(f"[{_now()}][discovery] found {len(candidates)} slug matches for '{slug_pattern}'")
+    if not markets:
+        print(f"[{_now()}][discovery] market not found yet: {slug}")
+        return None
 
-    results = []
-    for m in candidates:
-        slug = m.get("slug", "")
-        timing = _parse_slug_timing(slug)
-        if not timing:
-            print(f"[{_now()}][discovery]   {slug}: cannot parse timing, skipping")
-            continue
-        trading_start, duration_min = timing
-        trading_end = trading_start + duration_min * 60
-        secs_to_start = trading_start - now
-        secs_to_end   = trading_end - now
-        in_window = (trading_start - SUBSCRIBE_BUFFER_SECS) <= now <= (trading_end + KEEP_BUFFER_SECS)
+    m = markets[0]
+    token_ids = _parse_token_ids(m.get("clobTokenIds", "[]"))
+    if not token_ids:
+        print(f"[{_now()}][discovery] no token_ids for {slug}")
+        return None
 
-        if in_window:
-            status = f"IN WINDOW (ends in {int(secs_to_end)}s)"
-        elif secs_to_start > 0:
-            status = f"starts in {int(secs_to_start)}s"
-        else:
-            status = f"expired {int(-secs_to_end)}s ago"
-
-        print(f"[{_now()}][discovery]   {slug}: {status}")
-
-        if not in_window:
-            continue
-        token_ids = _parse_token_ids(m.get("clobTokenIds", "[]"))
-        if not token_ids:
-            print(f"[{_now()}][discovery]   {slug}: no token_ids, skipping")
-            continue
-        results.append({
-            "slug": slug,
-            "condition_id": m.get("conditionId", ""),
-            "token_ids": token_ids,
-        })
-    return results
+    print(f"[{_now()}][discovery] confirmed: {slug}  tokens={len(token_ids)}")
+    return {
+        "slug":         slug,
+        "condition_id": m.get("conditionId", ""),
+        "token_ids":    token_ids,
+        "window_end":   window_end,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -138,44 +136,39 @@ def find_trading_markets(slug_pattern: str) -> list[dict]:
 
 class WsRecorder:
     def __init__(self, slug_pattern: str):
-        self.slug_pattern = slug_pattern
-        self._ws: websockets.WebSocketClientProtocol | None = None
-
-        # condition_id -> open file handle
-        self._files: dict[str, object] = {}
-        # condition_id -> slug (for display/filename)
-        self._slugs: dict[str, str] = {}
-        # all token_ids subscribed (needed for WS resubscription)
-        self._tokens: list[str] = []
-        # condition_id -> messages written count
-        self._msg_counts: dict[str, int] = {}
-
+        self.slug_pattern    = slug_pattern
+        self._ws             = None
+        self._files:      dict[str, object] = {}   # condition_id -> file
+        self._slugs:      dict[str, str]    = {}   # condition_id -> slug
+        self._tokens:     list[str]         = []   # all subscribed token_ids
+        self._msg_counts: dict[str, int]    = {}   # condition_id -> count
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # File management
     # ------------------------------------------------------------------
 
-    def _open_market(self, slug: str, condition_id: str, token_ids: list[str]) -> list[str]:
-        """Register a market, open its file, return new token_ids to subscribe."""
-        if condition_id in self._files:
+    def _open_market(self, market: dict) -> list[str]:
+        """Open file for market, return new token_ids to subscribe."""
+        cid = market["condition_id"]
+        if cid in self._files:
             return []
-        path = DATA_DIR / f"{slug}.jsonl"
-        self._files[condition_id] = open(path, "a")
-        self._slugs[condition_id] = slug
-        self._msg_counts[condition_id] = 0
-        new_tokens = [t for t in token_ids if t not in self._tokens]
+        path = DATA_DIR / f"{market['slug']}.jsonl"
+        self._files[cid]      = open(path, "a")
+        self._slugs[cid]      = market["slug"]
+        self._msg_counts[cid] = 0
+        new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
         self._tokens.extend(new_tokens)
-        print(f"[{_now()}][recorder] tracking {slug}  → {path.name}")
+        print(f"[{_now()}][recorder] opened {market['slug']}  → {path.name}")
         return new_tokens
 
-    def _write(self, condition_id: str, msg: dict) -> None:
-        f = self._files.get(condition_id)
-        if f is None:
+    def _write(self, cid: str, msg: dict) -> None:
+        f = self._files.get(cid)
+        if not f:
             return
         f.write(json.dumps({"ts": int(time.time() * 1000), "msg": msg}) + "\n")
         f.flush()
-        self._msg_counts[condition_id] += 1
+        self._msg_counts[cid] += 1
 
     def _close_all(self) -> None:
         for f in self._files.values():
@@ -185,53 +178,55 @@ class WsRecorder:
                 pass
 
     # ------------------------------------------------------------------
-    # WebSocket helpers
+    # WebSocket
     # ------------------------------------------------------------------
 
     async def _subscribe(self, token_ids: list[str]) -> None:
-        if self._ws is None or not token_ids:
+        if not self._ws or not token_ids:
             return
-        msg = {
-            "type": "market",
-            "assets_ids": token_ids,
+        await self._ws.send(json.dumps({
+            "type":                   "market",
+            "assets_ids":             token_ids,
             "custom_feature_enabled": True,
-        }
-        await self._ws.send(json.dumps(msg))
+        }))
         print(f"[{_now()}][ws] subscribed to {len(token_ids)} token(s)")
-
-    async def _resubscribe_all(self) -> None:
-        if self._tokens:
-            await self._subscribe(self._tokens)
-
-    # ------------------------------------------------------------------
-    # Message handling
-    # ------------------------------------------------------------------
 
     async def _on_message(self, raw: str | bytes) -> None:
         try:
             payload = json.loads(raw)
         except Exception:
             return
-
         items = payload if isinstance(payload, list) else [payload]
         for msg in items:
             event_type = msg.get("event_type", "unknown")
-            condition_id = msg.get("market", "")
-            slug = self._slugs.get(condition_id, condition_id[:12] + "..." if condition_id else "?")
+            cid        = msg.get("market", "")
+            slug       = self._slugs.get(cid, cid[:12] + "..." if cid else "?")
 
             if event_type not in RELEVANT_EVENTS:
                 print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [skipped]")
                 continue
 
-            if condition_id and condition_id in self._files:
-                self._write(condition_id, msg)
-                count = self._msg_counts[condition_id]
-                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [saved #{count}]")
+            if cid and cid in self._files:
+                self._write(cid, msg)
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [saved #{self._msg_counts[cid]}]")
             else:
                 print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [no file]")
 
     # ------------------------------------------------------------------
     # Discovery loop
+    # ------------------------------------------------------------------
+
+    async def _discovery_loop(self) -> None:
+        while True:
+            market = lookup_current_market(self.slug_pattern)
+            if market:
+                new_tokens = self._open_market(market)
+                if new_tokens:
+                    await self._subscribe(new_tokens)
+            await asyncio.sleep(DISCOVERY_INTERVAL)
+
+    # ------------------------------------------------------------------
+    # Heartbeat
     # ------------------------------------------------------------------
 
     async def _heartbeat_loop(self) -> None:
@@ -241,41 +236,29 @@ class WsRecorder:
                 counts = {self._slugs[cid]: n for cid, n in self._msg_counts.items()}
                 print(f"[{_now()}][heartbeat] tracking {len(self._files)} market(s) | msgs: {counts}")
             else:
-                print(f"[{_now()}][heartbeat] waiting — no markets in trading window yet")
-
-    async def _discovery_loop(self) -> None:
-        while True:
-            markets = find_trading_markets(self.slug_pattern)
-            new_tokens = []
-            for m in markets:
-                new = self._open_market(m["slug"], m["condition_id"], m["token_ids"])
-                new_tokens.extend(new)
-            if new_tokens:
-                await self._subscribe(new_tokens)
-            await asyncio.sleep(DISCOVERY_INTERVAL)
+                print(f"[{_now()}][heartbeat] waiting for active market window")
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        print(f"[{_now()}][recorder] starting | slug_pattern={self.slug_pattern!r}")
-        print(f"[{_now()}][recorder] subscribe buffer={SUBSCRIBE_BUFFER_SECS}s | keep buffer={KEEP_BUFFER_SECS}s | poll interval={DISCOVERY_INTERVAL}s")
+        print(f"[{_now()}][recorder] starting | pattern={self.slug_pattern!r} | poll={DISCOVERY_INTERVAL}s")
         try:
             while True:
                 try:
                     async with websockets.connect(
-                        WS_URL,
-                        ping_interval=10,
-                        ping_timeout=30,
-                        close_timeout=5,
+                        WS_URL, ping_interval=10, ping_timeout=30, close_timeout=5,
                     ) as ws:
                         self._ws = ws
-                        print(f"[{_now()}][ws] connected to {WS_URL}")
+                        print(f"[{_now()}][ws] connected")
 
-                        await self._resubscribe_all()
-                        discovery  = asyncio.create_task(self._discovery_loop())
-                        heartbeat  = asyncio.create_task(self._heartbeat_loop())
+                        # Resubscribe known tokens on reconnect
+                        if self._tokens:
+                            await self._subscribe(self._tokens)
+
+                        discovery = asyncio.create_task(self._discovery_loop())
+                        heartbeat = asyncio.create_task(self._heartbeat_loop())
 
                         async for raw in ws:
                             await self._on_message(raw)
@@ -297,7 +280,7 @@ class WsRecorder:
 def main() -> None:
     p = argparse.ArgumentParser(description="Record Polymarket WS feed to JSONL")
     p.add_argument("--slug-pattern", required=True,
-                   help="Slug substring to match (e.g. btc-updown-15m)")
+                   help="e.g. btc-updown-15m or btc-updown-5m")
     args = p.parse_args()
     asyncio.run(WsRecorder(args.slug_pattern).run())
 

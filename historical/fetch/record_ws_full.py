@@ -1,25 +1,26 @@
 """
-Record Polymarket WebSocket `book` events to compact gzip JSONL.
+Record Polymarket WebSocket market feed to JSONL files.
 
 Logic:
     1. Compute the slug for the currently-running window from UTC time
        e.g. now=14:37 UTC → window_start=14:30 → slug=btc-updown-15m-{ts}
     2. Look up that exact slug on gamma API to confirm it exists and get token_ids
-    3. Subscribe and record only `book` snapshots
+    3. Subscribe to those token_ids on the WS and record live data
 
 Usage:
     python historical/fetch/record_ws.py --slug-pattern btc-updown-15m
 
 Output:
-    data/ws_recordings/<slug>.jsonl.gz  (gzip-compressed, ~1 MB per 15-min window)
-    Line 0 (metadata): {"meta": {"slug": ..., "condition_id": ..., "assets": [token_id_0, token_id_1]}}
-    Line N (book):     {"t": <unix_ms>, "a": <0|1>, "b": [[price, size], ...], "s": [[price, size], ...]}
+    data/ws_recordings/<slug>.jsonl
+    Each line: {"ts": <unix_ms>, "msg": <raw_message>}
 
-See record_ws_full.py to record all event types (book + last_trade_price + best_bid_ask).
+Message types recorded:
+    book             - full L2 snapshot (on subscribe + after each trade)
+    last_trade_price - a trade executed
+    best_bid_ask     - top-of-book update (requires custom_feature_enabled)
 """
 import argparse
 import asyncio
-import gzip
 import json
 import re
 import sys
@@ -37,7 +38,8 @@ WS_URL    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 DATA_DIR  = PROJECT_ROOT / "data" / "ws_recordings"
 
-DISCOVERY_INTERVAL = 15    # seconds between market-existence checks
+DISCOVERY_INTERVAL = 15    # seconds between checks
+RELEVANT_EVENTS    = {"book", "last_trade_price", "best_bid_ask"}
 
 
 def _now() -> str:
@@ -136,9 +138,8 @@ class WsRecorder:
     def __init__(self, slug_pattern: str):
         self.slug_pattern    = slug_pattern
         self._ws             = None
-        self._files:      dict[str, object] = {}   # condition_id -> gzip file
+        self._files:      dict[str, object] = {}   # condition_id -> file
         self._slugs:      dict[str, str]    = {}   # condition_id -> slug
-        self._asset_idx:  dict[str, int]    = {}   # asset_id -> index (0 or 1)
         self._tokens:     list[str]         = []   # all subscribed token_ids
         self._msg_counts: dict[str, int]    = {}   # condition_id -> count
         DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -148,39 +149,24 @@ class WsRecorder:
     # ------------------------------------------------------------------
 
     def _open_market(self, market: dict) -> list[str]:
-        """Open gzip file for market, return new token_ids to subscribe."""
+        """Open file for market, return new token_ids to subscribe."""
         cid = market["condition_id"]
         if cid in self._files:
             return []
-        path    = DATA_DIR / f"{market['slug']}.jsonl.gz"
-        is_new  = not path.exists()
-        f       = gzip.open(path, "at")
-        if is_new:
-            meta = json.dumps(
-                {"meta": {"slug": market["slug"], "condition_id": cid, "assets": market["token_ids"]}},
-                separators=(",", ":"),
-            )
-            f.write(meta + "\n")
-        self._files[cid]      = f
+        path = DATA_DIR / f"{market['slug']}.jsonl"
+        self._files[cid]      = open(path, "a")
         self._slugs[cid]      = market["slug"]
         self._msg_counts[cid] = 0
-        for i, token_id in enumerate(market["token_ids"]):
-            self._asset_idx[token_id] = i
         new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
         self._tokens.extend(new_tokens)
         print(f"[{_now()}][recorder] opened {market['slug']}  → {path.name}")
         return new_tokens
 
-    def _write_book(self, cid: str, msg: dict) -> None:
+    def _write(self, cid: str, msg: dict) -> None:
         f = self._files.get(cid)
         if not f:
             return
-        asset_idx = self._asset_idx.get(msg.get("asset_id", ""), -1)
-        bids = [[float(x["price"]), float(x["size"])] for x in msg.get("bids", [])]
-        asks = [[float(x["price"]), float(x["size"])] for x in msg.get("asks", [])]
-        line = json.dumps({"t": int(msg["timestamp"]), "a": asset_idx, "b": bids, "s": asks},
-                          separators=(",", ":"))
-        f.write(line + "\n")
+        f.write(json.dumps({"ts": int(time.time() * 1000), "msg": msg}) + "\n")
         f.flush()
         self._msg_counts[cid] += 1
 
@@ -199,8 +185,9 @@ class WsRecorder:
         if not self._ws or not token_ids:
             return
         await self._ws.send(json.dumps({
-            "type":       "market",
-            "assets_ids": token_ids,
+            "type":                   "market",
+            "assets_ids":             token_ids,
+            "custom_feature_enabled": True,
         }))
         print(f"[{_now()}][ws] subscribed to {len(token_ids)} token(s)")
 
@@ -213,16 +200,17 @@ class WsRecorder:
         for msg in items:
             event_type = msg.get("event_type", "unknown")
             cid        = msg.get("market", "")
+            slug       = self._slugs.get(cid, cid[:12] + "..." if cid else "?")
 
-            if event_type != "book":
+            if event_type not in RELEVANT_EVENTS:
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [skipped]")
                 continue
 
             if cid and cid in self._files:
-                self._write_book(cid, msg)
-                slug = self._slugs.get(cid, cid[:12] + "...")
-                print(f"[{_now()}][ws] book  {slug}  [#{self._msg_counts[cid]}]")
+                self._write(cid, msg)
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [saved #{self._msg_counts[cid]}]")
             else:
-                print(f"[{_now()}][ws] book  [no file for market]")
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [no file]")
 
     # ------------------------------------------------------------------
     # Discovery loop
@@ -265,6 +253,7 @@ class WsRecorder:
                         self._ws = ws
                         print(f"[{_now()}][ws] connected")
 
+                        # Resubscribe known tokens on reconnect
                         if self._tokens:
                             await self._subscribe(self._tokens)
 
@@ -289,7 +278,7 @@ class WsRecorder:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Record Polymarket book snapshots to compact gzip JSONL")
+    p = argparse.ArgumentParser(description="Record Polymarket WS feed to JSONL")
     p.add_argument("--slug-pattern", required=True,
                    help="e.g. btc-updown-15m or btc-updown-5m")
     args = p.parse_args()

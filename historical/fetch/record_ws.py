@@ -136,12 +136,13 @@ class WsRecorder:
     def __init__(self, slug_pattern: str):
         self.slug_pattern    = slug_pattern
         self._ws             = None
-        self._files:        dict[str, object] = {}   # condition_id -> gzip file
-        self._slugs:        dict[str, str]    = {}   # condition_id -> slug
-        self._asset_idx:    dict[str, int]    = {}   # asset_id -> index (0 or 1)
-        self._window_ends:  dict[str, int]    = {}   # condition_id -> window_end (unix s)
-        self._tokens:       list[str]         = []   # all subscribed token_ids
-        self._msg_counts:   dict[str, int]    = {}   # condition_id -> count
+        self._files:         dict[str, object]      = {}   # condition_id -> gzip file
+        self._slugs:         dict[str, str]         = {}   # condition_id -> slug
+        self._asset_idx:     dict[str, int]         = {}   # asset_id -> index (0 or 1)
+        self._market_tokens: dict[str, list[str]]   = {}   # condition_id -> [token_ids]
+        self._window_ends:   dict[str, int]         = {}   # condition_id -> window_end (unix s)
+        self._tokens:        list[str]              = []   # all currently subscribed token_ids
+        self._msg_counts:    dict[str, int]         = {}   # condition_id -> count
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -162,10 +163,11 @@ class WsRecorder:
                 separators=(",", ":"),
             )
             f.write(meta + "\n")
-        self._files[cid]       = f
-        self._slugs[cid]       = market["slug"]
-        self._msg_counts[cid]  = 0
-        self._window_ends[cid] = market["window_end"]
+        self._files[cid]          = f
+        self._slugs[cid]          = market["slug"]
+        self._msg_counts[cid]     = 0
+        self._window_ends[cid]    = market["window_end"]
+        self._market_tokens[cid]  = market["token_ids"]
         for i, token_id in enumerate(market["token_ids"]):
             self._asset_idx[token_id] = i
         new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
@@ -199,6 +201,12 @@ class WsRecorder:
                     print(f"[{_now()}][recorder] closed {slug} (window ended, {self._msg_counts[cid]} records)")
                 except Exception as e:
                     print(f"[{_now()}][recorder] error closing {slug}: {e}")
+            # Remove this market's tokens so the next window's tokens aren't filtered out
+            expired_tokens = self._market_tokens.pop(cid, [])
+            for t in expired_tokens:
+                self._asset_idx.pop(t, None)
+                if t in self._tokens:
+                    self._tokens.remove(t)
             self._slugs.pop(cid, None)
             self._window_ends.pop(cid, None)
             self._msg_counts.pop(cid, None)

@@ -136,11 +136,12 @@ class WsRecorder:
     def __init__(self, slug_pattern: str):
         self.slug_pattern    = slug_pattern
         self._ws             = None
-        self._files:      dict[str, object] = {}   # condition_id -> gzip file
-        self._slugs:      dict[str, str]    = {}   # condition_id -> slug
-        self._asset_idx:  dict[str, int]    = {}   # asset_id -> index (0 or 1)
-        self._tokens:     list[str]         = []   # all subscribed token_ids
-        self._msg_counts: dict[str, int]    = {}   # condition_id -> count
+        self._files:        dict[str, object] = {}   # condition_id -> gzip file
+        self._slugs:        dict[str, str]    = {}   # condition_id -> slug
+        self._asset_idx:    dict[str, int]    = {}   # asset_id -> index (0 or 1)
+        self._window_ends:  dict[str, int]    = {}   # condition_id -> window_end (unix s)
+        self._tokens:       list[str]         = []   # all subscribed token_ids
+        self._msg_counts:   dict[str, int]    = {}   # condition_id -> count
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -161,9 +162,10 @@ class WsRecorder:
                 separators=(",", ":"),
             )
             f.write(meta + "\n")
-        self._files[cid]      = f
-        self._slugs[cid]      = market["slug"]
-        self._msg_counts[cid] = 0
+        self._files[cid]       = f
+        self._slugs[cid]       = market["slug"]
+        self._msg_counts[cid]  = 0
+        self._window_ends[cid] = market["window_end"]
         for i, token_id in enumerate(market["token_ids"]):
             self._asset_idx[token_id] = i
         new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
@@ -184,10 +186,29 @@ class WsRecorder:
         f.flush()
         self._msg_counts[cid] += 1
 
+    def _close_expired(self) -> None:
+        """Close gzip files for windows that have ended, writing the end-of-stream marker."""
+        now     = int(time.time())
+        expired = [cid for cid, end in self._window_ends.items() if now >= end]
+        for cid in expired:
+            slug = self._slugs.get(cid, cid[:12])
+            f    = self._files.pop(cid, None)
+            if f:
+                try:
+                    f.close()
+                    print(f"[{_now()}][recorder] closed {slug} (window ended, {self._msg_counts[cid]} records)")
+                except Exception as e:
+                    print(f"[{_now()}][recorder] error closing {slug}: {e}")
+            self._slugs.pop(cid, None)
+            self._window_ends.pop(cid, None)
+            self._msg_counts.pop(cid, None)
+
     def _close_all(self) -> None:
-        for f in self._files.values():
+        for cid, f in list(self._files.items()):
+            slug = self._slugs.get(cid, cid[:12])
             try:
                 f.close()
+                print(f"[{_now()}][recorder] closed {slug} ({self._msg_counts.get(cid, 0)} records)")
             except Exception:
                 pass
 
@@ -230,6 +251,7 @@ class WsRecorder:
 
     async def _discovery_loop(self) -> None:
         while True:
+            self._close_expired()
             market = lookup_current_market(self.slug_pattern)
             if market:
                 new_tokens = self._open_market(market)

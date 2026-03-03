@@ -56,20 +56,35 @@ class BtcUpDownStrategy(Strategy):
         if epoch != self._current_epoch:
             self._current_epoch = epoch
             self._entered_this_epoch = False
+            # Close any leftover position from the previous epoch
+            for pos in self.cache.positions_open(instrument_id=self._pm_instrument_id):
+                self.close_position(pos)
 
-        if self._entered_this_epoch:
-            return
         if len(self._btc_closes) <= self._signal_lookback:
             return
 
-        if self._compute_signal() == 1:
+        signal = self._compute_signal()
+        positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
+
+        # Exit: close long on bearish signal
+        if positions and signal == -1:
+            for pos in positions:
+                self.close_position(pos)
+            return
+
+        # Enter: buy YES on bullish signal, once per epoch
+        if not positions and not self._entered_this_epoch and signal == 1:
             self._submit_yes_order()
             self._entered_this_epoch = True
 
     def _compute_signal(self) -> int:
-        """1 if BTC close rose over lookback window, else 0."""
+        """1=bullish, -1=bearish, 0=neutral."""
         closes = list(self._btc_closes)
-        return 1 if closes[-1] > closes[0] else 0
+        if closes[-1] > closes[0]:
+            return 1
+        elif closes[-1] < closes[0]:
+            return -1
+        return 0
 
     def _submit_yes_order(self):
         order = self.order_factory.market(

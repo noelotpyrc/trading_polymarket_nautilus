@@ -21,6 +21,7 @@ import asyncio
 import json
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -37,6 +38,10 @@ DISCOVERY_INTERVAL = 60     # seconds between gamma API polls
 SUBSCRIBE_BUFFER_SECS = 120 # subscribe this many seconds before window start
 KEEP_BUFFER_SECS = 60       # keep recording this many seconds after window end
 RELEVANT_EVENTS = {"book", "last_trade_price", "best_bid_ask"}
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
 # ---------------------------------------------------------------------------
@@ -84,18 +89,40 @@ def find_trading_markets(slug_pattern: str) -> list[dict]:
         )
         resp.raise_for_status()
     except Exception as e:
-        print(f"[discovery] gamma API error: {e}")
+        print(f"[{_now()}][discovery] gamma API error: {e}")
         return []
 
+    now = int(time.time())
+    candidates = [m for m in resp.json() if slug_pattern in m.get("slug", "")]
+    print(f"[{_now()}][discovery] found {len(candidates)} slug matches for '{slug_pattern}'")
+
     results = []
-    for m in resp.json():
+    for m in candidates:
         slug = m.get("slug", "")
-        if slug_pattern not in slug:
+        timing = _parse_slug_timing(slug)
+        if not timing:
+            print(f"[{_now()}][discovery]   {slug}: cannot parse timing, skipping")
             continue
-        if not _is_in_trading_window(slug):
+        trading_start, duration_min = timing
+        trading_end = trading_start + duration_min * 60
+        secs_to_start = trading_start - now
+        secs_to_end   = trading_end - now
+        in_window = (trading_start - SUBSCRIBE_BUFFER_SECS) <= now <= (trading_end + KEEP_BUFFER_SECS)
+
+        if in_window:
+            status = f"IN WINDOW (ends in {int(secs_to_end)}s)"
+        elif secs_to_start > 0:
+            status = f"starts in {int(secs_to_start)}s"
+        else:
+            status = f"expired {int(-secs_to_end)}s ago"
+
+        print(f"[{_now()}][discovery]   {slug}: {status}")
+
+        if not in_window:
             continue
         token_ids = _parse_token_ids(m.get("clobTokenIds", "[]"))
         if not token_ids:
+            print(f"[{_now()}][discovery]   {slug}: no token_ids, skipping")
             continue
         results.append({
             "slug": slug,
@@ -120,6 +147,8 @@ class WsRecorder:
         self._slugs: dict[str, str] = {}
         # all token_ids subscribed (needed for WS resubscription)
         self._tokens: list[str] = []
+        # condition_id -> messages written count
+        self._msg_counts: dict[str, int] = {}
 
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -134,9 +163,10 @@ class WsRecorder:
         path = DATA_DIR / f"{slug}.jsonl"
         self._files[condition_id] = open(path, "a")
         self._slugs[condition_id] = slug
+        self._msg_counts[condition_id] = 0
         new_tokens = [t for t in token_ids if t not in self._tokens]
         self._tokens.extend(new_tokens)
-        print(f"[recorder] tracking {slug}  → {path.name}")
+        print(f"[{_now()}][recorder] tracking {slug}  → {path.name}")
         return new_tokens
 
     def _write(self, condition_id: str, msg: dict) -> None:
@@ -145,6 +175,7 @@ class WsRecorder:
             return
         f.write(json.dumps({"ts": int(time.time() * 1000), "msg": msg}) + "\n")
         f.flush()
+        self._msg_counts[condition_id] += 1
 
     def _close_all(self) -> None:
         for f in self._files.values():
@@ -166,7 +197,7 @@ class WsRecorder:
             "custom_feature_enabled": True,
         }
         await self._ws.send(json.dumps(msg))
-        print(f"[ws] subscribed to {len(token_ids)} token(s)")
+        print(f"[{_now()}][ws] subscribed to {len(token_ids)} token(s)")
 
     async def _resubscribe_all(self) -> None:
         if self._tokens:
@@ -184,16 +215,33 @@ class WsRecorder:
 
         items = payload if isinstance(payload, list) else [payload]
         for msg in items:
-            event_type = msg.get("event_type")
+            event_type = msg.get("event_type", "unknown")
+            condition_id = msg.get("market", "")
+            slug = self._slugs.get(condition_id, condition_id[:12] + "..." if condition_id else "?")
+
             if event_type not in RELEVANT_EVENTS:
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [skipped]")
                 continue
-            condition_id = msg.get("market")
+
             if condition_id and condition_id in self._files:
                 self._write(condition_id, msg)
+                count = self._msg_counts[condition_id]
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [saved #{count}]")
+            else:
+                print(f"[{_now()}][ws] recv {event_type:<20} {slug}  [no file]")
 
     # ------------------------------------------------------------------
     # Discovery loop
     # ------------------------------------------------------------------
+
+    async def _heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            if self._files:
+                counts = {self._slugs[cid]: n for cid, n in self._msg_counts.items()}
+                print(f"[{_now()}][heartbeat] tracking {len(self._files)} market(s) | msgs: {counts}")
+            else:
+                print(f"[{_now()}][heartbeat] waiting — no markets in trading window yet")
 
     async def _discovery_loop(self) -> None:
         while True:
@@ -211,7 +259,8 @@ class WsRecorder:
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        print(f"[recorder] starting | slug_pattern={self.slug_pattern!r}")
+        print(f"[{_now()}][recorder] starting | slug_pattern={self.slug_pattern!r}")
+        print(f"[{_now()}][recorder] subscribe buffer={SUBSCRIBE_BUFFER_SECS}s | keep buffer={KEEP_BUFFER_SECS}s | poll interval={DISCOVERY_INTERVAL}s")
         try:
             while True:
                 try:
@@ -222,18 +271,20 @@ class WsRecorder:
                         close_timeout=5,
                     ) as ws:
                         self._ws = ws
-                        print(f"[ws] connected to {WS_URL}")
+                        print(f"[{_now()}][ws] connected to {WS_URL}")
 
                         await self._resubscribe_all()
-                        discovery = asyncio.create_task(self._discovery_loop())
+                        discovery  = asyncio.create_task(self._discovery_loop())
+                        heartbeat  = asyncio.create_task(self._heartbeat_loop())
 
                         async for raw in ws:
                             await self._on_message(raw)
 
                         discovery.cancel()
+                        heartbeat.cancel()
 
                 except (websockets.ConnectionClosed, OSError) as e:
-                    print(f"[ws] disconnected ({e}), reconnecting in 5s...")
+                    print(f"[{_now()}][ws] disconnected ({e}), reconnecting in 5s...")
                     await asyncio.sleep(5)
         finally:
             self._close_all()

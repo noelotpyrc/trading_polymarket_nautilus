@@ -1,11 +1,11 @@
 """
 Record Polymarket WebSocket `book` events to compact gzip JSONL.
 
-Logic:
-    1. Compute the slug for the currently-running window from UTC time
-       e.g. now=14:37 UTC → window_start=14:30 → slug=btc-updown-15m-{ts}
-    2. Look up that exact slug on gamma API to confirm it exists and get token_ids
-    3. Subscribe and record only `book` snapshots
+Logic (one WS connection per window):
+    1. Compute current window slug from UTC time
+    2. Look up market on gamma API to get token_ids
+    3. Connect WS, subscribe, record book events until window ends
+    4. Close file (writing gzip EOS), wait for next window, repeat
 
 Usage:
     python historical/fetch/record_ws.py --slug-pattern btc-updown-15m
@@ -37,7 +37,7 @@ WS_URL    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 DATA_DIR  = PROJECT_ROOT / "data" / "ws_recordings"
 
-DISCOVERY_INTERVAL = 15    # seconds between market-existence checks
+DISCOVERY_INTERVAL = 15   # seconds between market-existence checks
 
 
 def _now() -> str:
@@ -62,11 +62,11 @@ def _current_window_slug(slug_pattern: str) -> tuple[str, int, int] | None:
     duration_min = _duration_from_pattern(slug_pattern)
     if not duration_min:
         return None
-    duration_sec  = duration_min * 60
-    now           = int(time.time())
-    window_start  = (now // duration_sec) * duration_sec
-    window_end    = window_start + duration_sec
-    slug          = f"{slug_pattern}-{window_start}"
+    duration_sec = duration_min * 60
+    now          = int(time.time())
+    window_start = (now // duration_sec) * duration_sec
+    window_end   = window_start + duration_sec
+    slug         = f"{slug_pattern}-{window_start}"
     return slug, window_start, window_end
 
 
@@ -91,14 +91,14 @@ def lookup_current_market(slug_pattern: str) -> dict | None:
         print(f"[{_now()}][discovery] cannot parse duration from '{slug_pattern}'")
         return None
 
-    slug, window_start, window_end = result
-    now = int(time.time())
+    slug, _, window_end = result
+    now            = int(time.time())
     secs_remaining = window_end - now
 
     print(f"[{_now()}][discovery] current window: {slug}  ({secs_remaining}s remaining)")
 
     if now >= window_end:
-        print(f"[{_now()}][discovery] window already ended, will pick up next window shortly")
+        print(f"[{_now()}][discovery] window already ended")
         return None
 
     try:
@@ -110,10 +110,10 @@ def lookup_current_market(slug_pattern: str) -> dict | None:
         return None
 
     if not markets:
-        print(f"[{_now()}][discovery] market not found yet: {slug}")
+        print(f"[{_now()}][discovery] not found: {slug}")
         return None
 
-    m = markets[0]
+    m         = markets[0]
     token_ids = _parse_token_ids(m.get("clobTokenIds", "[]"))
     if not token_ids:
         print(f"[{_now()}][discovery] no token_ids for {slug}")
@@ -134,198 +134,86 @@ def lookup_current_market(slug_pattern: str) -> dict | None:
 
 class WsRecorder:
     def __init__(self, slug_pattern: str):
-        self.slug_pattern    = slug_pattern
-        self._ws             = None
-        self._files:         dict[str, object]      = {}   # condition_id -> gzip file
-        self._slugs:         dict[str, str]         = {}   # condition_id -> slug
-        self._asset_idx:     dict[str, int]         = {}   # asset_id -> index (0 or 1)
-        self._token_to_cid:  dict[str, str]         = {}   # asset_id -> condition_id
-        self._market_tokens: dict[str, list[str]]   = {}   # condition_id -> [token_ids]
-        self._window_ends:   dict[str, int]         = {}   # condition_id -> window_end (unix s)
-        self._tokens:        list[str]              = []   # all currently subscribed token_ids
-        self._msg_counts:    dict[str, int]         = {}   # condition_id -> count
+        self.slug_pattern = slug_pattern
         DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # File management
-    # ------------------------------------------------------------------
+    async def _record_window(self, market: dict) -> None:
+        """
+        Open a fresh WS connection for this window, subscribe, record until window ends.
+        Reconnects within the window if the connection drops.
+        """
+        slug       = market["slug"]
+        token_ids  = market["token_ids"]
+        window_end = market["window_end"]
+        asset_idx  = {t: i for i, t in enumerate(token_ids)}
+        count      = 0
 
-    def _open_market(self, market: dict) -> list[str]:
-        """Open gzip file for market, return new token_ids to subscribe."""
-        cid = market["condition_id"]
-        if cid in self._files:
-            return []
-        path    = DATA_DIR / f"{market['slug']}.jsonl.gz"
-        is_new  = not path.exists()
-        f       = gzip.open(path, "at")
-        if is_new:
-            meta = json.dumps(
-                {"meta": {"slug": market["slug"], "condition_id": cid, "assets": market["token_ids"]}},
-                separators=(",", ":"),
-            )
-            f.write(meta + "\n")
-        self._files[cid]          = f
-        self._slugs[cid]          = market["slug"]
-        self._msg_counts[cid]     = 0
-        self._window_ends[cid]    = market["window_end"]
-        self._market_tokens[cid]  = market["token_ids"]
-        for i, token_id in enumerate(market["token_ids"]):
-            self._asset_idx[token_id]    = i
-            self._token_to_cid[token_id] = cid
-        new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
-        self._tokens.extend(new_tokens)
-        print(f"[{_now()}][recorder] opened {market['slug']}  → {path.name}")
-        print(f"[{_now()}][recorder] token_ids: {[t[:12] for t in market['token_ids']]}")
-        return new_tokens
+        path   = DATA_DIR / f"{slug}.jsonl.gz"
+        is_new = not path.exists()
 
-    def _write_book(self, cid: str, msg: dict) -> None:
-        f = self._files.get(cid)
-        if not f:
-            return
-        asset_idx = self._asset_idx.get(msg.get("asset_id", ""), -1)
-        bids = [[float(x["price"]), float(x["size"])] for x in msg.get("bids", [])]
-        asks = [[float(x["price"]), float(x["size"])] for x in msg.get("asks", [])]
-        line = json.dumps({"t": int(msg["timestamp"]), "a": asset_idx, "b": bids, "s": asks},
-                          separators=(",", ":"))
-        f.write(line + "\n")
-        f.flush()
-        self._msg_counts[cid] += 1
+        with gzip.open(path, "at") as gz:
+            if is_new:
+                gz.write(json.dumps(
+                    {"meta": {"slug": slug, "condition_id": market["condition_id"], "assets": token_ids}},
+                    separators=(",", ":"),
+                ) + "\n")
 
-    def _close_expired(self) -> bool:
-        """Close gzip files for windows that have ended. Returns True if any expired."""
-        now     = int(time.time())
-        expired = [cid for cid, end in self._window_ends.items() if now >= end]
-        for cid in expired:
-            slug = self._slugs.get(cid, cid[:12])
-            f    = self._files.pop(cid, None)
-            if f:
-                try:
-                    f.close()
-                    print(f"[{_now()}][recorder] closed {slug} (window ended, {self._msg_counts[cid]} records)")
-                except Exception as e:
-                    print(f"[{_now()}][recorder] error closing {slug}: {e}")
-            # Remove this market's tokens so the next window's tokens aren't filtered out
-            expired_tokens = self._market_tokens.pop(cid, [])
-            for t in expired_tokens:
-                self._asset_idx.pop(t, None)
-                self._token_to_cid.pop(t, None)
-                if t in self._tokens:
-                    self._tokens.remove(t)
-            self._slugs.pop(cid, None)
-            self._window_ends.pop(cid, None)
-            self._msg_counts.pop(cid, None)
-        return bool(expired)
+            print(f"[{_now()}][recording] {slug}  ({window_end - int(time.time())}s remaining)")
 
-    def _close_all(self) -> None:
-        for cid, f in list(self._files.items()):
-            slug = self._slugs.get(cid, cid[:12])
-            try:
-                f.close()
-                print(f"[{_now()}][recorder] closed {slug} ({self._msg_counts.get(cid, 0)} records)")
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
-    # WebSocket
-    # ------------------------------------------------------------------
-
-    async def _subscribe(self, token_ids: list[str]) -> None:
-        if not self._ws or not token_ids:
-            return
-        await self._ws.send(json.dumps({
-            "type":       "market",
-            "assets_ids": token_ids,
-        }))
-        print(f"[{_now()}][ws] subscribed to {len(token_ids)} token(s): {[t[:12] for t in token_ids]}")
-
-    async def _on_message(self, raw: str | bytes) -> None:
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            return
-        items = payload if isinstance(payload, list) else [payload]
-        for msg in items:
-            event_type = msg.get("event_type", "unknown")
-
-            if event_type != "book":
-                continue
-
-            # Route by asset_id — WS market field may differ from gamma conditionId
-            asset_id = msg.get("asset_id", "")
-            cid      = self._token_to_cid.get(asset_id, "")
-
-            if cid and cid in self._files:
-                self._write_book(cid, msg)
-                slug = self._slugs.get(cid, cid[:12] + "...")
-                print(f"[{_now()}][ws] book  {slug}  [#{self._msg_counts[cid]}]")
-            else:
-                print(f"[{_now()}][ws] book  [no file for asset {asset_id[:12]}...]")
-
-    # ------------------------------------------------------------------
-    # Discovery loop
-    # ------------------------------------------------------------------
-
-    async def _discovery_loop(self) -> None:
-        while True:
-            expired = self._close_expired()
-            market  = lookup_current_market(self.slug_pattern)
-            if market:
-                new_tokens = self._open_market(market)
-                if new_tokens:
-                    if expired:
-                        # Window transition: reconnect so new tokens get a clean initial snapshot
-                        print(f"[{_now()}][ws] reconnecting for new window...")
-                        await self._ws.close()
-                        return
-                    else:
-                        await self._subscribe(new_tokens)
-            await asyncio.sleep(DISCOVERY_INTERVAL)
-
-    # ------------------------------------------------------------------
-    # Heartbeat
-    # ------------------------------------------------------------------
-
-    async def _heartbeat_loop(self) -> None:
-        while True:
-            await asyncio.sleep(30)
-            if self._files:
-                counts = {self._slugs[cid]: n for cid, n in self._msg_counts.items()}
-                print(f"[{_now()}][heartbeat] tracking {len(self._files)} market(s) | msgs: {counts}")
-            else:
-                print(f"[{_now()}][heartbeat] waiting for active market window")
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
-    async def run(self) -> None:
-        print(f"[{_now()}][recorder] starting | pattern={self.slug_pattern!r} | poll={DISCOVERY_INTERVAL}s")
-        try:
-            while True:
+            while int(time.time()) < window_end:
                 try:
                     async with websockets.connect(
                         WS_URL, ping_interval=10, ping_timeout=30, close_timeout=5,
                     ) as ws:
-                        self._ws = ws
-                        print(f"[{_now()}][ws] connected")
-
-                        if self._tokens:
-                            await self._subscribe(self._tokens)
-
-                        discovery = asyncio.create_task(self._discovery_loop())
-                        heartbeat = asyncio.create_task(self._heartbeat_loop())
+                        await ws.send(json.dumps({"type": "market", "assets_ids": token_ids}))
+                        print(f"[{_now()}][ws] subscribed  {[t[:12] for t in token_ids]}")
 
                         async for raw in ws:
-                            await self._on_message(raw)
-
-                        discovery.cancel()
-                        heartbeat.cancel()
+                            if int(time.time()) >= window_end:
+                                break
+                            try:
+                                payload = json.loads(raw)
+                            except Exception:
+                                continue
+                            items = payload if isinstance(payload, list) else [payload]
+                            for msg in items:
+                                if msg.get("event_type") != "book":
+                                    continue
+                                a = asset_idx.get(msg.get("asset_id", ""), -1)
+                                if a == -1:
+                                    continue   # message for a different/unknown token
+                                bids = [[float(x["price"]), float(x["size"])] for x in msg.get("bids", [])]
+                                asks = [[float(x["price"]), float(x["size"])] for x in msg.get("asks", [])]
+                                gz.write(json.dumps(
+                                    {"t": int(msg["timestamp"]), "a": a, "b": bids, "s": asks},
+                                    separators=(",", ":"),
+                                ) + "\n")
+                                gz.flush()
+                                count += 1
+                                print(f"[{_now()}][ws] book  {slug}  #{count}")
 
                 except (websockets.ConnectionClosed, OSError) as e:
-                    print(f"[{_now()}][ws] disconnected ({e}), reconnecting in 5s...")
-                    await asyncio.sleep(5)
-        finally:
-            self._close_all()
+                    if int(time.time()) < window_end:
+                        print(f"[{_now()}][ws] disconnected ({e}), reconnecting in 3s...")
+                        await asyncio.sleep(3)
+
+        print(f"[{_now()}][recording] done  {slug}  ({count} records)")
+
+    async def run(self) -> None:
+        print(f"[{_now()}][recorder] starting | pattern={self.slug_pattern!r}")
+        while True:
+            market = lookup_current_market(self.slug_pattern)
+            if not market:
+                await asyncio.sleep(DISCOVERY_INTERVAL)
+                continue
+
+            await self._record_window(market)
+
+            # Wait for next window to start (with a small buffer)
+            gap = market["window_end"] - int(time.time()) + 2
+            if gap > 0:
+                print(f"[{_now()}][recorder] waiting {gap}s for next window...")
+                await asyncio.sleep(gap)
 
 
 # ---------------------------------------------------------------------------

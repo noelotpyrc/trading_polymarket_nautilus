@@ -139,6 +139,7 @@ class WsRecorder:
         self._files:         dict[str, object]      = {}   # condition_id -> gzip file
         self._slugs:         dict[str, str]         = {}   # condition_id -> slug
         self._asset_idx:     dict[str, int]         = {}   # asset_id -> index (0 or 1)
+        self._token_to_cid:  dict[str, str]         = {}   # asset_id -> condition_id
         self._market_tokens: dict[str, list[str]]   = {}   # condition_id -> [token_ids]
         self._window_ends:   dict[str, int]         = {}   # condition_id -> window_end (unix s)
         self._tokens:        list[str]              = []   # all currently subscribed token_ids
@@ -169,7 +170,8 @@ class WsRecorder:
         self._window_ends[cid]    = market["window_end"]
         self._market_tokens[cid]  = market["token_ids"]
         for i, token_id in enumerate(market["token_ids"]):
-            self._asset_idx[token_id] = i
+            self._asset_idx[token_id]    = i
+            self._token_to_cid[token_id] = cid
         new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
         self._tokens.extend(new_tokens)
         print(f"[{_now()}][recorder] opened {market['slug']}  → {path.name}")
@@ -205,6 +207,7 @@ class WsRecorder:
             expired_tokens = self._market_tokens.pop(cid, [])
             for t in expired_tokens:
                 self._asset_idx.pop(t, None)
+                self._token_to_cid.pop(t, None)
                 if t in self._tokens:
                     self._tokens.remove(t)
             self._slugs.pop(cid, None)
@@ -241,17 +244,20 @@ class WsRecorder:
         items = payload if isinstance(payload, list) else [payload]
         for msg in items:
             event_type = msg.get("event_type", "unknown")
-            cid        = msg.get("market", "")
 
             if event_type != "book":
                 continue
+
+            # Route by asset_id — WS market field may differ from gamma conditionId
+            asset_id = msg.get("asset_id", "")
+            cid      = self._token_to_cid.get(asset_id, "")
 
             if cid and cid in self._files:
                 self._write_book(cid, msg)
                 slug = self._slugs.get(cid, cid[:12] + "...")
                 print(f"[{_now()}][ws] book  {slug}  [#{self._msg_counts[cid]}]")
             else:
-                print(f"[{_now()}][ws] book  [no file for market]")
+                print(f"[{_now()}][ws] book  [no file for asset {asset_id[:12]}...]")
 
     # ------------------------------------------------------------------
     # Discovery loop

@@ -4,8 +4,8 @@ Record Polymarket WebSocket `book` events to compact gzip JSONL.
 Logic (one WS connection per window):
     1. Compute current window slug from UTC time
     2. Look up market on gamma API to get token_ids
-    3. Connect WS, subscribe, record book events until window ends
-    4. Close file (writing gzip EOS), wait for next window, repeat
+    3. Connect WS, subscribe, record book events until window_end + 1s
+    4. Close file (writing gzip EOS), move to next window, repeat
 
 Usage:
     python historical/fetch/record_ws.py --slug-pattern btc-updown-15m
@@ -141,26 +141,26 @@ class WsRecorder:
         """
         Open a fresh WS connection for this window, subscribe, record until window ends.
         Reconnects within the window if the connection drops.
+        A closer task exits the WS loop promptly at window_end even if traffic is quiet.
         """
         slug       = market["slug"]
         token_ids  = market["token_ids"]
         window_end = market["window_end"]
-        asset_idx  = {t: i for i, t in enumerate(token_ids)}
-        count      = 0
+        asset_idx   = {t: i for i, t in enumerate(token_ids)}
+        count       = 0
+        record_until = window_end + 1  # 1s buffer: run until window_end+1 so next window starts ~1s in
 
-        path   = DATA_DIR / f"{slug}.jsonl.gz"
-        is_new = not path.exists()
+        path = DATA_DIR / f"{slug}.jsonl.gz"
 
-        with gzip.open(path, "at") as gz:
-            if is_new:
-                gz.write(json.dumps(
-                    {"meta": {"slug": slug, "condition_id": market["condition_id"], "assets": token_ids}},
-                    separators=(",", ":"),
-                ) + "\n")
+        with gzip.open(path, "wt") as gz:
+            gz.write(json.dumps(
+                {"meta": {"slug": slug, "condition_id": market["condition_id"], "assets": token_ids}},
+                separators=(",", ":"),
+            ) + "\n")
 
             print(f"[{_now()}][recording] {slug}  ({window_end - int(time.time())}s remaining)")
 
-            while int(time.time()) < window_end:
+            while int(time.time()) < record_until:
                 try:
                     async with websockets.connect(
                         WS_URL, ping_interval=10, ping_timeout=30, close_timeout=5,
@@ -168,32 +168,42 @@ class WsRecorder:
                         await ws.send(json.dumps({"type": "market", "assets_ids": token_ids}))
                         print(f"[{_now()}][ws] subscribed  {[t[:12] for t in token_ids]}")
 
-                        async for raw in ws:
-                            if int(time.time()) >= window_end:
-                                break
-                            try:
-                                payload = json.loads(raw)
-                            except Exception:
-                                continue
-                            items = payload if isinstance(payload, list) else [payload]
-                            for msg in items:
-                                if msg.get("event_type") != "book":
+                        # Close WS at record_until so we exit promptly even on a quiet market
+                        async def _close_at_end():
+                            delay = record_until - time.time()
+                            if delay > 0:
+                                await asyncio.sleep(delay)
+                            await ws.close()
+
+                        closer = asyncio.create_task(_close_at_end())
+                        try:
+                            async for raw in ws:
+                                try:
+                                    payload = json.loads(raw)
+                                except Exception:
                                     continue
-                                a = asset_idx.get(msg.get("asset_id", ""), -1)
-                                if a == -1:
-                                    continue   # message for a different/unknown token
-                                bids = [[float(x["price"]), float(x["size"])] for x in msg.get("bids", [])]
-                                asks = [[float(x["price"]), float(x["size"])] for x in msg.get("asks", [])]
-                                gz.write(json.dumps(
-                                    {"t": int(msg["timestamp"]), "a": a, "b": bids, "s": asks},
-                                    separators=(",", ":"),
-                                ) + "\n")
-                                gz.flush()
-                                count += 1
-                                print(f"[{_now()}][ws] book  {slug}  #{count}")
+                                items = payload if isinstance(payload, list) else [payload]
+                                for msg in items:
+                                    if msg.get("event_type") != "book":
+                                        continue
+                                    a = asset_idx.get(msg.get("asset_id", ""), -1)
+                                    if a == -1:
+                                        continue   # message for a different/unknown token
+                                    bids = [[float(x["price"]), float(x["size"])] for x in msg.get("bids", [])]
+                                    asks = [[float(x["price"]), float(x["size"])] for x in msg.get("asks", [])]
+                                    gz.write(json.dumps(
+                                        {"t": int(msg["timestamp"]), "a": a, "b": bids, "s": asks},
+                                        separators=(",", ":"),
+                                    ) + "\n")
+                                    gz.flush()
+                                    count += 1
+                                    if count % 100 == 0:
+                                        print(f"[{_now()}][ws] {slug}  #{count}")
+                        finally:
+                            closer.cancel()
 
                 except (websockets.ConnectionClosed, OSError) as e:
-                    if int(time.time()) < window_end:
+                    if int(time.time()) < record_until:
                         print(f"[{_now()}][ws] disconnected ({e}), reconnecting in 3s...")
                         await asyncio.sleep(3)
 
@@ -208,12 +218,7 @@ class WsRecorder:
                 continue
 
             await self._record_window(market)
-
-            # Wait for next window to start (with a small buffer)
-            gap = market["window_end"] - int(time.time()) + 2
-            if gap > 0:
-                print(f"[{_now()}][recorder] waiting {gap}s for next window...")
-                await asyncio.sleep(gap)
+            # No gap sleep — next window already started (markets pre-created 24hr ahead)
 
 
 # ---------------------------------------------------------------------------

@@ -244,8 +244,10 @@ Config from `.env`: `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_A
 5. **Build tick data fetcher** — `historical/fetch/market_trades.py` (data-api + Goldsky fallback)
 6. **Nautilus backtest Phase 2** — rerun with real `TradeTick` data, compare vs Phase 1
 7. **Live node scaffold** — `node.py`, `config.py`, wire Binance WebSocket feed + Polymarket clients
-8. **Shadow mode** — run node, log signals, no real orders
-9. **Live deployment** — start node + sweep cadence
+8. **Replay + mock exec** — replay recorded WS book data, mock exec client, confirm signal + order logic (see `docs/live_testing_plan.md`)
+9. **Shadow mode** — real live data feeds, mock exec client, confirm adapters + window transitions
+10. **Real minimum orders** — $5–$10 per order, verify CLOB submission + fill handling end-to-end
+11. **Live deployment** — increase size, start node + sweep cadence
 
 ---
 

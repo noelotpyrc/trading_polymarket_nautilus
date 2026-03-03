@@ -175,6 +175,7 @@ class WsRecorder:
         new_tokens = [t for t in market["token_ids"] if t not in self._tokens]
         self._tokens.extend(new_tokens)
         print(f"[{_now()}][recorder] opened {market['slug']}  → {path.name}")
+        print(f"[{_now()}][recorder] token_ids: {[t[:12] for t in market['token_ids']]}")
         return new_tokens
 
     def _write_book(self, cid: str, msg: dict) -> None:
@@ -190,8 +191,8 @@ class WsRecorder:
         f.flush()
         self._msg_counts[cid] += 1
 
-    def _close_expired(self) -> None:
-        """Close gzip files for windows that have ended, writing the end-of-stream marker."""
+    def _close_expired(self) -> bool:
+        """Close gzip files for windows that have ended. Returns True if any expired."""
         now     = int(time.time())
         expired = [cid for cid, end in self._window_ends.items() if now >= end]
         for cid in expired:
@@ -213,6 +214,7 @@ class WsRecorder:
             self._slugs.pop(cid, None)
             self._window_ends.pop(cid, None)
             self._msg_counts.pop(cid, None)
+        return bool(expired)
 
     def _close_all(self) -> None:
         for cid, f in list(self._files.items()):
@@ -234,7 +236,7 @@ class WsRecorder:
             "type":       "market",
             "assets_ids": token_ids,
         }))
-        print(f"[{_now()}][ws] subscribed to {len(token_ids)} token(s)")
+        print(f"[{_now()}][ws] subscribed to {len(token_ids)} token(s): {[t[:12] for t in token_ids]}")
 
     async def _on_message(self, raw: str | bytes) -> None:
         try:
@@ -265,12 +267,18 @@ class WsRecorder:
 
     async def _discovery_loop(self) -> None:
         while True:
-            self._close_expired()
-            market = lookup_current_market(self.slug_pattern)
+            expired = self._close_expired()
+            market  = lookup_current_market(self.slug_pattern)
             if market:
                 new_tokens = self._open_market(market)
                 if new_tokens:
-                    await self._subscribe(new_tokens)
+                    if expired:
+                        # Window transition: reconnect so new tokens get a clean initial snapshot
+                        print(f"[{_now()}][ws] reconnecting for new window...")
+                        await self._ws.close()
+                        return
+                    else:
+                        await self._subscribe(new_tokens)
             await asyncio.sleep(DISCOVERY_INTERVAL)
 
     # ------------------------------------------------------------------

@@ -9,11 +9,20 @@ Scripts for fetching and processing Polymarket historical data. All scripts use 
 ```
 fetch/gamma_events.py
   └─> events JSON
-        └─> process/event_tags.py       (filter by tag)
+        └─> process/event_tags.py            (filter by tag)
         └─> fetch/market_price_history.py
               └─> price history JSON
-                    └─> process/clean_price_history.py
+                    └─> process/clean_price_history_15min_btcupdown.py
                           └─> analysis-ready CSV
+
+backtest/run.py
+  └─> loads Binance 1m CSV + fetches PM price history live
+        └─> BacktestEngine (two venues: BINANCE signal + POLYMARKET execution)
+              └─> P&L summary
+
+fetch/record_ws.py
+  └─> records live Polymarket WS book events
+        └─> data/ws_recordings/<slug>.jsonl.gz (one file per window)
 ```
 
 ---
@@ -82,11 +91,11 @@ python historical/fetch/markets.py
 
 ## process/
 
-### `clean_price_history.py`
+### `clean_price_history_15min_btcupdown.py`
 Cleans raw price history JSON into an analysis-ready CSV. Filters to markets with exactly 15 in-window data points (one per minute for 15m markets) and assigns minute indices.
 
 ```bash
-python historical/process/clean_price_history.py \
+python historical/process/clean_price_history_15min_btcupdown.py \
   data/btc_15m_price_history.json \
   data/btc_15m_clean.csv
 ```
@@ -112,6 +121,40 @@ python historical/process/event_tags.py filter \
   --input data/gamma_events.json --tags crypto,bitcoin \
   --output data/crypto_events.json
 ```
+
+---
+
+## backtest/
+
+### `run.py`
+End-to-end Nautilus backtest combining Binance 1m signal data with Polymarket YES token price history. Fetches PM price history live from the CLOB on each run.
+
+```bash
+python historical/backtest/run.py \
+  --binance-csv "/Volumes/Extreme SSD/trading_data/cex/ohlvc/binance_btcusdt_perp_1m/BTCUSDT-1m-merged.csv" \
+  --market-slug btc-updown-15m-1770594300 \
+  --start 2025-09-01 --end 2025-10-01
+```
+
+| Flag | Description |
+|---|---|
+| `--binance-csv` | Path to merged Binance 1m OHLCV CSV |
+| `--market-slug` | Polymarket market slug (must include timestamp suffix) |
+| `--start`, `--end` | Date range (YYYY-MM-DD) |
+| `--capital` | Starting USDC balance (default: 500.0) |
+
+---
+
+## fetch/ (additional)
+
+### `record_ws.py`
+Records live Polymarket WebSocket book snapshots to gzip-compressed JSONL. Runs continuously, one file per market window.
+
+```bash
+python historical/fetch/record_ws.py --slug-pattern btc-updown-15m
+```
+
+Output: `data/ws_recordings/<slug>.jsonl.gz` — see `docs/ws_book_recording_format.md` for format.
 
 ---
 

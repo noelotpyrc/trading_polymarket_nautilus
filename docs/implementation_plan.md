@@ -1,6 +1,6 @@
 # Implementation Plan
 
-End goal: a Nautilus-based trading system that backtests on Polymarket historical data and runs the same strategy live against the Polymarket CLOB.
+End goal: a Nautilus-based trading system that backtests on Polymarket historical data and trades live against the Polymarket CLOB. Backtest and live share signal logic but are separate implementations with different data subscriptions and lifecycle concerns.
 
 ---
 
@@ -26,9 +26,10 @@ These are markets of the form "Bitcoin Up or Down — 15 Minutes": at expiry, if
 | Signal generation spec (`vol_signal_spec.md`) | Done |
 | Signal generation implementation | Not started |
 | Strategy trading rules | Pending (user) |
-| Nautilus backtest Phase 1 | Not started |
+| Nautilus backtest Phase 1 | Done — `historical/backtest/run.py` |
 | Nautilus backtest Phase 2 | Not started |
-| Nautilus live trading node | Not started |
+| Live node scaffold (`node.py`, `config.py`) | Done — `--sandbox` flag for shadow mode |
+| Live strategy + runner (`live/strategies/btc_updown.py`, `live/runs/btc_updown.py`) | Done — quote ticks, time alerts, continuous window trading |
 
 ---
 
@@ -171,31 +172,31 @@ Then ported into the Nautilus strategy's `on_bar` handler for live use.
 
 ## Strategy
 
-A Nautilus `Strategy` subclass. Same class runs in backtest and live.
+Backtest and live strategies are **separate implementations**. They share signal logic but have different data subscriptions and lifecycle concerns.
 
 ```
-live/strategies/
-  btc_updown.py    # BTC up/down strategy (all intervals)
+historical/backtest/run.py         # backtest runner — uses backtest strategy inline
+live/strategies/btc_updown.py      # live strategy logic
+live/runs/btc_updown.py            # live runner — wires feeds + strategy
 ```
+
+### Backtest strategy (already built)
+- Takes a fixed `pm_instrument_id` (single market, known at startup)
+- Subscribes to Binance bars for signal, Polymarket bars for market state
+- `BacktestEngine` simulates bar delivery — no adapter constraints
+- Window transitions are irrelevant (engine replays a fixed date range)
+
+### Live strategy (already built)
+The Polymarket live adapter does **not** support `subscribe_bars()` — only quote ticks and trade ticks. The live strategy therefore:
+- Subscribes `subscribe_bars()` for Binance (works fine — native Binance WS klines)
+- Subscribes `subscribe_quote_ticks()` for Polymarket (adapter constraint)
+- Handles continuous window trading: knows current market's instrument ID, uses time alerts to close positions and switch to the next window at expiry
+
+### Shared signal logic
+`_compute_signal()` (BTC momentum over N bars) is a plain function — no coupling to engine type.
 
 ### Trading rules
 To be written by user (separate rules doc). Will define thresholds on `prob_yes_emp` for entry/exit.
-
-### Skeleton
-
-```python
-def on_start(self):
-    # Binance klines for signal — no API key needed for public data
-    self.subscribe_bars(BarType.from_str("BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL"))
-    # Polymarket YES token for market state
-    self.subscribe_bars(BarType.from_str(f"{token_id}.POLYMARKET-1-MINUTE-LAST-EXTERNAL"))
-
-def on_bar(self, bar: Bar):
-    if bar.type.instrument_id.venue == BINANCE_VENUE:
-        self._update_signal(bar)      # recompute prob_yes_emp
-    else:
-        self._check_entry_exit(bar)   # apply trading rules against prob_yes_emp
-```
 
 ### Position sizing
 - Minimum $5 per order (platform limit)
@@ -237,17 +238,16 @@ Config from `.env`: `POLYMARKET_API_KEY`, `POLYMARKET_API_SECRET`, `POLYMARKET_A
 
 ## Build Order
 
-1. **Implement signal pipeline** — `historical/process/vol_signal.py`, validate on Sept 2025–Feb 2026 data
-2. **Write trading rules** — user defines entry/exit thresholds on `prob_yes_emp`
-3. **Implement strategy** — `live/strategies/btc_updown.py`, embeds signal logic in `on_bar`
-4. **Nautilus backtest Phase 1** — `BacktestEngine` with 1-min YES token bars + Binance merged CSV
-5. **Build tick data fetcher** — `historical/fetch/market_trades.py` (data-api + Goldsky fallback)
-6. **Nautilus backtest Phase 2** — rerun with real `TradeTick` data, compare vs Phase 1
-7. **Live node scaffold** — `node.py`, `config.py`, wire Binance WebSocket feed + Polymarket clients
-8. **Replay + mock exec** — replay recorded WS book data, mock exec client, confirm signal + order logic (see `docs/live_testing_plan.md`)
-9. **Shadow mode** — real live data feeds, mock exec client, confirm adapters + window transitions
-10. **Real minimum orders** — $5–$10 per order, verify CLOB submission + fill handling end-to-end
-11. **Live deployment** — increase size, start node + sweep cadence
+1. ~~**Implement signal pipeline**~~ — deferred; current strategy uses simple BTC momentum
+2. **Write trading rules** — user defines entry/exit logic (thresholds, timing, sizing)
+3. ~~**Nautilus backtest Phase 1**~~ — **Done** (`historical/backtest/run.py`)
+4. **Build tick data fetcher** — `historical/fetch/market_trades.py` (data-api + Goldsky fallback)
+5. **Nautilus backtest Phase 2** — rerun with real `TradeTick` data, compare vs Phase 1
+6. ~~**Live node scaffold**~~ — **Done** (`live/node.py`, `live/config.py`, `--sandbox` flag)
+7. ~~**Live strategy**~~ — **Done** (quote ticks for PM, time alerts for window transitions, pre-loaded window schedule)
+8. **Shadow mode** — run `live/runs/btc_updown.py --slug-pattern btc-updown-15m --sandbox`, confirm adapters + signal + window transitions end-to-end (see `docs/live_testing_plan.md`)
+9. **Real minimum orders** — $5–$10 per order, verify CLOB submission + fill handling end-to-end
+10. **Live deployment** — increase size, start node + sweep cadence
 
 ---
 

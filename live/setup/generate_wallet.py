@@ -1,29 +1,45 @@
 #!/usr/bin/env python3
 """
-Step 1: Generate a new EOA wallet for Polymarket trading.
+Step 1: Generate a new EOA wallet.
 
-Writes PRIVATE_KEY and WALLET_ADDRESS to .env in the project root.
-Run this once — do NOT run again or it will generate a different wallet.
+Default: writes PRIVATE_KEY and WALLET_ADDRESS to .env (production wallet).
+--test:  writes POLYMARKET_TEST_PRIVATE_KEY and POLYMARKET_TEST_WALLET_ADDRESS (sandbox wallet).
+
+Run each mode once only — re-running will abort if the key already exists.
 
 Usage:
-    python live/setup/generate_wallet.py
+    python live/setup/generate_wallet.py           # production wallet
+    python live/setup/generate_wallet.py --test    # sandbox/test wallet (no funding needed)
 """
-
+import argparse
 import sys
 from pathlib import Path
 
-from eth_account import Account
 from dotenv import dotenv_values
+from eth_account import Account
 
 ENV_PATH = Path(__file__).parents[2] / ".env"
 
 
 def main() -> None:
-    # Guard: don't overwrite an existing key
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--test", action="store_true",
+        help="Generate a test wallet (zero-funds, sandbox mode only)"
+    )
+    args = parser.parse_args()
+
+    if args.test:
+        key_var, addr_var = "POLYMARKET_TEST_PRIVATE_KEY", "POLYMARKET_TEST_WALLET_ADDRESS"
+        label = "TEST"
+    else:
+        key_var, addr_var = "PRIVATE_KEY", "WALLET_ADDRESS"
+        label = "PRODUCTION"
+
     existing = dotenv_values(ENV_PATH)
-    if existing.get("PRIVATE_KEY"):
-        print("ERROR: .env already contains a PRIVATE_KEY. Aborting to avoid overwriting.")
-        print(f"  Wallet address: {existing.get('WALLET_ADDRESS', '(unknown)')}")
+    if existing.get(key_var):
+        print(f"ERROR: .env already contains {key_var}. Aborting to avoid overwriting.")
+        print(f"  Address: {existing.get(addr_var, '(unknown)')}")
         sys.exit(1)
 
     account = Account.create()
@@ -31,17 +47,22 @@ def main() -> None:
     address = account.address
 
     with ENV_PATH.open("a") as f:
-        f.write(f"PRIVATE_KEY={private_key}\n")
-        f.write(f"WALLET_ADDRESS={address}\n")
+        f.write(f"{key_var}={private_key}\n")
+        f.write(f"{addr_var}={address}\n")
 
-    print("Wallet generated and saved to .env")
+    print(f"{label} wallet generated and saved to .env")
     print(f"  Address:     {address}")
     print(f"  Private key: {private_key}")
     print()
-    print("Next steps:")
-    print("  1. Send USDC.e to your address on Polygon")
-    print("  2. Send a small amount of POL (for gas) to your address on Polygon")
-    print("  3. Run: python live/setup/init_trading.py")
+
+    if args.test:
+        print("Next step (no funding needed):")
+        print("  python live/setup/init_trading.py --test")
+    else:
+        print("Next steps:")
+        print("  1. Send USDC.e to your address on Polygon")
+        print("  2. Send a small amount of POL (for gas) to your address on Polygon")
+        print("  3. Run: python live/setup/init_trading.py")
 
 
 if __name__ == "__main__":

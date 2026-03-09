@@ -16,8 +16,12 @@ Execution is routed through a Polymarket CLOB exec client (live) or a `SandboxEx
 live/
 ├── node.py                  # Shared infrastructure for live nodes
 ├── config.py                # TradingNodeConfig builders (live / sandbox)
+├── profiles/
+│   └── catalog/             # Checked-in runner profile TOML files
 ├── runs/
 │   ├── btc_updown.py        # Infrastructure test runner (warmup-based)
+│   ├── profile.py           # Generic profile runner
+│   ├── profiles/            # Fixed per-profile entrypoints
 │   └── random_signal.py     # Infrastructure test runner (fast exercise)
 ├── strategies/
 │   ├── btc_updown.py        # Infrastructure test strategy logic
@@ -35,6 +39,10 @@ Run scripts are the entry points. `node.py` exposes shared infrastructure that t
 
 | Command | Description |
 |---------|-------------|
+| `python live/runs/profile.py --list` | List checked-in runner profiles |
+| `python live/runs/profiles/btc_updown_15m_live.py` | Fixed live BTC momentum profile |
+| `python live/runs/profiles/btc_updown_15m_sandbox.py` | Fixed warmup sandbox profile |
+| `python live/runs/profiles/random_signal_15m_sandbox.py` | Fixed fast sandbox profile |
 | `python live/runs/btc_updown.py --slug-pattern btc-updown-15m` | BTC momentum, live orders |
 | `python live/runs/btc_updown.py --slug-pattern btc-updown-15m --sandbox` | BTC momentum, simulated orders |
 | `python live/runs/random_signal.py --slug-pattern btc-updown-15m --sandbox` | Random signal, sandbox (testing) |
@@ -48,6 +56,32 @@ Common flags:
 | `--run-secs N` | Auto-stop after N seconds for bounded sandbox/manual runs |
 | `--sandbox` | Simulated execution — no real orders |
 | `--binance-us` | Use Binance US endpoint (for US IPs) |
+
+Fixed per-profile entrypoints intentionally do not expose the full ad hoc flag surface. The checked-in TOML file is the source of truth for market/feed/risk settings, with `--run-secs` as the only supported runtime override.
+
+---
+
+## Runner Profiles
+
+Production-style deployment now uses checked-in profile files under [live/profiles/catalog](/Users/noel/projects/trading_polymarket_nautilus/live/profiles/catalog).
+
+Each profile defines:
+- strategy
+- slug pattern
+- hours ahead
+- mode (`sandbox` or `live`)
+- Binance feed route (`global` or `us`)
+- optional bounded runtime
+- strategy-specific config overrides
+
+The generic profile runner can load a profile by name or path:
+
+```bash
+python live/runs/profile.py btc_updown_15m_live
+python live/runs/profile.py btc_updown_15m_live --print-profile
+```
+
+Fixed wrapper scripts in `live/runs/profiles/` provide one stable command per intended process. This is the preferred operator surface.
 
 ---
 
@@ -73,6 +107,12 @@ Clients registered:
 ### `make_arg_parser(description)`
 
 Returns an `argparse.ArgumentParser` with the standard flags (`--slug-pattern`, `--hours-ahead`, `--run-secs`, `--sandbox`, `--binance-us`). All run scripts use this to keep CLI consistent.
+
+### `live.runs.common.run_strategy(...)`
+
+Shared launcher that runs preflight, builds the node, instantiates the selected strategy/config pair, attaches the strategy, schedules bounded stop if requested, and starts the node.
+
+Both ad hoc runners and profile-driven runners use this path.
 
 ### `prepare_run(...)`
 
@@ -172,9 +212,9 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
    - `python tests/live/smoke_polymarket_feed.py --secs 60`
    - `python tests/live/explore_nautilus_ws.py --phase-secs 20`
 2. Run the fast bounded sandbox check:
-   - `python live/runs/random_signal.py --slug-pattern btc-updown-15m --hours-ahead 1 --sandbox --run-secs 180`
+   - `python live/runs/profiles/random_signal_15m_sandbox.py`
 3. Run the slower warmup-based sandbox check:
-   - `python live/runs/btc_updown.py --slug-pattern btc-updown-15m --hours-ahead 2 --sandbox --run-secs 600`
+   - `python live/runs/profiles/btc_updown_15m_sandbox.py`
 4. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
 5. Daily restart is acceptable even if the first window after restart is missed.
 
@@ -182,22 +222,19 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
 
-1. Production runner profiles
-   - Purpose: reproducible deployment entrypoints instead of ad hoc CLI assembly.
-   - Success: one stable command or profile per intended live process.
-2. Health guards / fail-safe controls
+1. Health guards / fail-safe controls
    - Purpose: stop or block trading when feeds are stale or process state is unsafe.
    - Success: stale or degraded inputs do not produce accidental orders.
-3. Longer sandbox soak runs
+2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability instead of startup correctness only.
    - Success: repeated rollovers and long runtimes finish cleanly.
-4. Live order lifecycle rehearsal
+3. Live order lifecycle rehearsal
    - Purpose: prove real submit/open/cancel behavior without intended fill risk.
    - Success: a tiny non-marketable live limit order opens, cancels, and leaves no residue.
-5. Minimum-size live fill rehearsal
+4. Minimum-size live fill rehearsal
    - Purpose: prove real live fills and venue reconciliation end-to-end.
    - Success: one minimum-size live round trip reconciles cleanly.
-6. Observability tightening
+5. Observability tightening
    - Purpose: make long-running live processes operable.
    - Success: operators can diagnose failures from logs and runbook alone.
 
@@ -208,7 +245,7 @@ The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/n
 1. Create `live/strategies/your_strategy.py`
 2. Define `YourStrategyConfig(StrategyConfig)` and `YourStrategy(Strategy)`
 3. Implement window roll using the **subscribe NEW before unsubscribe OLD** pattern
-4. Add a run script in `live/runs/your_strategy.py`:
+4. Add an ad hoc run script in `live/runs/your_strategy.py`:
 
 ```python
 if __name__ == "__main__":
@@ -239,4 +276,6 @@ if __name__ == "__main__":
     node.run()
 ```
 
-5. Run with: `python live/runs/your_strategy.py --slug-pattern btc-updown-15m --sandbox`
+5. Add a checked-in profile file in `live/profiles/catalog/your_profile.toml` with the market/feed/runtime choices you want operators to use.
+6. Add an optional fixed wrapper in `live/runs/profiles/your_profile.py` if this should become a stable operator command.
+7. Run ad hoc with `python live/runs/your_strategy.py --slug-pattern btc-updown-15m --sandbox`, or run the fixed profile entrypoint once it exists.

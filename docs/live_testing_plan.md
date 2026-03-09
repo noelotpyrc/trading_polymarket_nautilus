@@ -12,6 +12,7 @@ The current repo is through the sandbox gate:
 - Live data feed smokes passed
 - WS rollover behavior was verified
 - Bounded sandbox runner validation passed
+- Production-style runner profiles are implemented
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
@@ -80,6 +81,11 @@ Create deployment-ready runner profiles for real operating setups.
 - Operators do not need to manually assemble runtime flags
 - Feed selection, market selection, and risk-relevant settings are explicit and versioned
 - Sandbox and live mode differences remain deliberate and documented
+
+**Current status**
+- Implemented via checked-in TOML profiles in `live/profiles/catalog`
+- Fixed entrypoints live in `live/runs/profiles`
+- Generic loader/launcher lives in `live/runs/profile.py`
 
 ---
 
@@ -213,7 +219,7 @@ Stage 1a (fast sandbox, 180s)
 Stage 1b (warmup sandbox, 600s)
   -> python live/runs/btc_updown.py --slug-pattern btc-updown-15m --hours-ahead 2 --sandbox --run-secs 600
 Stage 2
-  -> add production runner profiles
+  -> use fixed profile entrypoints for repeatable sandbox/live sessions
 Stage 3
   -> add stale-feed / fail-safe controls
 Stage 4

@@ -1,0 +1,10 @@
+strategy = "btc_updown"
+slug_pattern = "btc-updown-15m"
+hours_ahead = 4
+mode = "live"
+binance_feed = "global"
+description = "Production-style live BTC up/down runner on global Binance feed."
+
+[strategy_config]
+trade_amount_usdc = 5.0
+signal_lookback = 5

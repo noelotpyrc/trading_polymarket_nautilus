@@ -1,0 +1,12 @@
+strategy = "random_signal"
+slug_pattern = "btc-updown-15m"
+hours_ahead = 1
+mode = "sandbox"
+binance_feed = "global"
+run_secs = 180
+description = "Fast bounded sandbox validation profile for the random signal runner."
+
+[strategy_config]
+trade_amount_usdc = 5.0
+entry_threshold = 0.5
+exit_threshold = 0.7

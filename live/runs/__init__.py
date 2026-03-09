@@ -1,1 +1,1 @@
-"""Live run scripts."""
+"""Live run scripts and profile entrypoints."""

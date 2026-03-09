@@ -72,8 +72,12 @@ Both are handled automatically by `py-clob-client`.
 ```
 node.py              # Shared TradingNode helpers (window resolution + client wiring)
 config.py            # Client config builders (Binance + Polymarket data/exec clients)
+profiles/
+  catalog/           # Checked-in runner profile TOML files
 runs/
   btc_updown.py      # Infrastructure test runner: momentum-based, slower warmup
+  profile.py         # Generic profile runner (`--list`, print/override support)
+  profiles/          # Fixed per-profile entrypoints
   random_signal.py   # Infrastructure test runner: fast stack exercise
 trade.py             # Ad-hoc order placement CLI (manual BUY/SELL for testing)
 strategies/
@@ -88,20 +92,50 @@ setup/
 
 ## Running the live node
 
+### Fixed profile entrypoints
+
 ```bash
+# List available profiles
+python live/runs/profile.py --list
+
 # Fast sandbox validation — preferred first full-stack check
-python live/runs/random_signal.py --slug-pattern btc-updown-15m --hours-ahead 1 --sandbox --run-secs 180
+python live/runs/profiles/random_signal_15m_sandbox.py
 
 # Slower sandbox validation — confirms the warmup-based strategy path
-python live/runs/btc_updown.py --slug-pattern btc-updown-15m --hours-ahead 2 --sandbox --run-secs 600
+python live/runs/profiles/btc_updown_15m_sandbox.py
 
 # Unbounded live run — only after the sandbox gate is complete
+python live/runs/profiles/btc_updown_15m_live.py
+```
+
+### Ad hoc runners
+
+```bash
+python live/runs/random_signal.py --slug-pattern btc-updown-15m --hours-ahead 1 --sandbox --run-secs 180
+python live/runs/btc_updown.py --slug-pattern btc-updown-15m --hours-ahead 2 --sandbox --run-secs 600
 python live/runs/btc_updown.py --slug-pattern btc-updown-15m
 ```
 
 Both strategies are infrastructure test strategies for validating the Nautilus live process. They are not the intended production trading logic.
 
 At startup the node validates credentials, resolves upcoming market windows from Gamma, pre-loads their instruments, and trades until the pre-loaded schedule is exhausted. The expected behavior for this phase is to restart the node each day; missing the first window after restart is acceptable.
+
+## Runner Profiles
+
+- Profile files live in [live/profiles/catalog](/Users/noel/projects/trading_polymarket_nautilus/live/profiles/catalog).
+- Secrets stay in `.env`; profile files only hold checked-in runtime choices.
+- Current catalog:
+  - `random_signal_15m_sandbox`
+  - `btc_updown_15m_sandbox`
+  - `btc_updown_15m_live`
+- Each profile pins strategy, market slug pattern, hours ahead, mode, Binance route, bounded runtime if any, and strategy-specific knobs.
+- Fixed profile entrypoints are the preferred operator surface.
+- The only supported runtime override on a fixed profile is `--run-secs`:
+
+```bash
+python live/runs/profiles/btc_updown_15m_live.py --run-secs 300
+python live/runs/profile.py btc_updown_15m_live --print-profile
+```
 
 ## Operator Notes
 
@@ -114,21 +148,18 @@ At startup the node validates credentials, resolves upcoming market windows from
 
 The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next implementation stages are:
 
-1. Production runner profiles
-   - Purpose: convert test-oriented runner usage into reproducible deployment profiles.
-   - Success: one stable command or profile per intended production process.
-2. Health guards / fail-safe controls
+1. Health guards / fail-safe controls
    - Purpose: stop or block trading when feeds are stale or state is unsafe.
    - Success: degraded feeds cannot trigger accidental entries.
-3. Longer sandbox soak runs
+2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability.
    - Success: repeated rollovers and long runtimes remain clean.
-4. Live order lifecycle rehearsal
+3. Live order lifecycle rehearsal
    - Purpose: prove live submit/open/cancel behavior with no intended fill.
    - Success: a tiny non-marketable live order opens and cancels cleanly.
-5. Minimum-size live fill rehearsal
+4. Minimum-size live fill rehearsal
    - Purpose: prove the live execution path end-to-end.
    - Success: one minimum-size live round trip reconciles with Polymarket.
-6. Observability tightening
+5. Observability tightening
    - Purpose: make the live system operable at session and multi-node scale.
    - Success: logs and runbook are enough to diagnose failures without code inspection.

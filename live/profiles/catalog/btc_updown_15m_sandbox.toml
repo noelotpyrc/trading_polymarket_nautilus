@@ -1,0 +1,11 @@
+strategy = "btc_updown"
+slug_pattern = "btc-updown-15m"
+hours_ahead = 2
+mode = "sandbox"
+binance_feed = "global"
+run_secs = 600
+description = "Bounded sandbox validation profile for the BTC momentum runner."
+
+[strategy_config]
+trade_amount_usdc = 5.0
+signal_lookback = 5

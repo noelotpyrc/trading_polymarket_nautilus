@@ -117,8 +117,7 @@ def main() -> None:
         print("Test wallet setup complete. No funding needed.")
         print(
             "Run sandbox mode: "
-            "python live/runs/random_signal.py --slug-pattern btc-updown-15m "
-            "--hours-ahead 1 --sandbox --run-secs 180"
+            "python live/runs/profiles/random_signal_15m_sandbox.py"
         )
     else:
         print("Next step (requires POL for gas): python live/setup/set_allowances.py")

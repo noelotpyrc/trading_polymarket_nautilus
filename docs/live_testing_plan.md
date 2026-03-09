@@ -1,95 +1,233 @@
 # Live Testing Plan
 
-How to test the live trading infrastructure before deploying with real capital.
+How to validate the live Nautilus process before deploying with meaningful capital.
 
-Polymarket has no testnet — all testing must be done either with mocked execution or with real but minimal orders.
+Polymarket has no testnet. Validation must progress from sandboxed live-data runs to tightly controlled live order rehearsals.
 
 ---
 
-## Stage 1 — Replay + Mock Exec (fully offline)
+## Current Status
 
-Feed recorded WS book data as the Polymarket data source and replace the exec client with a mock that logs orders without submitting them.
+The current repo is through the sandbox gate:
+- Live data feed smokes passed
+- WS rollover behavior was verified
+- Bounded sandbox runner validation passed
+- Daily restart with pre-loaded windows is the accepted operating model for now
+
+What is **not** proven yet:
+- Real Polymarket order submission and cancel behavior
+- Real live fill handling and venue reconciliation
+- Multi-hour stability under production-style supervision
+
+---
+
+## Stage 1 — Sandbox Live Process
+
+Connect to real live data feeds but replace Polymarket execution with Nautilus sandbox execution.
+
+**Purpose**
+- Prove the live process is correct without market risk
+- Validate startup, subscriptions, signals, rollover, shutdown, and basic simulated order lifecycle
+- Catch Nautilus integration issues before any live order is sent
 
 **What it tests**
-- Strategy signal computation from Binance bars
-- Order trigger logic (entry/exit thresholds on `prob_yes_emp`)
-- Order sizing and instrument routing
-- Position tracking updates
+- Polymarket data adapter parsing real WS events
+- Binance live kline stream -> signal pipeline latency
+- Strategy signal computation and order trigger logic
+- Instrument routing and window lifecycle
+- Pending-order cleanup on rollover and stop
 
 **What it does NOT test**
-- Actual CLOB order submission
-- Fill confirmation handling
-- Polymarket adapter data parsing (adapter is bypassed)
-
-**Data sources**
-- Binance: recorded 1m bars or live Binance WS (no API key needed for public klines)
-- Polymarket: `data/ws_recordings/*.jsonl.gz` replayed as `QuoteTick` events
+- Real CLOB order submission
+- Real venue order state reconciliation
+- Real fill semantics and venue-side balances
 
 **How**
-- Build a replay data client that reads `.jsonl.gz` files and emits `QuoteTick` at the recorded timestamps
-- Replace `PolymarketExecClientConfig` with a `MockExecClient` that logs order requests and simulates immediate fill confirmations
-- Run fully reproducible — same scenario can be replayed multiple times
+- Use bounded runners with `--run-secs`
+- `--sandbox` swaps `PolymarketExecClientConfig` for `SandboxLiveExecClientFactory`
+- Real `BinanceDataClientConfig` + `PolymarketDataClientConfig` stay unchanged
+
+**Success criteria**
+- Live automated tests are green
+- Both live runner CLIs load cleanly with `--help`
+- Sandbox runs finish without uncaught exceptions or broken quote subscriptions after rollover
+- No runner gets stuck in a pending-entry state after reject, deny, cancel, or window exhaustion
+- Window exhaustion produces a clean stop and explicit restart-needed log message
+
+**Expected operational model**
+- The node stops cleanly once pre-loaded windows are exhausted
+- Daily restart is acceptable for this phase
+- Missing the first window after restart is acceptable
 
 ---
 
-## Stage 2 — Shadow Mode (live data, mock exec)
+## Stage 2 — Production Runner Profiles
 
-Connect to real live data feeds but still block actual order submission.
+Create deployment-ready runner profiles for real operating setups.
 
-**What it tests**
-- Everything in Stage 1, plus:
-- Polymarket data adapter parsing real WS events (`book`, `last_trade_price`)
-- Binance live kline stream → signal pipeline latency
-- Market discovery and instrument lifecycle (window transitions)
+**Purpose**
+- Turn test-oriented CLI usage into reproducible production process definitions
+- Reduce operator error by replacing ad hoc flag combinations with fixed profiles
+- Separate deployment wiring from strategy logic
 
-**What it does NOT test**
-- Actual CLOB submission and fill handling
+**What we will implement**
+- Checked-in runner profiles or profile-driven launch config for each intended prod process
+- Stable settings for strategy, slug pattern, hours ahead, Binance route, risk knobs, and runtime policy
+- Secrets remain in environment variables, not in profile files
 
-**How**
-- Run full `TradingNode` with real `BinanceDataClientConfig` + `PolymarketDataClientConfig`
-- Replace only `PolymarketExecClientConfig` with a `MockExecClient`
-- Log every would-be order with timestamp, price, size, side
+**Success criteria**
+- Each intended production process starts from one stable command or profile
+- Operators do not need to manually assemble runtime flags
+- Feed selection, market selection, and risk-relevant settings are explicit and versioned
+- Sandbox and live mode differences remain deliberate and documented
 
 ---
 
-## Stage 3 — Real Minimum Orders
+## Stage 3 — Health Guards / Fail-Safe Controls
 
-Run the full live node with real order submission, hard-capped at minimum size.
+Add health gating so the node stops trading when the process is alive but the inputs are not trustworthy.
 
-**What it tests**
-- Everything, including CLOB order submission, fill confirmation, position tracking
+**Purpose**
+- Prevent trading on stale or incomplete data
+- Fail safe instead of silently running in a degraded state
+- Make operational failure modes explicit in logs
+
+**What we will implement**
+- Binance bar staleness guard
+- Polymarket quote staleness guard for the active instrument
+- Clear stop or no-entry behavior when feeds are stale or rollover state is unsafe
+- Exit reasons that are obvious from logs
+
+**Success criteria**
+- New entries are blocked when feed freshness conditions are violated
+- Unsafe state leads to clean stop or explicit degraded-mode behavior
+- Tests prove stale-input conditions do not produce accidental orders
+- Operators can identify the failure cause from logs alone
+
+---
+
+## Stage 4 — Longer Sandbox Soak Runs
+
+Run the live process for hours, not minutes.
+
+**Purpose**
+- Prove stability over time instead of just correctness at startup
+- Catch reconnect issues, timer drift, rollover accumulation, and noisy-feed edge cases
+- Validate that the runner shape can survive normal session length
+
+**What we will implement**
+- Multi-hour sandbox runs for the intended runner profiles
+- Log review for reconnects, rollover continuity, pending-order cleanup, and shutdown
+
+**Success criteria**
+- Multi-hour sandbox runs complete without uncaught exceptions
+- Quote subscriptions survive rollover repeatedly
+- No stuck pending-entry state, runaway log storm, or degraded process behavior
+- Shutdown remains clean after long runtimes
+
+---
+
+## Stage 5 — Live Order Lifecycle Rehearsal (No Intended Fill)
+
+Submit a tiny live order that is intended to rest, then cancel it.
+
+**Purpose**
+- Prove the live control plane before taking fill risk
+- Validate live auth, order submission, open-order state, cancel, and cleanup
+- Confirm Nautilus state matches venue state for a real live order
+
+**What we will implement**
+- Use one supervised live process
+- Submit a very small non-marketable limit order on a healthy market
+- Prefer `post_only=True` if supported by the order path
+- Wait for open confirmation, then cancel quickly
+
+**Success criteria**
+- The live order is accepted by Polymarket
+- Nautilus sees the order as open
+- Cancel succeeds cleanly
+- No fill occurs
+- No residual open order or position remains afterward
+- Venue state matches Nautilus state after cleanup
+
+---
+
+## Stage 6 — Minimum-Size Live Fill Rehearsal
+
+Execute the smallest practical live position, then flatten it.
+
+**Purpose**
+- Prove the live execution path end-to-end, including fills
+- Validate real account balances, fees, position lifecycle, and flatten behavior
+- Close the gap that sandbox cannot prove
+
+**What we will implement**
+- Hard-cap live size to the minimum practical amount
+- Run one supervised process with one position at a time
+- Enter and exit a live position under strict exposure limits
 
 **Risk controls**
-- Hard cap: $5–$10 per order, $20 total exposure
-- Only one position open at a time
-- Add a `max_notional` guard in the strategy before `submit_order`
+- Hard cap: minimum practical notional only
+- Only one live position open at a time
+- Strategy-side max-notional guard before `submit_order`
 
-**Exit criterion**
-- At least one full round-trip (entry + exit + settlement) confirmed working
-- Position P&L reconciles with CLOB trade history
+**Success criteria**
+- At least one full round trip completes live
+- Entry, exit, and final position state all reconcile with Polymarket
+- Fees and balances line up with venue history
+- No unexplained divergence remains between Nautilus state and venue state
 
 ---
 
-## Sequence
+## Stage 7 — Observability Tightening
+
+Make the system operable once multiple long-running nodes exist.
+
+**Purpose**
+- Make debugging and supervision practical
+- Preserve enough context to answer what happened without replaying a session manually
+- Support production operation instead of single-session experimentation
+
+**What we will implement**
+- Durable per-run log locations
+- Clear lifecycle markers in logs
+- Short operator runbook for restart, failure modes, and expected actions
+
+**Success criteria**
+- Every run produces durable logs with enough context to diagnose failures
+- Operators can answer what happened, when, and what action is needed from logs alone
+- Restart and recovery expectations are documented and consistent with actual behavior
+
+---
+
+## Recommended Sequence
 
 ```
-Stage 1 (offline replay)
-  → confirm signal fires at right moments, orders sized correctly
-Stage 2 (shadow mode)
-  → confirm live data adapters work, no parsing errors, window transitions clean
-Stage 3 ($5 real orders)
-  → confirm CLOB submission, fill handling, position lifecycle end-to-end
-  → then increase size
+Feed smokes
+  -> confirm Binance bars, Polymarket quotes, and WS rollover behavior
+Stage 1a (fast sandbox, 180s)
+  -> python tests/live/smoke_binance_feed.py --secs 90
+  -> python tests/live/smoke_polymarket_feed.py --secs 60
+  -> python tests/live/explore_nautilus_ws.py --phase-secs 20
+  -> python live/runs/random_signal.py --slug-pattern btc-updown-15m --hours-ahead 1 --sandbox --run-secs 180
+Stage 1b (warmup sandbox, 600s)
+  -> python live/runs/btc_updown.py --slug-pattern btc-updown-15m --hours-ahead 2 --sandbox --run-secs 600
+Stage 2
+  -> add production runner profiles
+Stage 3
+  -> add stale-feed / fail-safe controls
+Stage 4
+  -> run multi-hour sandbox soak sessions on the production profiles
+Stage 5
+  -> submit a tiny non-marketable live limit order and cancel it
+Stage 6
+  -> execute one minimum-size live fill-and-flatten rehearsal
+Stage 7
+  -> tighten log retention and operator-facing observability
 ```
 
 ---
 
 ## WS Recordings
 
-`data/ws_recordings/*.jsonl.gz` — compact gzip JSONL, one file per market window.
-
-Used in Stage 1 as a reproducible Polymarket data source. See `docs/ws_book_recording_format.md` for format details.
-
-Recorder: `historical/fetch/record_ws.py --slug-pattern btc-updown-5m`
-
-Keep at least a few days of recordings before building the Stage 1 replay client, to have enough windows for meaningful testing.
+`data/ws_recordings/*.jsonl.gz` are used for **execution simulation during backtesting**, not for live infrastructure testing. See `docs/ws_book_recording_format.md` for format details.

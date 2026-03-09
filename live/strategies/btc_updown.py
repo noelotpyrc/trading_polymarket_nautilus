@@ -1,104 +1,118 @@
-"""BTC up/down market strategy — same class runs in backtest and live."""
+"""BTC up/down infrastructure test strategy for the live process.
+
+Signal: BTC momentum over N 1-minute bars.
+Execution: Polymarket YES token via quote ticks.
+Window transitions: driven by time alerts, not data timestamps.
+"""
 from collections import deque
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
-from nautilus_trader.model.enums import OrderSide
-from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.objects import Quantity
-from nautilus_trader.trading.strategy import Strategy
+
+from live.strategies.windowed import WindowedPolymarketStrategy, _fmt_ns
 
 
 class BtcUpDownConfig(StrategyConfig, frozen=True):
-    pm_instrument_id: str           # "TOKEN_ID.POLYMARKET"
-    btc_bar_type: str = "BTCUSDT.BINANCE-1-MINUTE-LAST-EXTERNAL"
-    interval_minutes: int = 15
+    # Ordered list of pre-resolved windows: current first, then upcoming.
+    # Both tuples must be the same length.
+    pm_instrument_ids: tuple[str, ...]
+    window_end_times_ns: tuple[int, ...]
+
+    btc_bar_type: str = "BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL"
     trade_amount_usdc: float = 5.0
-    signal_lookback: int = 5        # N bars of BTC momentum
+    signal_lookback: int = 5
 
 
-class BtcUpDownStrategy(Strategy):
+class BtcUpDownStrategy(WindowedPolymarketStrategy):
+    _STATUS_INTERVAL_NS = 30_000_000_000  # 30 seconds
+
     def __init__(self, config: BtcUpDownConfig):
         super().__init__(config)
-        self._pm_instrument_id = InstrumentId.from_str(config.pm_instrument_id)
         self._btc_bar_type = BarType.from_str(config.btc_bar_type)
-        self._pm_bar_type = BarType.from_str(
-            f"{config.pm_instrument_id}-1-MINUTE-LAST-EXTERNAL"
-        )
-        self._interval_ns = config.interval_minutes * 60 * 1_000_000_000
         self._trade_amount = config.trade_amount_usdc
         self._signal_lookback = config.signal_lookback
-
         self._btc_closes: deque[float] = deque(maxlen=config.signal_lookback + 1)
-        self._entered_this_epoch = False
-        self._current_epoch = -1
-        self._trade_count = 0
 
     def on_start(self):
         self.subscribe_bars(self._btc_bar_type)
-        self.subscribe_bars(self._pm_bar_type)
+        self._start_window_lifecycle()
+        self.clock.set_timer_ns(
+            "status",
+            self._STATUS_INTERVAL_NS,
+            0,
+            0,
+            self._on_status_timer,
+        )
         self.log.info(
             f"Started | PM={self._pm_instrument_id} "
-            f"lookback={self._signal_lookback} amount=${self._trade_amount}"
+            f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
+            f"{len(self._windows)} window(s) pre-loaded"
         )
 
+    def on_stop(self):
+        self.clock.cancel_timer("status")
+        self._stop_window_lifecycle()
+        self.log.info(f"Stopped | total fills: {self._trade_count}")
+
     def on_bar(self, bar: Bar):
-        if bar.bar_type.instrument_id.venue.value == "BINANCE":
-            self._on_btc_bar(bar)
-        else:
-            self._on_pm_bar(bar)
-
-    def _on_btc_bar(self, bar: Bar):
         self._btc_closes.append(float(bar.close))
+        if len(self._btc_closes) > self._signal_lookback:
+            signal = self._compute_signal()
+            signal_str = {1: "BULLISH ↑", -1: "BEARISH ↓", 0: "NEUTRAL →"}.get(signal, "?")
+            self._check_entry_exit(bar.ts_event)
+        else:
+            signal_str = f"WAITING ({len(self._btc_closes)}/{self._signal_lookback + 1} bars)"
+        self.log.info(f"BTC close={bar.close} | {signal_str}")
 
-    def _on_pm_bar(self, bar: Bar):
-        epoch = bar.ts_event // self._interval_ns
-        if epoch != self._current_epoch:
-            self._current_epoch = epoch
-            self._entered_this_epoch = False
-            # Close any leftover position from the previous epoch
-            for pos in self.cache.positions_open(instrument_id=self._pm_instrument_id):
-                self.close_position(pos)
+    def _on_status_timer(self, event) -> None:
+        entered_str = "YES" if self._entered_this_window else "no"
+        self.log.info(
+            f"[heartbeat] PM={self._quote_state_str(self.clock.timestamp_ns())} | "
+            f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
+            f"entered={entered_str} | fills={self._trade_count}"
+        )
 
-        if len(self._btc_closes) <= self._signal_lookback:
-            return
+    def _on_window_end(self, event) -> None:
+        self._roll_to_next_window(
+            exhausted_message=(
+                "No more pre-loaded windows — stopping. "
+                "Restart the node for the next session."
+            ),
+        )
 
+    def _check_entry_exit(self, signal_ts_ns: int) -> None:
         signal = self._compute_signal()
         positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
 
-        # Exit: close long on bearish signal
         if positions and signal == -1:
             for pos in positions:
                 self.close_position(pos)
             return
 
-        # Enter: buy YES on bullish signal, once per epoch
-        if not positions and not self._entered_this_epoch and signal == 1:
-            self._submit_yes_order()
-            self._entered_this_epoch = True
+        if (
+            not positions
+            and not self._entered_this_window
+            and not self._entry_order_pending
+            and signal == 1
+        ):
+            reason = self._entry_guard_reason(signal_ts_ns)
+            if reason is not None:
+                self.log.info(f"Bullish entry skipped on {self._pm_instrument_id}: {reason}")
+                return
+            super()._submit_yes_order(self._trade_amount)
+            mid_str = f" mid={self._pm_mid:.4f}" if self._pm_mid else ""
+            self.log.info(f"BUY ${self._trade_amount} on {self._pm_instrument_id}{mid_str}")
 
     def _compute_signal(self) -> int:
-        """1=bullish, -1=bearish, 0=neutral."""
-        closes = list(self._btc_closes)
-        if closes[-1] > closes[0]:
-            return 1
-        elif closes[-1] < closes[0]:
-            return -1
+        return compute_signal(list(self._btc_closes))
+
+
+def compute_signal(closes: list[float]) -> int:
+    """BTC momentum signal over a window of closes."""
+    if len(closes) < 2:
         return 0
-
-    def _submit_yes_order(self):
-        order = self.order_factory.market(
-            instrument_id=self._pm_instrument_id,
-            order_side=OrderSide.BUY,
-            quantity=Quantity.from_str(f"{self._trade_amount:.6f}"),
-        )
-        self.submit_order(order)
-
-    def on_order_filled(self, event):
-        self._trade_count += 1
-        self.log.info(
-            f"Fill #{self._trade_count}: price={event.last_px} qty={event.last_qty}"
-        )
-
-    def on_stop(self):
-        self.log.info(f"Stopped | total fills: {self._trade_count}")
+    if closes[-1] > closes[0]:
+        return 1
+    if closes[-1] < closes[0]:
+        return -1
+    return 0

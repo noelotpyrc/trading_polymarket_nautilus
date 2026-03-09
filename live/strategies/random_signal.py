@@ -1,0 +1,89 @@
+"""Random infrastructure test strategy for the live process.
+
+Subscribes to BTC 1-minute bars and Polymarket quote ticks. On every bar,
+rolls `random()`; if above threshold, enters immediately. This is intended to
+exercise feed wiring, order lifecycle, and window roll behavior quickly.
+
+Usage:
+    python live/runs/random_signal.py --slug-pattern btc-updown-15m --sandbox
+"""
+import random
+
+from nautilus_trader.config import StrategyConfig
+from nautilus_trader.model.data import Bar, BarType
+
+from live.strategies.windowed import WindowedPolymarketStrategy, _fmt_ns
+
+
+class RandomSignalConfig(StrategyConfig, frozen=True):
+    pm_instrument_ids: tuple[str, ...]
+    window_end_times_ns: tuple[int, ...]
+
+    btc_bar_type: str = "BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL"
+    entry_threshold: float = 0.5
+    exit_threshold: float = 0.7
+    trade_amount_usdc: float = 5.0
+
+
+class RandomSignalStrategy(WindowedPolymarketStrategy):
+    def __init__(self, config: RandomSignalConfig):
+        super().__init__(config)
+        self._btc_bar_type = BarType.from_str(config.btc_bar_type)
+        self._trade_amount = config.trade_amount_usdc
+        self._entry_threshold = config.entry_threshold
+        self._exit_threshold = config.exit_threshold
+
+    def on_start(self):
+        self.subscribe_bars(self._btc_bar_type)
+        self._start_window_lifecycle()
+        self.log.info(
+            f"Started | PM={self._pm_instrument_id} | "
+            f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
+            f"entry_threshold={self._entry_threshold} | exit_threshold={self._exit_threshold}"
+        )
+
+    def on_stop(self):
+        self._stop_window_lifecycle()
+        self.log.info(f"Stopped | total fills: {self._trade_count}")
+
+    def on_bar(self, bar: Bar):
+        value = random.random()
+        mid_str = self._quote_state_str(bar.ts_event)
+        positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
+
+        if positions and value > self._exit_threshold:
+            self.log.info(
+                f"BTC={bar.close} rand={value:.3f} > {self._exit_threshold} → EXIT  mid={mid_str}"
+            )
+            for pos in positions:
+                self.close_position(pos)
+            return
+
+        if (
+            not positions
+            and not self._entered_this_window
+            and not self._entry_order_pending
+            and value > self._entry_threshold
+        ):
+            reason = self._entry_guard_reason(bar.ts_event)
+            if reason is not None:
+                self.log.info(f"BTC={bar.close} rand={value:.3f} → ENTER skipped ({reason})")
+                return
+            self.log.info(
+                f"BTC={bar.close} rand={value:.3f} > {self._entry_threshold} → ENTER  mid={mid_str}"
+            )
+            super()._submit_yes_order(self._trade_amount)
+            self.log.info(f"BUY ${self._trade_amount} on {self._pm_instrument_id}")
+        else:
+            self.log.info(
+                f"BTC={bar.close} rand={value:.3f} | mid={mid_str} | "
+                f"entered={self._entered_this_window} | positions={len(positions)}"
+            )
+
+    def _on_window_end(self, event) -> None:
+        self._roll_to_next_window(
+            exhausted_message=(
+                "No more pre-loaded windows — stopping. "
+                "Restart the node for the next session."
+            ),
+        )

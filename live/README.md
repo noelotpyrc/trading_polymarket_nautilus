@@ -101,10 +101,10 @@ python live/runs/profile.py --list
 # Fast sandbox validation — preferred first full-stack check
 python live/runs/profiles/random_signal_15m_sandbox.py
 
-# Slower sandbox validation — confirms the warmup-based strategy path
+# Slower sandbox validation — exercises the 14-day Binance warmup path
 python live/runs/profiles/btc_updown_15m_sandbox.py
 
-# Unbounded live run — only after the sandbox gate is complete
+# Unbounded live run — includes 14-day Binance warmup, only after the sandbox gate is complete
 python live/runs/profiles/btc_updown_15m_live.py
 ```
 
@@ -129,6 +129,7 @@ At startup the node validates credentials, resolves upcoming market windows from
   - `btc_updown_15m_sandbox`
   - `btc_updown_15m_live`
 - Each profile pins strategy, market slug pattern, hours ahead, mode, Binance route, bounded runtime if any, and strategy-specific knobs.
+- The checked-in `btc_updown` profiles currently set `warmup_days = 14`.
 - Fixed profile entrypoints are the preferred operator surface.
 - The only supported runtime override on a fixed profile is `--run-secs`:
 
@@ -148,18 +149,21 @@ python live/runs/profile.py btc_updown_15m_live --print-profile
 
 The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next implementation stages are:
 
-1. Health guards / fail-safe controls
+1. Outcome-side support (`yes` / `no`)
+   - Purpose: remove the current YES-only assumption and allow fixed-side NO-token runs.
+   - Success: a checked-in profile can run correctly against either outcome side.
+2. Health guards / fail-safe controls
    - Purpose: stop or block trading when feeds are stale or state is unsafe.
    - Success: degraded feeds cannot trigger accidental entries.
-2. Longer sandbox soak runs
+3. Longer sandbox soak runs
    - Purpose: prove multi-hour stability.
    - Success: repeated rollovers and long runtimes remain clean.
-3. Live order lifecycle rehearsal
+4. Live order lifecycle rehearsal
    - Purpose: prove live submit/open/cancel behavior with no intended fill.
    - Success: a tiny non-marketable live order opens and cancels cleanly.
-4. Minimum-size live fill rehearsal
+5. Minimum-size live fill rehearsal
    - Purpose: prove the live execution path end-to-end.
    - Success: one minimum-size live round trip reconciles with Polymarket.
-5. Observability tightening
+6. Observability tightening
    - Purpose: make the live system operable at session and multi-node scale.
    - Success: logs and runbook are enough to diagnose failures without code inspection.

@@ -13,9 +13,11 @@ The current repo is through the sandbox gate:
 - WS rollover behavior was verified
 - Bounded sandbox runner validation passed
 - Production-style runner profiles are implemented
+- Binance historical warmup is implemented for the `btc_updown` runner via `warmup_days`
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
+- Profile-driven NO-token execution path
 - Real Polymarket order submission and cancel behavior
 - Real live fill handling and venue reconciliation
 - Multi-hour stability under production-style supervision
@@ -89,7 +91,53 @@ Create deployment-ready runner profiles for real operating setups.
 
 ---
 
-## Stage 3 — Health Guards / Fail-Safe Controls
+## Stage 3 — Binance Historical Warmup
+
+Load historical Binance bars at live-strategy startup before relying on the live stream alone.
+
+**Purpose**
+- Remove the need to wait several live bars before the production strategy can compute signals
+- Make live startup behavior match the intended production signal pipeline more closely
+- Prove the Nautilus live node can mix historical Binance bootstrap with ongoing Binance live subscriptions
+
+**Implementation status**
+- Implemented for `BtcUpDownStrategy` with `warmup_days`
+- Uses Nautilus live `request_bars(...)` at startup
+- Buffers live Binance bars while the historical request is in flight, then merges/dedupes before enabling entries
+- Covered by focused unit/profile tests and warmup benchmarks
+
+**Success criteria**
+- A live strategy receives the configured number of historical Binance bars before trading
+- No entry is allowed before warmup is complete
+- The first live signal after startup matches the expected signal from equivalent historical input
+- Startup remains clean when Binance historical requests return no data or incomplete data
+
+---
+
+## Stage 4 — Outcome-Side Support (YES / NO)
+
+Allow live runners to target the NO token as well as the YES token.
+
+**Purpose**
+- Remove the current YES-only restriction in the live process
+- Support production strategies that want fixed-side deployment on either outcome
+- Make outcome side an explicit deployment choice instead of a hard-coded assumption
+
+**What we will implement**
+- Add outcome-side selection (`yes` or `no`) to runner profiles
+- Resolve the correct Polymarket token for each window instead of always taking `clobTokenIds[0]`
+- Route subscriptions and orders to the selected outcome instrument
+- Keep scope to one chosen outcome side per process/profile; dynamic same-window YES/NO switching is out of scope for this stage
+
+**Success criteria**
+- A checked-in profile can start a live or sandbox process in `yes` mode or `no` mode
+- The resolved instrument IDs match the selected outcome side for every pre-loaded window
+- Sandbox validation proves the selected outcome side can subscribe, enter, exit, and roll windows correctly
+- Docs and operator commands make the selected outcome side explicit
+
+---
+
+## Stage 5 — Health Guards / Fail-Safe Controls
 
 Add health gating so the node stops trading when the process is alive but the inputs are not trustworthy.
 
@@ -112,7 +160,7 @@ Add health gating so the node stops trading when the process is alive but the in
 
 ---
 
-## Stage 4 — Longer Sandbox Soak Runs
+## Stage 6 — Longer Sandbox Soak Runs
 
 Run the live process for hours, not minutes.
 
@@ -133,7 +181,7 @@ Run the live process for hours, not minutes.
 
 ---
 
-## Stage 5 — Live Order Lifecycle Rehearsal (No Intended Fill)
+## Stage 7 — Live Order Lifecycle Rehearsal (No Intended Fill)
 
 Submit a tiny live order that is intended to rest, then cancel it.
 
@@ -158,7 +206,7 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 ---
 
-## Stage 6 — Minimum-Size Live Fill Rehearsal
+## Stage 8 — Minimum-Size Live Fill Rehearsal
 
 Execute the smallest practical live position, then flatten it.
 
@@ -185,7 +233,7 @@ Execute the smallest practical live position, then flatten it.
 
 ---
 
-## Stage 7 — Observability Tightening
+## Stage 9 — Observability Tightening
 
 Make the system operable once multiple long-running nodes exist.
 
@@ -221,14 +269,18 @@ Stage 1b (warmup sandbox, 600s)
 Stage 2
   -> use fixed profile entrypoints for repeatable sandbox/live sessions
 Stage 3
-  -> add stale-feed / fail-safe controls
+  -> validate the btc_updown warmup runner/profile path
 Stage 4
-  -> run multi-hour sandbox soak sessions on the production profiles
+  -> add fixed YES/NO outcome-side selection to runner profiles
 Stage 5
-  -> submit a tiny non-marketable live limit order and cancel it
+  -> add stale-feed / fail-safe controls
 Stage 6
-  -> execute one minimum-size live fill-and-flatten rehearsal
+  -> run multi-hour sandbox soak sessions on the production profiles
 Stage 7
+  -> submit a tiny non-marketable live limit order and cancel it
+Stage 8
+  -> execute one minimum-size live fill-and-flatten rehearsal
+Stage 9
   -> tighten log retention and operator-facing observability
 ```
 

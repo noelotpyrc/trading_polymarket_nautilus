@@ -137,10 +137,11 @@ Infrastructure test strategy. Signal based on BTC 1-minute bar momentum.
 | `btc_bar_type` | `BTCUSDT-PERP.BINANCE-1-MINUTE-LAST-EXTERNAL` | Bar type for signal |
 | `signal_lookback` | `5` | Number of bars for momentum window |
 | `trade_amount_usdc` | `5.0` | Order size in USDC |
+| `warmup_days` | `0` | Historical Binance warmup window loaded at startup |
 
 **Signal logic:**
 
-Requires `signal_lookback + 1` bars to fire (~6 minutes warmup on 1m bars).
+Requires `signal_lookback + 1` bars to fire. With `warmup_days > 0`, the strategy requests historical Binance bars at startup, buffers live bars while the request is in flight, then merges/dedupes them before allowing entries.
 - `closes[-1] > closes[0]` → bullish → BUY YES
 - `closes[-1] < closes[0]` → bearish → exit if in position
 - Enters once per window; exits on bearish signal
@@ -222,19 +223,22 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
 
-1. Health guards / fail-safe controls
+1. Outcome-side support (`yes` / `no`)
+   - Purpose: remove the current YES-only assumption and allow fixed-side NO-token runs.
+   - Success: a checked-in profile can run correctly against either outcome side.
+2. Health guards / fail-safe controls
    - Purpose: stop or block trading when feeds are stale or process state is unsafe.
    - Success: stale or degraded inputs do not produce accidental orders.
-2. Longer sandbox soak runs
+3. Longer sandbox soak runs
    - Purpose: prove multi-hour stability instead of startup correctness only.
    - Success: repeated rollovers and long runtimes finish cleanly.
-3. Live order lifecycle rehearsal
+4. Live order lifecycle rehearsal
    - Purpose: prove real submit/open/cancel behavior without intended fill risk.
    - Success: a tiny non-marketable live limit order opens, cancels, and leaves no residue.
-4. Minimum-size live fill rehearsal
+5. Minimum-size live fill rehearsal
    - Purpose: prove real live fills and venue reconciliation end-to-end.
    - Success: one minimum-size live round trip reconciles cleanly.
-5. Observability tightening
+6. Observability tightening
    - Purpose: make long-running live processes operable.
    - Success: operators can diagnose failures from logs and runbook alone.
 

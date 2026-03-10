@@ -9,3 +9,4 @@ description = "Bounded sandbox validation profile for the BTC momentum runner."
 [strategy_config]
 trade_amount_usdc = 5.0
 signal_lookback = 5
+warmup_days = 14

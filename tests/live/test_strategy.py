@@ -1,7 +1,60 @@
 """Unit tests for live strategy pure logic."""
+from datetime import datetime, timezone
+
 import pytest
 
-from live.strategies.btc_updown import compute_signal
+from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.test_kit.providers import TestInstrumentProvider
+
+from live.strategies.btc_updown import BtcUpDownConfig, BtcUpDownStrategy, compute_signal
+
+BTC = TestInstrumentProvider.btcusdt_perp_binance()
+BTC_BAR_TYPE = BarType.from_str(f"{BTC.id}-1-MINUTE-LAST-EXTERNAL")
+
+
+def _btc_bar(close: float, ts_ns: int) -> Bar:
+    return Bar(
+        bar_type=BTC_BAR_TYPE,
+        open=BTC.make_price(close - 10),
+        high=BTC.make_price(close + 10),
+        low=BTC.make_price(close - 10),
+        close=BTC.make_price(close),
+        volume=BTC.make_qty(1.0),
+        ts_event=ts_ns,
+        ts_init=ts_ns,
+    )
+
+
+class WarmupHarness(BtcUpDownStrategy):
+    def __init__(self, config: BtcUpDownConfig):
+        super().__init__(config)
+        self.requests = []
+        self.entry_checks = []
+
+    def request_bars(self, bar_type, start, end=None, callback=None, **kwargs):
+        self.requests.append(
+            {
+                "bar_type": bar_type,
+                "start": start,
+                "end": end,
+                "callback": callback,
+            }
+        )
+        return "REQ-1"
+
+    def _check_entry_exit(self, signal_ts_ns: int) -> None:
+        self.entry_checks.append(signal_ts_ns)
+
+
+def _warmup_strategy(*, signal_lookback: int = 2, warmup_days: int = 14) -> WarmupHarness:
+    return WarmupHarness(
+        BtcUpDownConfig(
+            pm_instrument_ids=("a.POLYMARKET",),
+            window_end_times_ns=(1_000_000_000,),
+            signal_lookback=signal_lookback,
+            warmup_days=warmup_days,
+        )
+    )
 
 
 class TestComputeSignal:
@@ -36,3 +89,108 @@ class TestComputeSignal:
         # Middle values are irrelevant to the signal
         assert compute_signal([100.0, 50.0, 200.0, 150.0, 101.0]) == 1
         assert compute_signal([100.0, 50.0, 200.0, 150.0, 99.0]) == -1
+
+
+class TestBtcWarmup:
+    def test_rejects_negative_warmup_days(self):
+        with pytest.raises(ValueError, match="warmup_days must be >= 0"):
+            BtcUpDownStrategy(
+                BtcUpDownConfig(
+                    pm_instrument_ids=("a.POLYMARKET",),
+                    window_end_times_ns=(1_000_000_000,),
+                    warmup_days=-1,
+                )
+            )
+
+    def test_start_btc_warmup_requests_expected_range(self):
+        strategy = _warmup_strategy()
+        now = datetime(2026, 3, 9, 15, 27, 42, tzinfo=timezone.utc)
+
+        strategy._start_btc_warmup(now=now)
+
+        assert strategy._warmup_request_inflight is True
+        assert strategy.requests == [
+            {
+                "bar_type": BTC_BAR_TYPE,
+                "start": datetime(2026, 2, 23, 15, 27, tzinfo=timezone.utc),
+                "end": datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc),
+                "callback": strategy._on_warmup_complete,
+            }
+        ]
+
+    def test_live_bars_buffer_until_warmup_complete(self):
+        strategy = _warmup_strategy()
+
+        strategy.on_bar(_btc_bar(100.0, 1_000))
+
+        assert list(strategy._btc_closes) == []
+        assert strategy._warmup_live_buffer == {1_000: 100.0}
+        assert strategy.entry_checks == []
+
+    def test_warmup_complete_merges_history_and_buffered_live_bars(self):
+        strategy = _warmup_strategy(signal_lookback=2)
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+
+        strategy.on_historical_data(_btc_bar(100.0, 1_000))
+        strategy.on_historical_data(_btc_bar(101.0, 2_000))
+        strategy.on_bar(_btc_bar(102.0, 3_000))
+
+        strategy._on_warmup_complete("REQ-1")
+
+        assert strategy._warmup_complete is True
+        assert strategy._warmup_request_inflight is False
+        assert strategy._warmup_history == {}
+        assert strategy._warmup_live_buffer == {}
+        assert list(strategy._btc_closes) == [100.0, 101.0, 102.0]
+        assert strategy.entry_checks == [3_000]
+
+    def test_warmup_complete_dedupes_overlap_and_prefers_live_buffer(self):
+        strategy = _warmup_strategy(signal_lookback=2)
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+
+        strategy.on_historical_data(_btc_bar(100.0, 1_000))
+        strategy.on_historical_data(_btc_bar(101.0, 2_000))
+        strategy.on_bar(_btc_bar(101.5, 2_000))
+        strategy.on_bar(_btc_bar(102.0, 3_000))
+
+        strategy._on_warmup_complete("REQ-1")
+
+        assert list(strategy._btc_closes) == [100.0, 101.5, 102.0]
+        assert strategy.entry_checks == [3_000]
+
+    def test_first_post_warmup_live_bar_uses_history_to_form_signal(self):
+        strategy = _warmup_strategy(signal_lookback=2)
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+
+        strategy.on_historical_data(_btc_bar(100.0, 1_000))
+        strategy.on_historical_data(_btc_bar(99.0, 2_000))
+
+        strategy._on_warmup_complete("REQ-1")
+
+        assert list(strategy._btc_closes) == [100.0, 99.0]
+        assert strategy.entry_checks == []
+
+        strategy.on_bar(_btc_bar(101.0, 3_000))
+
+        assert list(strategy._btc_closes) == [100.0, 99.0, 101.0]
+        assert strategy._compute_signal() == 1
+        assert strategy.entry_checks == [3_000]
+
+    def test_post_warmup_live_bar_uses_merged_history_and_buffered_live_bars(self):
+        strategy = _warmup_strategy(signal_lookback=3)
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+
+        strategy.on_historical_data(_btc_bar(100.0, 1_000))
+        strategy.on_historical_data(_btc_bar(101.0, 2_000))
+        strategy.on_bar(_btc_bar(102.0, 3_000))
+
+        strategy._on_warmup_complete("REQ-1")
+
+        assert list(strategy._btc_closes) == [100.0, 101.0, 102.0]
+        assert strategy.entry_checks == []
+
+        strategy.on_bar(_btc_bar(99.0, 4_000))
+
+        assert list(strategy._btc_closes) == [100.0, 101.0, 102.0, 99.0]
+        assert strategy._compute_signal() == -1
+        assert strategy.entry_checks == [4_000]

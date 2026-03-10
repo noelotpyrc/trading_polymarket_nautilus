@@ -8,3 +8,4 @@ description = "Production-style live BTC up/down runner on global Binance feed."
 [strategy_config]
 trade_amount_usdc = 5.0
 signal_lookback = 5
+warmup_days = 14

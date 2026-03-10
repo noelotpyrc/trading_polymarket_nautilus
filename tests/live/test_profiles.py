@@ -32,6 +32,19 @@ class TestRunnerProfiles:
         assert profile.strategy_config == {
             "trade_amount_usdc": 5.0,
             "signal_lookback": 5,
+            "warmup_days": 14,
+        }
+
+    def test_loads_checked_in_warmup_sandbox_profile(self):
+        profile = load_profile("btc_updown_15m_sandbox")
+
+        assert profile.name == "btc_updown_15m_sandbox"
+        assert profile.mode == "sandbox"
+        assert profile.run_secs == 600
+        assert profile.strategy_config == {
+            "trade_amount_usdc": 5.0,
+            "signal_lookback": 5,
+            "warmup_days": 14,
         }
 
     def test_rejects_unknown_profile_key(self, tmp_path):
@@ -80,12 +93,13 @@ class TestSharedStrategyLauncher:
         strategy = build_strategy(
             "btc_updown",
             windows=[("a.POLYMARKET", 1), ("b.POLYMARKET", 2)],
-            strategy_config={"trade_amount_usdc": 7.5, "signal_lookback": 8},
+            strategy_config={"trade_amount_usdc": 7.5, "signal_lookback": 8, "warmup_days": 14},
         )
 
         assert strategy._windows == [("a.POLYMARKET", 1), ("b.POLYMARKET", 2)]
         assert strategy._trade_amount == 7.5
         assert strategy._signal_lookback == 8
+        assert strategy._warmup_days == 14
 
     def test_validate_strategy_config_rejects_unknown_field(self):
         with pytest.raises(ValueError, match="Unknown btc_updown strategy config field"):

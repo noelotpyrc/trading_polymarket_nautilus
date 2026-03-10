@@ -19,6 +19,7 @@ def run(args) -> None:
         "random_signal",
         slug_pattern=args.slug_pattern,
         hours_ahead=args.hours_ahead,
+        outcome_side=args.outcome_side,
         sandbox=args.sandbox,
         binance_us=args.binance_us,
         run_secs=args.run_secs,

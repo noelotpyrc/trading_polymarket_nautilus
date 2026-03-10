@@ -7,16 +7,22 @@ from live.profiles import ProfileError, RunnerProfile, available_profile_names, 
 from live.runs.common import build_strategy, validate_strategy_config
 from live.runs import profile as profile_run
 from live.runs.profiles import btc_updown_15m_live as btc_updown_15m_live_run
+from live.runs.profiles import btc_updown_15m_live_no as btc_updown_15m_live_no_run
 from live.runs.profiles import btc_updown_15m_sandbox as btc_updown_15m_sandbox_run
+from live.runs.profiles import btc_updown_15m_sandbox_no as btc_updown_15m_sandbox_no_run
 from live.runs.profiles import random_signal_15m_sandbox as random_signal_15m_sandbox_run
+from live.runs.profiles import random_signal_15m_sandbox_no as random_signal_15m_sandbox_no_run
 
 
 class TestRunnerProfiles:
     def test_catalog_lists_expected_profiles(self):
         assert available_profile_names() == [
             "btc_updown_15m_live",
+            "btc_updown_15m_live_no",
             "btc_updown_15m_sandbox",
+            "btc_updown_15m_sandbox_no",
             "random_signal_15m_sandbox",
+            "random_signal_15m_sandbox_no",
         ]
 
     def test_loads_checked_in_profile(self):
@@ -28,6 +34,7 @@ class TestRunnerProfiles:
         assert profile.hours_ahead == 4
         assert profile.mode == "live"
         assert profile.binance_feed == "global"
+        assert profile.outcome_side == "yes"
         assert profile.run_secs is None
         assert profile.strategy_config == {
             "trade_amount_usdc": 5.0,
@@ -40,12 +47,25 @@ class TestRunnerProfiles:
 
         assert profile.name == "btc_updown_15m_sandbox"
         assert profile.mode == "sandbox"
+        assert profile.outcome_side == "yes"
         assert profile.run_secs == 600
         assert profile.strategy_config == {
             "trade_amount_usdc": 5.0,
             "signal_lookback": 5,
             "warmup_days": 14,
         }
+
+    def test_loads_checked_in_no_profiles(self):
+        live_profile = load_profile("btc_updown_15m_live_no")
+        warmup_sandbox_profile = load_profile("btc_updown_15m_sandbox_no")
+        sandbox_profile = load_profile("random_signal_15m_sandbox_no")
+
+        assert live_profile.outcome_side == "no"
+        assert live_profile.strategy == "btc_updown"
+        assert warmup_sandbox_profile.outcome_side == "no"
+        assert warmup_sandbox_profile.strategy == "btc_updown"
+        assert sandbox_profile.outcome_side == "no"
+        assert sandbox_profile.strategy == "random_signal"
 
     def test_rejects_unknown_profile_key(self, tmp_path):
         path = tmp_path / "bad.toml"
@@ -74,6 +94,20 @@ class TestRunnerProfiles:
         with pytest.raises(ProfileError, match="mode must be one of"):
             load_profile(str(path))
 
+    def test_rejects_invalid_outcome_side(self, tmp_path):
+        path = tmp_path / "bad_side.toml"
+        path.write_text(
+            'strategy = "btc_updown"\n'
+            'slug_pattern = "btc-updown-15m"\n'
+            'hours_ahead = 4\n'
+            'mode = "live"\n'
+            'binance_feed = "global"\n'
+            'outcome_side = "down"\n'
+        )
+
+        with pytest.raises(ProfileError, match="outcome_side must be one of"):
+            load_profile(str(path))
+
     def test_run_secs_override_requires_positive_value(self):
         profile = RunnerProfile(
             name="demo",
@@ -93,6 +127,7 @@ class TestSharedStrategyLauncher:
         strategy = build_strategy(
             "btc_updown",
             windows=[("a.POLYMARKET", 1), ("b.POLYMARKET", 2)],
+            outcome_side="no",
             strategy_config={"trade_amount_usdc": 7.5, "signal_lookback": 8, "warmup_days": 14},
         )
 
@@ -100,14 +135,19 @@ class TestSharedStrategyLauncher:
         assert strategy._trade_amount == 7.5
         assert strategy._signal_lookback == 8
         assert strategy._warmup_days == 14
+        assert strategy._outcome_side == "no"
 
     def test_validate_strategy_config_rejects_unknown_field(self):
         with pytest.raises(ValueError, match="Unknown btc_updown strategy config field"):
             validate_strategy_config("btc_updown", {"made_up": 1})
 
     def test_validate_strategy_config_rejects_reserved_window_fields(self):
-        with pytest.raises(ValueError, match="reserved window keys"):
+        with pytest.raises(ValueError, match="reserved runtime keys"):
             validate_strategy_config("btc_updown", {"pm_instrument_ids": []})
+
+    def test_validate_strategy_config_rejects_reserved_outcome_side(self):
+        with pytest.raises(ValueError, match="reserved runtime keys"):
+            validate_strategy_config("btc_updown", {"outcome_side": "no"})
 
 
 class TestProfileRunner:
@@ -120,6 +160,7 @@ class TestProfileRunner:
             hours_ahead=4,
             mode="sandbox",
             binance_feed="us",
+            outcome_side="no",
             run_secs=300,
             strategy_config={"trade_amount_usdc": 6.0},
         )
@@ -146,6 +187,7 @@ class TestProfileRunner:
             "strategy_name": "btc_updown",
             "slug_pattern": "btc-updown-15m",
             "hours_ahead": 4,
+            "outcome_side": "no",
             "sandbox": True,
             "binance_us": True,
             "run_secs": 300,
@@ -172,6 +214,7 @@ class TestProfileRunner:
             hours_ahead=4,
             mode="live",
             binance_feed="global",
+            outcome_side="yes",
             run_secs=None,
             strategy_config={"trade_amount_usdc": 5.0},
         )
@@ -195,6 +238,7 @@ class TestProfileRunner:
             hours_ahead=4,
             mode="live",
             binance_feed="global",
+            outcome_side="yes",
             strategy_config={"trade_amount_usdc": 5.0},
         )
         monkeypatch.setattr(profile_run, "load_profile", lambda name: profile)
@@ -203,14 +247,18 @@ class TestProfileRunner:
 
         rendered = json.loads(capsys.readouterr().out)
         assert rendered["name"] == "btc_updown_15m_live"
+        assert rendered["outcome_side"] == "yes"
         assert rendered["strategy_config"] == {"trade_amount_usdc": 5.0}
 
     @pytest.mark.parametrize(
         ("module", "expected_name"),
         [
             (btc_updown_15m_live_run, "btc_updown_15m_live"),
+            (btc_updown_15m_live_no_run, "btc_updown_15m_live_no"),
             (btc_updown_15m_sandbox_run, "btc_updown_15m_sandbox"),
+            (btc_updown_15m_sandbox_no_run, "btc_updown_15m_sandbox_no"),
             (random_signal_15m_sandbox_run, "random_signal_15m_sandbox"),
+            (random_signal_15m_sandbox_no_run, "random_signal_15m_sandbox_no"),
         ],
     )
     def test_fixed_profile_entrypoints_delegate_to_main_for_profile(

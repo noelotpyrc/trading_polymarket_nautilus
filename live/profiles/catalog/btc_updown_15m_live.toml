@@ -3,6 +3,7 @@ slug_pattern = "btc-updown-15m"
 hours_ahead = 4
 mode = "live"
 binance_feed = "global"
+outcome_side = "yes"
 description = "Production-style live BTC up/down runner on global Binance feed."
 
 [strategy_config]

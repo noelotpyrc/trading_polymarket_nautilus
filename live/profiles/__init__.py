@@ -16,12 +16,14 @@ _ALLOWED_TOP_LEVEL_KEYS = {
     "hours_ahead",
     "mode",
     "binance_feed",
+    "outcome_side",
     "run_secs",
     "description",
     "strategy_config",
 }
 _ALLOWED_MODES = {"sandbox", "live"}
 _ALLOWED_BINANCE_FEEDS = {"global", "us"}
+_ALLOWED_OUTCOME_SIDES = {"yes", "no"}
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,7 @@ class RunnerProfile:
     hours_ahead: int
     mode: str
     binance_feed: str
+    outcome_side: str = "yes"
     run_secs: int | None = None
     description: str | None = None
     strategy_config: dict[str, object] = field(default_factory=dict)
@@ -100,6 +103,7 @@ def _parse_profile(*, name: str, data: dict[str, object]) -> RunnerProfile:
     mode = _required_str(data, "mode", name)
     binance_feed = _required_str(data, "binance_feed", name)
     hours_ahead = _required_positive_int(data, "hours_ahead", name)
+    outcome_side = _optional_str(data, "outcome_side", name) or "yes"
     run_secs = _optional_positive_int(data, "run_secs", name)
     description = _optional_str(data, "description", name)
     strategy_config = data.get("strategy_config", {})
@@ -110,6 +114,9 @@ def _parse_profile(*, name: str, data: dict[str, object]) -> RunnerProfile:
     if binance_feed not in _ALLOWED_BINANCE_FEEDS:
         allowed = ", ".join(sorted(_ALLOWED_BINANCE_FEEDS))
         raise ProfileError(f"Profile {name!r} binance_feed must be one of: {allowed}")
+    if outcome_side not in _ALLOWED_OUTCOME_SIDES:
+        allowed = ", ".join(sorted(_ALLOWED_OUTCOME_SIDES))
+        raise ProfileError(f"Profile {name!r} outcome_side must be one of: {allowed}")
     if not isinstance(strategy_config, dict):
         raise ProfileError(f"Profile {name!r} strategy_config must be a TOML table")
 
@@ -120,6 +127,7 @@ def _parse_profile(*, name: str, data: dict[str, object]) -> RunnerProfile:
         hours_ahead=hours_ahead,
         mode=mode,
         binance_feed=binance_feed,
+        outcome_side=outcome_side,
         run_secs=run_secs,
         description=description,
         strategy_config=dict(strategy_config),

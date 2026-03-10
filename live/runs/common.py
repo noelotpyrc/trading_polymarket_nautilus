@@ -17,7 +17,7 @@ _STRATEGY_SPECS: dict[str, StrategySpec] = {
     "random_signal": StrategySpec(RandomSignalStrategy, RandomSignalConfig),
 }
 
-_WINDOW_CONFIG_KEYS = {"pm_instrument_ids", "window_end_times_ns"}
+_RESERVED_CONFIG_KEYS = {"pm_instrument_ids", "window_end_times_ns", "outcome_side"}
 
 
 def strategy_names() -> tuple[str, ...]:
@@ -29,13 +29,13 @@ def validate_strategy_config(strategy_name: str, strategy_config: dict[str, obje
         return
 
     spec = _strategy_spec(strategy_name)
-    allowed_keys = set(getattr(spec.config_cls, "__annotations__", {})) - _WINDOW_CONFIG_KEYS
+    allowed_keys = set(getattr(spec.config_cls, "__annotations__", {})) - _RESERVED_CONFIG_KEYS
     unknown_keys = sorted(set(strategy_config) - allowed_keys)
-    reserved_keys = sorted(set(strategy_config) & _WINDOW_CONFIG_KEYS)
+    reserved_keys = sorted(set(strategy_config) & _RESERVED_CONFIG_KEYS)
 
     if reserved_keys:
         joined = ", ".join(reserved_keys)
-        raise ValueError(f"Strategy config cannot override reserved window keys: {joined}")
+        raise ValueError(f"Strategy config cannot override reserved runtime keys: {joined}")
     if unknown_keys:
         joined = ", ".join(unknown_keys)
         raise ValueError(f"Unknown {strategy_name} strategy config field(s): {joined}")
@@ -45,6 +45,7 @@ def build_strategy(
     strategy_name: str,
     *,
     windows: list[tuple[str, int]],
+    outcome_side: str,
     strategy_config: dict[str, object] | None = None,
 ):
     spec = _strategy_spec(strategy_name)
@@ -53,6 +54,7 @@ def build_strategy(
     strategy_kwargs = dict(strategy_config or {})
     strategy_kwargs["pm_instrument_ids"] = tuple(window[0] for window in windows)
     strategy_kwargs["window_end_times_ns"] = tuple(window[1] for window in windows)
+    strategy_kwargs["outcome_side"] = outcome_side
 
     return spec.strategy_cls(spec.config_cls(**strategy_kwargs))
 
@@ -62,6 +64,7 @@ def run_strategy(
     *,
     slug_pattern: str,
     hours_ahead: int,
+    outcome_side: str,
     sandbox: bool,
     binance_us: bool,
     run_secs: int | None,
@@ -70,6 +73,7 @@ def run_strategy(
     windows = prepare_run(
         slug_pattern=slug_pattern,
         hours_ahead=hours_ahead,
+        outcome_side=outcome_side,
         sandbox=sandbox,
         binance_us=binance_us,
         run_secs=run_secs,
@@ -81,6 +85,7 @@ def run_strategy(
         build_strategy(
             strategy_name,
             windows=windows,
+            outcome_side=outcome_side,
             strategy_config=strategy_config,
         )
     )

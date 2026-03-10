@@ -23,6 +23,7 @@ class RandomSignalConfig(StrategyConfig, frozen=True):
     entry_threshold: float = 0.5
     exit_threshold: float = 0.7
     trade_amount_usdc: float = 5.0
+    outcome_side: str = "yes"
 
 
 class RandomSignalStrategy(WindowedPolymarketStrategy):
@@ -39,6 +40,7 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
         self.log.info(
             f"Started | PM={self._pm_instrument_id} | "
             f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
+            f"outcome={self._selected_outcome_label()} | "
             f"entry_threshold={self._entry_threshold} | exit_threshold={self._exit_threshold}"
         )
 
@@ -72,8 +74,11 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
             self.log.info(
                 f"BTC={bar.close} rand={value:.3f} > {self._entry_threshold} → ENTER  mid={mid_str}"
             )
-            super()._submit_yes_order(self._trade_amount)
-            self.log.info(f"BUY ${self._trade_amount} on {self._pm_instrument_id}")
+            super()._submit_entry_order(self._trade_amount)
+            self.log.info(
+                f"BUY {self._selected_outcome_label()} ${self._trade_amount} "
+                f"on {self._pm_instrument_id}"
+            )
         else:
             self.log.info(
                 f"BTC={bar.close} rand={value:.3f} | mid={mid_str} | "

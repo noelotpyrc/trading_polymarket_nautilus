@@ -3,7 +3,7 @@
 Shared infrastructure for live trading nodes.
 
 Importable helpers for use by any strategy runner:
-  - resolve_upcoming_windows(slug_pattern, hours_ahead)
+  - resolve_upcoming_windows(slug_pattern, hours_ahead, outcome_side)
   - build_node(pm_instrument_ids, sandbox, binance_us)
   - make_arg_parser(description)
   - prepare_run(...)
@@ -33,7 +33,9 @@ _FIRST_WINDOW_WARN_NS = 120_000_000_000
 
 
 def resolve_upcoming_windows(
-    slug_pattern: str, hours_ahead: int = 4
+    slug_pattern: str,
+    hours_ahead: int = 4,
+    outcome_side: str = "yes",
 ) -> list[tuple[str, int]]:
     """
     Query Gamma API for current + upcoming market windows matching slug_pattern.
@@ -47,7 +49,12 @@ def resolve_upcoming_windows(
     window_start = (now // interval_secs) * interval_secs
     n_windows = (hours_ahead * 3600) // interval_secs + 1
 
-    print(f"Resolving up to {n_windows} windows ({hours_ahead}h ahead) for '{slug_pattern}'...")
+    _validate_outcome_side(outcome_side)
+
+    print(
+        f"Resolving up to {n_windows} windows ({hours_ahead}h ahead) "
+        f"for '{slug_pattern}' outcome={outcome_side.upper()}..."
+    )
 
     windows: list[tuple[str, int]] = []
     for i in range(n_windows):
@@ -66,15 +73,15 @@ def resolve_upcoming_windows(
             continue
 
         condition_id = markets[0].get("conditionId", "")
-        token_ids = json.loads(markets[0].get("clobTokenIds", "[]"))
-        if not condition_id or not token_ids:
-            print(f"  [{i:2d}] {slug} — missing conditionId or token IDs")
+        token_id, outcome_label = _select_outcome_token(markets[0], outcome_side)
+        if not condition_id or not token_id:
+            print(f"  [{i:2d}] {slug} — missing conditionId or {outcome_side.upper()} token ID")
             continue
 
-        pm_instrument_id = f"{condition_id}-{token_ids[0]}.POLYMARKET"
+        pm_instrument_id = f"{condition_id}-{token_id}.POLYMARKET"
         window_end_ns = (ts + interval_secs) * 1_000_000_000
         windows.append((pm_instrument_id, window_end_ns))
-        print(f"  [{i:2d}] {slug} → {pm_instrument_id}")
+        print(f"  [{i:2d}] {slug} [{outcome_label}] → {pm_instrument_id}")
 
     return windows
 
@@ -133,6 +140,8 @@ def make_arg_parser(description: str) -> argparse.ArgumentParser:
                         help="Hours of windows to pre-load at startup (default: 4)")
     parser.add_argument("--run-secs", type=int, default=None,
                         help="Auto-stop after N seconds for bounded sandbox/manual runs")
+    parser.add_argument("--outcome-side", choices=("yes", "no"), default="yes",
+                        help="Select the first (yes) or second (no) Polymarket outcome token")
     parser.add_argument("--sandbox", action="store_true",
                         help="Sandbox mode: real data feeds, simulated execution (no real orders)")
     parser.add_argument("--binance-us", action="store_true",
@@ -144,19 +153,26 @@ def prepare_run(
     *,
     slug_pattern: str,
     hours_ahead: int,
+    outcome_side: str,
     sandbox: bool,
     binance_us: bool,
     run_secs: int | None,
 ) -> list[tuple[str, int]]:
     """Run shared live-runner preflight and return validated windows."""
     _validate_run_secs(run_secs)
+    _validate_outcome_side(outcome_side)
     _validate_required_env_vars(sandbox=sandbox)
 
-    windows = resolve_upcoming_windows(slug_pattern, hours_ahead=hours_ahead)
+    windows = resolve_upcoming_windows(
+        slug_pattern,
+        hours_ahead=hours_ahead,
+        outcome_side=outcome_side,
+    )
     _validate_resolved_windows(windows)
     _print_run_summary(
         windows=windows,
         slug_pattern=slug_pattern,
+        outcome_side=outcome_side,
         sandbox=sandbox,
         binance_us=binance_us,
         run_secs=run_secs,
@@ -187,6 +203,11 @@ def _parse_interval_secs(slug_pattern: str) -> int:
 def _validate_run_secs(run_secs: int | None) -> None:
     if run_secs is not None and run_secs <= 0:
         raise SystemExit("--run-secs must be a positive integer")
+
+
+def _validate_outcome_side(outcome_side: str) -> None:
+    if outcome_side not in {"yes", "no"}:
+        raise SystemExit("--outcome-side must be one of: yes, no")
 
 
 def _validate_required_env_vars(*, sandbox: bool) -> None:
@@ -241,6 +262,7 @@ def _print_run_summary(
     *,
     windows: list[tuple[str, int]],
     slug_pattern: str,
+    outcome_side: str,
     sandbox: bool,
     binance_us: bool,
     run_secs: int | None,
@@ -251,7 +273,10 @@ def _print_run_summary(
     last_end_ns = windows[-1][1]
 
     print()
-    print(f"{mode} run | slug={slug_pattern} | feed={binance_label}")
+    print(
+        f"{mode} run | slug={slug_pattern} | feed={binance_label} | "
+        f"outcome={outcome_side.upper()}"
+    )
     print(f"Resolved {len(windows)} window(s)")
     print(f"First window ends : {_fmt_abs_ns(first_end_ns)} UTC")
     print(f"Last window ends  : {_fmt_abs_ns(last_end_ns)} UTC")
@@ -267,3 +292,27 @@ def _print_run_summary(
 
 def _fmt_abs_ns(ts_ns: int) -> str:
     return datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _select_outcome_token(market: dict[str, object], outcome_side: str) -> tuple[str | None, str]:
+    token_ids = _parse_json_list(market.get("clobTokenIds"))
+    outcome_labels = _parse_json_list(market.get("outcomes"))
+    index = 0 if outcome_side == "yes" else 1
+
+    if len(token_ids) <= index:
+        return None, outcome_side.upper()
+
+    label = outcome_labels[index] if len(outcome_labels) > index else outcome_side.upper()
+    return str(token_ids[index]), str(label)
+
+
+def _parse_json_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []

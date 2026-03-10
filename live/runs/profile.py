@@ -22,6 +22,7 @@ def run_profile(profile: RunnerProfile) -> None:
         profile.strategy,
         slug_pattern=profile.slug_pattern,
         hours_ahead=profile.hours_ahead,
+        outcome_side=profile.outcome_side,
         sandbox=profile.sandbox,
         binance_us=profile.binance_us,
         run_secs=profile.run_secs,

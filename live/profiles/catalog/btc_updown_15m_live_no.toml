@@ -1,11 +1,10 @@
 strategy = "btc_updown"
 slug_pattern = "btc-updown-15m"
-hours_ahead = 2
-mode = "sandbox"
+hours_ahead = 4
+mode = "live"
 binance_feed = "global"
-outcome_side = "yes"
-run_secs = 600
-description = "Bounded sandbox validation profile for the BTC momentum runner."
+outcome_side = "no"
+description = "Production-style live BTC up/down runner targeting the NO outcome on global Binance feed."
 
 [strategy_config]
 trade_amount_usdc = 5.0

@@ -3,9 +3,9 @@ slug_pattern = "btc-updown-15m"
 hours_ahead = 1
 mode = "sandbox"
 binance_feed = "global"
-outcome_side = "yes"
+outcome_side = "no"
 run_secs = 180
-description = "Fast bounded sandbox validation profile for the random signal runner."
+description = "Fast bounded sandbox validation profile for the random signal runner targeting the NO outcome."
 
 [strategy_config]
 trade_amount_usdc = 5.0

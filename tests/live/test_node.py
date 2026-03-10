@@ -58,10 +58,18 @@ class TestParseIntervalSecs:
 
 
 class TestResolveUpcomingWindows:
-    def _make_market(self, condition_id: str, yes_token_id: str) -> dict:
+    def _make_market(
+        self,
+        condition_id: str,
+        yes_token_id: str,
+        *,
+        no_token_id: str = "no-token-id",
+        outcomes: list[str] | None = None,
+    ) -> dict:
         return {
             "conditionId": condition_id,
-            "clobTokenIds": json.dumps([yes_token_id, "no-token-id"]),
+            "clobTokenIds": json.dumps([yes_token_id, no_token_id]),
+            "outcomes": json.dumps(outcomes or ["Yes", "No"]),
         }
 
     def _mock_response(self, markets: list) -> MagicMock:
@@ -79,7 +87,7 @@ class TestResolveUpcomingWindows:
             [self._make_market(condition_id, token_id)]
         )
 
-        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0)
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="yes")
 
         assert len(windows) == 1
         instrument_id, _ = windows[0]
@@ -91,7 +99,7 @@ class TestResolveUpcomingWindows:
             [self._make_market("cid", "tid")]
         )
 
-        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0)
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="yes")
 
         assert len(windows) == 1
         _, window_end_ns = windows[0]
@@ -102,7 +110,7 @@ class TestResolveUpcomingWindows:
     def test_skips_missing_markets(self, mock_get):
         mock_get.return_value = self._mock_response([])
 
-        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0)
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="yes")
 
         assert windows == []
 
@@ -112,7 +120,7 @@ class TestResolveUpcomingWindows:
             [{"conditionId": "", "clobTokenIds": '["tid"]'}]
         )
 
-        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0)
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="yes")
 
         assert windows == []
 
@@ -124,7 +132,7 @@ class TestResolveUpcomingWindows:
 
         mock_get.side_effect = side_effect
 
-        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=1)
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=1, outcome_side="yes")
 
         assert len(windows) == 5
         end_times = [w[1] for w in windows]
@@ -134,7 +142,28 @@ class TestResolveUpcomingWindows:
     def test_request_error_skips_window(self, mock_get):
         mock_get.side_effect = Exception("connection refused")
 
-        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0)
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="yes")
+
+        assert windows == []
+
+    @patch("live.node.requests.get")
+    def test_selects_no_token_when_requested(self, mock_get):
+        condition_id = "0xabc123"
+        mock_get.return_value = self._mock_response(
+            [self._make_market(condition_id, "yes-token", no_token_id="no-token", outcomes=["Up", "Down"])]
+        )
+
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="no")
+
+        assert windows == [(f"{condition_id}-no-token.POLYMARKET", windows[0][1])]
+
+    @patch("live.node.requests.get")
+    def test_skips_market_missing_requested_outcome_token(self, mock_get):
+        mock_get.return_value = self._mock_response(
+            [{"conditionId": "cid", "clobTokenIds": json.dumps(["yes-token"]), "outcomes": json.dumps(["Yes"])}]
+        )
+
+        windows = resolve_upcoming_windows("btc-updown-15m", hours_ahead=0, outcome_side="no")
 
         assert windows == []
 
@@ -147,6 +176,7 @@ class TestPrepareRun:
             prepare_run(
                 slug_pattern="btc-updown-15m",
                 hours_ahead=1,
+                outcome_side="yes",
                 sandbox=True,
                 binance_us=False,
                 run_secs=None,
@@ -159,6 +189,7 @@ class TestPrepareRun:
             prepare_run(
                 slug_pattern="btc-updown-15m",
                 hours_ahead=1,
+                outcome_side="yes",
                 sandbox=False,
                 binance_us=False,
                 run_secs=None,
@@ -171,22 +202,40 @@ class TestPrepareRun:
             prepare_run(
                 slug_pattern="btc-updown-15m",
                 hours_ahead=1,
+                outcome_side="yes",
                 sandbox=True,
                 binance_us=False,
                 run_secs=0,
+            )
+
+    def test_rejects_invalid_outcome_side(self, monkeypatch):
+        _set_sandbox_env(monkeypatch)
+
+        with pytest.raises(SystemExit, match="--outcome-side must be one of"):
+            prepare_run(
+                slug_pattern="btc-updown-15m",
+                hours_ahead=1,
+                outcome_side="down",
+                sandbox=True,
+                binance_us=False,
+                run_secs=None,
             )
 
     def test_rejects_duplicate_windows(self, monkeypatch):
         _set_sandbox_env(monkeypatch)
         monkeypatch.setattr(
             "live.node.resolve_upcoming_windows",
-            lambda slug_pattern, hours_ahead: [("a.POLYMARKET", 1), ("a.POLYMARKET", 2)],
+            lambda slug_pattern, hours_ahead, outcome_side: [
+                ("a.POLYMARKET", 1),
+                ("a.POLYMARKET", 2),
+            ],
         )
 
         with pytest.raises(SystemExit, match="Resolved duplicate Polymarket instruments"):
             prepare_run(
                 slug_pattern="btc-updown-15m",
                 hours_ahead=1,
+                outcome_side="yes",
                 sandbox=True,
                 binance_us=False,
                 run_secs=None,
@@ -196,13 +245,17 @@ class TestPrepareRun:
         _set_sandbox_env(monkeypatch)
         monkeypatch.setattr(
             "live.node.resolve_upcoming_windows",
-            lambda slug_pattern, hours_ahead: [("a.POLYMARKET", 10), ("b.POLYMARKET", 5)],
+            lambda slug_pattern, hours_ahead, outcome_side: [
+                ("a.POLYMARKET", 10),
+                ("b.POLYMARKET", 5),
+            ],
         )
 
         with pytest.raises(SystemExit, match="not strictly increasing"):
             prepare_run(
                 slug_pattern="btc-updown-15m",
                 hours_ahead=1,
+                outcome_side="yes",
                 sandbox=True,
                 binance_us=False,
                 run_secs=None,
@@ -212,13 +265,14 @@ class TestPrepareRun:
         _set_sandbox_env(monkeypatch)
         monkeypatch.setattr(
             "live.node.resolve_upcoming_windows",
-            lambda slug_pattern, hours_ahead: [("a.POLYMARKET", 60_000_000_000)],
+            lambda slug_pattern, hours_ahead, outcome_side: [("a.POLYMARKET", 60_000_000_000)],
         )
         monkeypatch.setattr("live.node.time.time_ns", lambda: 0)
 
         windows = prepare_run(
             slug_pattern="btc-updown-15m",
             hours_ahead=1,
+            outcome_side="no",
             sandbox=True,
             binance_us=True,
             run_secs=180,
@@ -226,6 +280,7 @@ class TestPrepareRun:
 
         out = capsys.readouterr().out
         assert windows == [("a.POLYMARKET", 60_000_000_000)]
+        assert "outcome=NO" in out
         assert "WARNING: First window ends in 60s" in out
         assert "Auto-stop after   : 180s" in out
 

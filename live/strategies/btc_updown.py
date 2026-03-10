@@ -1,7 +1,7 @@
 """BTC up/down infrastructure test strategy for the live process.
 
 Signal: BTC momentum over N 1-minute bars.
-Execution: Polymarket YES token via quote ticks.
+Execution: selected Polymarket outcome token via quote ticks.
 Window transitions: driven by time alerts, not data timestamps.
 """
 from collections import deque
@@ -23,6 +23,7 @@ class BtcUpDownConfig(StrategyConfig, frozen=True):
     trade_amount_usdc: float = 5.0
     signal_lookback: int = 5
     warmup_days: int = 0
+    outcome_side: str = "yes"
 
 
 class BtcUpDownStrategy(WindowedPolymarketStrategy):
@@ -59,6 +60,7 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
             f"Started | PM={self._pm_instrument_id} "
             f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
             f"{len(self._windows)} window(s) pre-loaded | "
+            f"outcome={self._selected_outcome_label()} | "
             f"warmup={self._warmup_status_str()}"
         )
 
@@ -126,9 +128,12 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
             if reason is not None:
                 self.log.info(f"Bullish entry skipped on {self._pm_instrument_id}: {reason}")
                 return
-            super()._submit_yes_order(self._trade_amount)
+            super()._submit_entry_order(self._trade_amount)
             mid_str = f" mid={self._pm_mid:.4f}" if self._pm_mid else ""
-            self.log.info(f"BUY ${self._trade_amount} on {self._pm_instrument_id}{mid_str}")
+            self.log.info(
+                f"BUY {self._selected_outcome_label()} ${self._trade_amount} "
+                f"on {self._pm_instrument_id}{mid_str}"
+            )
 
     def _compute_signal(self) -> int:
         return compute_signal(list(self._btc_closes))

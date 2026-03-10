@@ -14,10 +14,10 @@ The current repo is through the sandbox gate:
 - Bounded sandbox runner validation passed
 - Production-style runner profiles are implemented
 - Binance historical warmup is implemented for the `btc_updown` runner via `warmup_days`
+- Outcome-side selection is implemented for runner profiles and ad hoc runners
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
-- Profile-driven NO-token execution path
 - Real Polymarket order submission and cancel behavior
 - Real live fill handling and venue reconciliation
 - Multi-hour stability under production-style supervision
@@ -123,11 +123,11 @@ Allow live runners to target the NO token as well as the YES token.
 - Support production strategies that want fixed-side deployment on either outcome
 - Make outcome side an explicit deployment choice instead of a hard-coded assumption
 
-**What we will implement**
-- Add outcome-side selection (`yes` or `no`) to runner profiles
-- Resolve the correct Polymarket token for each window instead of always taking `clobTokenIds[0]`
-- Route subscriptions and orders to the selected outcome instrument
-- Keep scope to one chosen outcome side per process/profile; dynamic same-window YES/NO switching is out of scope for this stage
+**Implementation status**
+- Implemented for checked-in runner profiles and ad hoc runners via `outcome_side`
+- Gamma resolution now selects the first (`yes`) or second (`no`) outcome token per window
+- Fixed NO profiles were added for sandbox and live operator commands
+- Sandbox validation covered NO-side subscription, entry, exit, and rollover on a real live-data session
 
 **Success criteria**
 - A checked-in profile can start a live or sandbox process in `yes` mode or `no` mode
@@ -271,7 +271,7 @@ Stage 2
 Stage 3
   -> validate the btc_updown warmup runner/profile path
 Stage 4
-  -> add fixed YES/NO outcome-side selection to runner profiles
+  -> validate fixed YES/NO outcome-side profiles on live data
 Stage 5
   -> add stale-feed / fail-safe controls
 Stage 6

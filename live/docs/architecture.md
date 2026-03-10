@@ -4,7 +4,7 @@
 
 The live system runs a Nautilus `TradingNode` connected to two data sources:
 - **Binance** — 1-minute BTC perpetual futures bars (signal input)
-- **Polymarket** — quote ticks for the current window's YES token (execution target)
+- **Polymarket** — quote ticks for the current window's selected outcome token (execution target)
 
 Execution is routed through a Polymarket CLOB exec client (live) or a `SandboxExecutionClient` (paper trading).
 
@@ -41,11 +41,14 @@ Run scripts are the entry points. `node.py` exposes shared infrastructure that t
 |---------|-------------|
 | `python live/runs/profile.py --list` | List checked-in runner profiles |
 | `python live/runs/profiles/btc_updown_15m_live.py` | Fixed live BTC momentum profile |
+| `python live/runs/profiles/btc_updown_15m_live_no.py` | Fixed live BTC momentum NO-outcome profile |
 | `python live/runs/profiles/btc_updown_15m_sandbox.py` | Fixed warmup sandbox profile |
+| `python live/runs/profiles/btc_updown_15m_sandbox_no.py` | Fixed warmup sandbox NO-outcome profile |
 | `python live/runs/profiles/random_signal_15m_sandbox.py` | Fixed fast sandbox profile |
-| `python live/runs/btc_updown.py --slug-pattern btc-updown-15m` | BTC momentum, live orders |
-| `python live/runs/btc_updown.py --slug-pattern btc-updown-15m --sandbox` | BTC momentum, simulated orders |
-| `python live/runs/random_signal.py --slug-pattern btc-updown-15m --sandbox` | Random signal, sandbox (testing) |
+| `python live/runs/profiles/random_signal_15m_sandbox_no.py` | Fixed fast sandbox NO-outcome profile |
+| `python live/runs/btc_updown.py --slug-pattern btc-updown-15m --outcome-side yes` | BTC momentum, live orders |
+| `python live/runs/btc_updown.py --slug-pattern btc-updown-15m --outcome-side no --sandbox` | BTC momentum, simulated NO-outcome orders |
+| `python live/runs/random_signal.py --slug-pattern btc-updown-15m --outcome-side no --sandbox` | Random signal, sandbox NO-outcome (testing) |
 
 Common flags:
 
@@ -54,6 +57,7 @@ Common flags:
 | `--slug-pattern` | Market slug prefix, e.g. `btc-updown-15m` |
 | `--hours-ahead N` | Pre-load N hours of windows at startup (default: 4) |
 | `--run-secs N` | Auto-stop after N seconds for bounded sandbox/manual runs |
+| `--outcome-side {yes,no}` | Select the first or second Polymarket outcome token |
 | `--sandbox` | Simulated execution — no real orders |
 | `--binance-us` | Use Binance US endpoint (for US IPs) |
 
@@ -71,6 +75,7 @@ Each profile defines:
 - hours ahead
 - mode (`sandbox` or `live`)
 - Binance feed route (`global` or `us`)
+- outcome side (`yes` or `no`)
 - optional bounded runtime
 - strategy-specific config overrides
 
@@ -87,9 +92,9 @@ Fixed wrapper scripts in `live/runs/profiles/` provide one stable command per in
 
 ## Shared Infrastructure (`node.py`)
 
-### `resolve_upcoming_windows(slug_pattern, hours_ahead)`
+### `resolve_upcoming_windows(slug_pattern, hours_ahead, outcome_side)`
 
-Queries the Gamma API to find current + upcoming Polymarket windows matching the slug pattern. Returns an ordered list of `(pm_instrument_id, window_end_ns)` tuples.
+Queries the Gamma API to find current + upcoming Polymarket windows matching the slug pattern. Returns an ordered list of `(pm_instrument_id, window_end_ns)` tuples for the selected outcome side.
 
 - One API call per window (~17 calls for 4h of 15m windows)
 - Instrument ID format: `{condition_id}-{token_id}.POLYMARKET`
@@ -106,7 +111,7 @@ Clients registered:
 
 ### `make_arg_parser(description)`
 
-Returns an `argparse.ArgumentParser` with the standard flags (`--slug-pattern`, `--hours-ahead`, `--run-secs`, `--sandbox`, `--binance-us`). All run scripts use this to keep CLI consistent.
+Returns an `argparse.ArgumentParser` with the standard flags (`--slug-pattern`, `--hours-ahead`, `--run-secs`, `--outcome-side`, `--sandbox`, `--binance-us`). All run scripts use this to keep CLI consistent.
 
 ### `live.runs.common.run_strategy(...)`
 
@@ -138,11 +143,12 @@ Infrastructure test strategy. Signal based on BTC 1-minute bar momentum.
 | `signal_lookback` | `5` | Number of bars for momentum window |
 | `trade_amount_usdc` | `5.0` | Order size in USDC |
 | `warmup_days` | `0` | Historical Binance warmup window loaded at startup |
+| `outcome_side` | `yes` | First (`yes`) or second (`no`) Polymarket outcome token |
 
 **Signal logic:**
 
 Requires `signal_lookback + 1` bars to fire. With `warmup_days > 0`, the strategy requests historical Binance bars at startup, buffers live bars while the request is in flight, then merges/dedupes them before allowing entries.
-- `closes[-1] > closes[0]` → bullish → BUY YES
+- `closes[-1] > closes[0]` → bullish → BUY selected outcome token
 - `closes[-1] < closes[0]` → bearish → exit if in position
 - Enters once per window; exits on bearish signal
 
@@ -166,6 +172,7 @@ Infrastructure test strategy. Fires a random signal on each Binance bar — no w
 | `entry_threshold` | `0.5` | Enter if `random() > threshold` (~50% hit rate per bar) |
 | `exit_threshold` | `0.7` | Exit if `random() > threshold` (~30% hit rate per bar) |
 | `trade_amount_usdc` | `5.0` | Order size in USDC |
+| `outcome_side` | `yes` | First (`yes`) or second (`no`) Polymarket outcome token |
 
 **Signal logic:**
 
@@ -214,31 +221,30 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
    - `python tests/live/explore_nautilus_ws.py --phase-secs 20`
 2. Run the fast bounded sandbox check:
    - `python live/runs/profiles/random_signal_15m_sandbox.py`
-3. Run the slower warmup-based sandbox check:
+3. Run the NO-outcome fast sandbox check when validating side selection:
+   - `python live/runs/profiles/random_signal_15m_sandbox_no.py`
+4. Run the slower warmup-based sandbox check:
    - `python live/runs/profiles/btc_updown_15m_sandbox.py`
-4. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
-5. Daily restart is acceptable even if the first window after restart is missed.
+5. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
+6. Daily restart is acceptable even if the first window after restart is missed.
 
 ## Next Milestones
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
 
-1. Outcome-side support (`yes` / `no`)
-   - Purpose: remove the current YES-only assumption and allow fixed-side NO-token runs.
-   - Success: a checked-in profile can run correctly against either outcome side.
-2. Health guards / fail-safe controls
+1. Health guards / fail-safe controls
    - Purpose: stop or block trading when feeds are stale or process state is unsafe.
    - Success: stale or degraded inputs do not produce accidental orders.
-3. Longer sandbox soak runs
+2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability instead of startup correctness only.
    - Success: repeated rollovers and long runtimes finish cleanly.
-4. Live order lifecycle rehearsal
+3. Live order lifecycle rehearsal
    - Purpose: prove real submit/open/cancel behavior without intended fill risk.
    - Success: a tiny non-marketable live limit order opens, cancels, and leaves no residue.
-5. Minimum-size live fill rehearsal
+4. Minimum-size live fill rehearsal
    - Purpose: prove real live fills and venue reconciliation end-to-end.
    - Success: one minimum-size live round trip reconciles cleanly.
-6. Observability tightening
+5. Observability tightening
    - Purpose: make long-running live processes operable.
    - Success: operators can diagnose failures from logs and runbook alone.
 
@@ -263,6 +269,7 @@ if __name__ == "__main__":
     windows = prepare_run(
         slug_pattern=args.slug_pattern,
         hours_ahead=args.hours_ahead,
+        outcome_side=args.outcome_side,
         sandbox=args.sandbox,
         binance_us=args.binance_us,
         run_secs=args.run_secs,

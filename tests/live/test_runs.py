@@ -12,6 +12,7 @@ def _args():
         slug_pattern="btc-updown-15m",
         hours_ahead=4,
         run_secs=180,
+        outcome_side="no",
         sandbox=True,
         binance_us=False,
     )
@@ -35,6 +36,7 @@ class TestBtcUpDownRunScript:
             "strategy_name": "btc_updown",
             "slug_pattern": "btc-updown-15m",
             "hours_ahead": 4,
+            "outcome_side": "no",
             "sandbox": True,
             "binance_us": False,
             "run_secs": 180,
@@ -69,6 +71,7 @@ class TestRandomSignalRunScript:
             "strategy_name": "random_signal",
             "slug_pattern": "btc-updown-15m",
             "hours_ahead": 4,
+            "outcome_side": "no",
             "sandbox": True,
             "binance_us": False,
             "run_secs": 180,

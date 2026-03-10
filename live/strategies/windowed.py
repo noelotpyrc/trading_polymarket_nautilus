@@ -20,6 +20,9 @@ class WindowedPolymarketStrategy(Strategy):
         self._windows: list[tuple[str, int]] = list(
             zip(config.pm_instrument_ids, config.window_end_times_ns)
         )
+        self._outcome_side = getattr(config, "outcome_side", "yes")
+        if self._outcome_side not in {"yes", "no"}:
+            raise ValueError("outcome_side must be one of: yes, no")
         self._window_idx = 0
         self._pm_instrument_id = InstrumentId.from_str(self._windows[0][0])
         self._window_end_ns = self._windows[0][1]
@@ -77,7 +80,7 @@ class WindowedPolymarketStrategy(Strategy):
         quote_age_ns = max(0, now_ns - self._pm_mid_ts_ns)
         return f"{self._pm_mid:.4f} age={quote_age_ns // 1_000_000_000}s"
 
-    def _submit_yes_order(self, trade_amount: float) -> None:
+    def _submit_entry_order(self, trade_amount: float) -> None:
         qty_str = f"{trade_amount:.6f}".rstrip("0").rstrip(".")
         order = self.order_factory.market(
             instrument_id=self._pm_instrument_id,
@@ -90,6 +93,9 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_order_client_id = order.client_order_id
         self._entry_order_instruments[order.client_order_id] = self._pm_instrument_id
         self.submit_order(order)
+
+    def _selected_outcome_label(self) -> str:
+        return self._outcome_side.upper()
 
     def _cancel_pending_entry_order(self, reason: str) -> None:
         if not self._entry_order_pending or self._entry_order is None or self._entry_order_client_id is None:

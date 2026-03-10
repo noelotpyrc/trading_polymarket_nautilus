@@ -13,6 +13,7 @@ from live.strategies.windowed import WindowedPolymarketStrategy
 class HarnessConfig(StrategyConfig, frozen=True):
     pm_instrument_ids: tuple[str, ...]
     window_end_times_ns: tuple[int, ...]
+    outcome_side: str = "yes"
 
 
 class DummyOrder:
@@ -61,6 +62,16 @@ def _strategy() -> LifecycleHarness:
 
 
 class TestWindowedPolymarketStrategy:
+    def test_invalid_outcome_side_rejected(self):
+        with pytest.raises(ValueError, match="outcome_side must be one of"):
+            LifecycleHarness(
+                HarnessConfig(
+                    pm_instrument_ids=("a.POLYMARKET",),
+                    window_end_times_ns=(1_000,),
+                    outcome_side="down",
+                )
+            )
+
     def test_entry_guard_requires_quote(self):
         strategy = _strategy()
 

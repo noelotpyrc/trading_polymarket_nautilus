@@ -15,11 +15,14 @@ The current repo is through the sandbox gate:
 - Production-style runner profiles are implemented
 - Binance historical warmup is implemented for the `btc_updown` runner via `warmup_days`
 - Outcome-side selection is implemented for runner profiles and ad hoc runners
+- Stage 5 health guards are implemented for Binance signal validity, warmup timeout, and PM order-lifecycle escalation
+- Stage 6 guardrail fault-injection E2E coverage is implemented
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
 - Real Polymarket order submission and cancel behavior
 - Real live fill handling and venue reconciliation
+- End-to-end guardrail behavior under deterministic fault injection
 - Multi-hour stability under production-style supervision
 
 ---
@@ -141,16 +144,19 @@ Allow live runners to target the NO token as well as the YES token.
 
 Add health gating so the node stops trading when the process is alive but the inputs are not trustworthy.
 
+Detailed runtime definitions and the action matrix live in [docs/live_health_guard_policy.md](live_health_guard_policy.md).
+
 **Purpose**
 - Prevent trading on stale or incomplete data
 - Fail safe instead of silently running in a degraded state
 - Make operational failure modes explicit in logs
 
-**What we will implement**
-- Binance bar staleness guard
-- Polymarket quote staleness guard for the active instrument
-- Clear stop or no-entry behavior when feeds are stale or rollover state is unsafe
-- Exit reasons that are obvious from logs
+**Implementation status**
+- `btc_updown` now blocks signal-driven decisions on stale Binance bars and on Binance bar-series gaps until the gap ages out of the signal window
+- `btc_updown` now stops cleanly when historical warmup times out or returns no historical bars
+- Shared PM entry orders now cancel after the pending timeout and escalate to stop if they never resolve
+- Shared PM late fills now trigger immediate flattening plus a cleanup timeout that stops the node if flatness is not restored
+- Explicit runtime-health transitions are logged for `btc_updown`, and PM guardrail escalations log the order or instrument involved
 
 **Success criteria**
 - New entries are blocked when feed freshness conditions are violated
@@ -160,7 +166,32 @@ Add health gating so the node stops trading when the process is alive but the in
 
 ---
 
-## Stage 6 — Longer Sandbox Soak Runs
+## Stage 6 — Guardrail Fault-Injection E2E
+
+Exercise the implemented safeguard paths end-to-end with deterministic synthetic failures instead of waiting for live data to hit rare edge cases.
+
+**Purpose**
+- Prove the guardrail policies behave correctly across the full runtime flow, not just inside unit-level helpers
+- Validate that entry blocking, cancel escalation, flatten cleanup, and startup-stop behavior all hold when multiple components interact
+- Close the confidence gap between Stage 5 logic and later long-running or live-order rehearsals
+
+**Implementation status**
+- Implemented in [tests/live/test_guardrails_e2e.py](tests/live/test_guardrails_e2e.py)
+- Uses one BacktestEngine scenario for Binance gap block-and-recover
+- Uses deterministic scenario harnesses for:
+  - pending entry timeout -> cancel -> stop escalation
+  - late fill -> flatten -> cleanup success/failure
+  - warmup timeout -> stop
+
+**Success criteria**
+- Gap-contaminated Binance signal input cannot produce new entries until the gap is healed or ages out of the signal window
+- A stuck pending entry order is canceled on schedule and escalates to stop if it never resolves
+- A late fill creates immediate flatten behavior and stops if flatness is not restored
+- Warmup timeout causes a clean stop with the expected reason
+
+---
+
+## Stage 7 — Longer Sandbox Soak Runs
 
 Run the live process for hours, not minutes.
 
@@ -181,7 +212,7 @@ Run the live process for hours, not minutes.
 
 ---
 
-## Stage 7 — Live Order Lifecycle Rehearsal (No Intended Fill)
+## Stage 8 — Live Order Lifecycle Rehearsal (No Intended Fill)
 
 Submit a tiny live order that is intended to rest, then cancel it.
 
@@ -206,7 +237,7 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 ---
 
-## Stage 8 — Minimum-Size Live Fill Rehearsal
+## Stage 9 — Minimum-Size Live Fill Rehearsal
 
 Execute the smallest practical live position, then flatten it.
 
@@ -233,7 +264,7 @@ Execute the smallest practical live position, then flatten it.
 
 ---
 
-## Stage 9 — Observability Tightening
+## Stage 10 — Observability Tightening
 
 Make the system operable once multiple long-running nodes exist.
 

@@ -28,8 +28,12 @@ def _btc_bar(close: float, ts_ns: int) -> Bar:
 class WarmupHarness(BtcUpDownStrategy):
     def __init__(self, config: BtcUpDownConfig):
         super().__init__(config)
+        self.canceled_timer_names = []
         self.requests = []
+        self.scheduled_alerts = []
         self.entry_checks = []
+        self.now_ns = 0
+        self.stop_called = False
 
     def request_bars(self, bar_type, start, end=None, callback=None, **kwargs):
         self.requests.append(
@@ -41,6 +45,18 @@ class WarmupHarness(BtcUpDownStrategy):
             }
         )
         return "REQ-1"
+
+    def stop(self):
+        self.stop_called = True
+
+    def _now_ns(self) -> int:
+        return self.now_ns
+
+    def _set_guard_time_alert(self, name: str, alert_time_ns: int, callback) -> None:
+        self.scheduled_alerts.append((name, alert_time_ns, callback))
+
+    def _cancel_guard_timer(self, name: str) -> None:
+        self.canceled_timer_names.append(name)
 
     def _check_entry_exit(self, signal_ts_ns: int) -> None:
         self.entry_checks.append(signal_ts_ns)
@@ -105,6 +121,7 @@ class TestBtcWarmup:
     def test_start_btc_warmup_requests_expected_range(self):
         strategy = _warmup_strategy()
         now = datetime(2026, 3, 9, 15, 27, 42, tzinfo=timezone.utc)
+        strategy.now_ns = 5_000
 
         strategy._start_btc_warmup(now=now)
 
@@ -117,6 +134,19 @@ class TestBtcWarmup:
                 "callback": strategy._on_warmup_complete,
             }
         ]
+        assert strategy.scheduled_alerts == [
+            ("btc_warmup_timeout", 300_000_005_000, strategy._on_warmup_timeout)
+        ]
+
+    def test_warmup_timeout_stops_strategy(self):
+        strategy = _warmup_strategy()
+        strategy.now_ns = 10_000
+
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+        strategy._on_warmup_timeout(None)
+
+        assert strategy._warmup_request_inflight is False
+        assert strategy.stop_called is True
 
     def test_live_bars_buffer_until_warmup_complete(self):
         strategy = _warmup_strategy()
@@ -143,6 +173,7 @@ class TestBtcWarmup:
         assert strategy._warmup_live_buffer == {}
         assert list(strategy._btc_closes) == [100.0, 101.0, 102.0]
         assert strategy.entry_checks == [3_000]
+        assert strategy.canceled_timer_names == ["btc_warmup_timeout"]
 
     def test_warmup_complete_dedupes_overlap_and_prefers_live_buffer(self):
         strategy = _warmup_strategy(signal_lookback=2)
@@ -157,6 +188,16 @@ class TestBtcWarmup:
 
         assert list(strategy._btc_closes) == [100.0, 101.5, 102.0]
         assert strategy.entry_checks == [3_000]
+
+    def test_warmup_complete_with_no_historical_bars_stops_strategy(self):
+        strategy = _warmup_strategy(signal_lookback=2)
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+        strategy.on_bar(_btc_bar(102.0, 3_000))
+
+        strategy._on_warmup_complete("REQ-1")
+
+        assert strategy.stop_called is True
+        assert strategy.entry_checks == []
 
     def test_first_post_warmup_live_bar_uses_history_to_form_signal(self):
         strategy = _warmup_strategy(signal_lookback=2)
@@ -194,3 +235,54 @@ class TestBtcWarmup:
         assert list(strategy._btc_closes) == [100.0, 101.0, 102.0, 99.0]
         assert strategy._compute_signal() == -1
         assert strategy.entry_checks == [4_000]
+
+    def test_stale_live_bar_blocks_signal_generation(self):
+        strategy = _warmup_strategy(signal_lookback=2, warmup_days=0)
+
+        strategy.now_ns = 60_000_000_000
+        strategy.on_bar(_btc_bar(100.0, 60_000_000_000))
+        strategy.now_ns = 120_000_000_000
+        strategy.on_bar(_btc_bar(101.0, 120_000_000_000))
+        strategy.now_ns = 331_000_000_000
+        strategy.on_bar(_btc_bar(102.0, 180_000_000_000))
+
+        assert list(strategy._btc_closes) == [100.0, 101.0, 102.0]
+        assert strategy.entry_checks == []
+        assert strategy._signal_guard_reason(180_000_000_000) == "BTC bar stale (151s old)"
+
+    def test_gap_blocks_signal_until_contiguous_window_recovers(self):
+        strategy = _warmup_strategy(signal_lookback=2, warmup_days=0)
+
+        for ts_ns, close in [
+            (60_000_000_000, 100.0),
+            (120_000_000_000, 101.0),
+            (240_000_000_000, 102.0),  # Missing 180s bar
+            (300_000_000_000, 103.0),
+            (360_000_000_000, 104.0),
+        ]:
+            strategy.now_ns = ts_ns
+            strategy.on_bar(_btc_bar(close, ts_ns))
+
+        assert strategy.entry_checks == [360_000_000_000]
+        assert strategy._gap_recovery_bars == 0
+        assert list(strategy._btc_closes) == [102.0, 103.0, 104.0]
+
+    def test_warmup_gap_requires_post_gap_bars_before_signal(self):
+        strategy = _warmup_strategy(signal_lookback=2)
+        strategy.now_ns = 0
+        strategy._start_btc_warmup(now=datetime(2026, 3, 9, 15, 27, tzinfo=timezone.utc))
+
+        strategy.on_historical_data(_btc_bar(100.0, 60_000_000_000))
+        strategy.on_historical_data(_btc_bar(101.0, 120_000_000_000))
+        strategy.on_historical_data(_btc_bar(102.0, 240_000_000_000))  # Missing 180s bar
+
+        strategy._on_warmup_complete("REQ-1")
+        assert strategy.entry_checks == []
+
+        strategy.now_ns = 300_000_000_000
+        strategy.on_bar(_btc_bar(103.0, 300_000_000_000))
+        assert strategy.entry_checks == []
+
+        strategy.now_ns = 360_000_000_000
+        strategy.on_bar(_btc_bar(104.0, 360_000_000_000))
+        assert strategy.entry_checks == [360_000_000_000]

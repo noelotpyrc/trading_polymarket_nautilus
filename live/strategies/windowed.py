@@ -9,6 +9,10 @@ from nautilus_trader.trading.strategy import Strategy
 
 class WindowedPolymarketStrategy(Strategy):
     _QUOTE_STALE_AFTER_NS = 120_000_000_000
+    _SIGNAL_BAR_STALE_AFTER_NS = 150_000_000_000
+    _ENTRY_ORDER_CANCEL_AFTER_NS = 90_000_000_000
+    _ENTRY_ORDER_ESCALATE_AFTER_NS = 180_000_000_000
+    _LATE_FILL_FLATTEN_TIMEOUT_NS = 60_000_000_000
 
     def __init__(self, config):
         super().__init__(config)
@@ -36,6 +40,11 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_order_client_id = None
         self._entry_order_instruments: dict[object, InstrumentId] = {}
         self._entry_orders_flatten_on_fill: set[object] = set()
+        self._entry_order_timer_names: dict[object, tuple[str, str]] = {}
+        self._entry_order_timeout_order_ids: dict[str, object] = {}
+        self._late_fill_timer_names: dict[InstrumentId, str] = {}
+        self._late_fill_timeout_instruments: dict[str, InstrumentId] = {}
+        self._late_fill_cleanup_pending: set[InstrumentId] = set()
 
         self._trade_count = 0
 
@@ -74,6 +83,16 @@ class WindowedPolymarketStrategy(Strategy):
 
         return None
 
+    def _now_ns(self) -> int:
+        return self.clock.timestamp_ns()
+
+    def _signal_bar_stale_reason(self, signal_ts_ns: int, *, now_ns: int | None = None) -> str | None:
+        current_ns = self._now_ns() if now_ns is None else now_ns
+        bar_age_ns = max(0, current_ns - signal_ts_ns)
+        if bar_age_ns > self._SIGNAL_BAR_STALE_AFTER_NS:
+            return f"BTC bar stale ({bar_age_ns // 1_000_000_000}s old)"
+        return None
+
     def _quote_state_str(self, now_ns: int) -> str:
         if self._pm_mid is None or self._pm_mid_ts_ns is None:
             return "n/a"
@@ -92,6 +111,7 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_order_pending = True
         self._entry_order_client_id = order.client_order_id
         self._entry_order_instruments[order.client_order_id] = self._pm_instrument_id
+        self._schedule_entry_order_timeouts(order.client_order_id)
         self.submit_order(order)
 
     def _selected_outcome_label(self) -> str:
@@ -118,6 +138,135 @@ class WindowedPolymarketStrategy(Strategy):
                 continue
             seen.add(instrument_id)
             self._close_positions_for_instrument(instrument_id, reason="strategy stop")
+
+    def _has_open_position_on_instrument(self, instrument_id: InstrumentId) -> bool:
+        return bool(self.cache.positions_open(instrument_id=instrument_id))
+
+    def _guard_timer_name(self, prefix: str, suffix: str) -> str:
+        return f"{prefix}:{suffix}"
+
+    def _client_order_ref(self, client_order_id) -> str:
+        if hasattr(client_order_id, "to_str"):
+            return client_order_id.to_str()
+        return str(client_order_id)
+
+    def _set_guard_time_alert(self, name: str, alert_time_ns: int, callback) -> None:
+        self.clock.set_time_alert_ns(
+            name=name,
+            alert_time_ns=alert_time_ns,
+            callback=callback,
+        )
+
+    def _cancel_guard_timer(self, name: str) -> None:
+        try:
+            self.clock.cancel_timer(name)
+        except Exception:
+            return
+
+    def _schedule_entry_order_timeouts(self, client_order_id) -> None:
+        order_ref = self._client_order_ref(client_order_id)
+        cancel_name = self._guard_timer_name("ENTRY-CANCEL", order_ref)
+        escalate_name = self._guard_timer_name("ENTRY-ESCALATE", order_ref)
+        now_ns = self._now_ns()
+
+        self._entry_order_timer_names[client_order_id] = (cancel_name, escalate_name)
+        self._entry_order_timeout_order_ids[cancel_name] = client_order_id
+        self._entry_order_timeout_order_ids[escalate_name] = client_order_id
+
+        self._set_guard_time_alert(
+            cancel_name,
+            now_ns + self._ENTRY_ORDER_CANCEL_AFTER_NS,
+            self._on_entry_order_cancel_timeout,
+        )
+        self._set_guard_time_alert(
+            escalate_name,
+            now_ns + self._ENTRY_ORDER_ESCALATE_AFTER_NS,
+            self._on_entry_order_escalation_timeout,
+        )
+
+    def _cancel_entry_order_timeouts(self, client_order_id) -> None:
+        timer_names = self._entry_order_timer_names.pop(client_order_id, None)
+        if timer_names is None:
+            return
+
+        for timer_name in timer_names:
+            self._entry_order_timeout_order_ids.pop(timer_name, None)
+            self._cancel_guard_timer(timer_name)
+
+    def _handle_entry_order_cancel_timeout_for(self, client_order_id) -> None:
+        if (
+            not self._entry_order_pending
+            or self._entry_order is None
+            or client_order_id != self._entry_order_client_id
+        ):
+            return
+
+        self._entry_orders_flatten_on_fill.add(client_order_id)
+        self.cancel_order(self._entry_order)
+        self.log.warning(
+            f"Entry order pending too long ({self._ENTRY_ORDER_CANCEL_AFTER_NS // 1_000_000_000}s) "
+            f"— canceling {client_order_id}"
+        )
+
+    def _handle_entry_order_escalation_timeout_for(self, client_order_id) -> None:
+        if not self._entry_order_pending or client_order_id != self._entry_order_client_id:
+            return
+
+        self.log.error(
+            f"Entry order unresolved after cancel grace "
+            f"({self._ENTRY_ORDER_ESCALATE_AFTER_NS // 1_000_000_000}s) "
+            f"— stopping for manual reconciliation: {client_order_id}"
+        )
+        self.stop()
+
+    def _on_entry_order_cancel_timeout(self, event) -> None:
+        client_order_id = self._entry_order_timeout_order_ids.get(event.to_str())
+        if client_order_id is not None:
+            self._handle_entry_order_cancel_timeout_for(client_order_id)
+
+    def _on_entry_order_escalation_timeout(self, event) -> None:
+        client_order_id = self._entry_order_timeout_order_ids.get(event.to_str())
+        if client_order_id is not None:
+            self._handle_entry_order_escalation_timeout_for(client_order_id)
+
+    def _schedule_late_fill_cleanup_timeout(self, instrument_id: InstrumentId) -> None:
+        if instrument_id in self._late_fill_timer_names:
+            return
+
+        timer_name = self._guard_timer_name("LATE-FILL-CHECK", str(instrument_id))
+        self._late_fill_timer_names[instrument_id] = timer_name
+        self._late_fill_timeout_instruments[timer_name] = instrument_id
+        self._late_fill_cleanup_pending.add(instrument_id)
+        self._set_guard_time_alert(
+            timer_name,
+            self._now_ns() + self._LATE_FILL_FLATTEN_TIMEOUT_NS,
+            self._on_late_fill_cleanup_timeout,
+        )
+
+    def _cancel_late_fill_cleanup_timeout(self, instrument_id: InstrumentId) -> None:
+        timer_name = self._late_fill_timer_names.pop(instrument_id, None)
+        if timer_name is None:
+            return
+
+        self._late_fill_timeout_instruments.pop(timer_name, None)
+        self._late_fill_cleanup_pending.discard(instrument_id)
+        self._cancel_guard_timer(timer_name)
+
+    def _handle_late_fill_cleanup_timeout_for(self, instrument_id: InstrumentId) -> None:
+        if not self._has_open_position_on_instrument(instrument_id):
+            self._cancel_late_fill_cleanup_timeout(instrument_id)
+            return
+
+        self.log.error(
+            f"Late-fill cleanup did not flatten {instrument_id} within "
+            f"{self._LATE_FILL_FLATTEN_TIMEOUT_NS // 1_000_000_000}s — stopping"
+        )
+        self.stop()
+
+    def _on_late_fill_cleanup_timeout(self, event) -> None:
+        instrument_id = self._late_fill_timeout_instruments.get(event.to_str())
+        if instrument_id is not None:
+            self._handle_late_fill_cleanup_timeout_for(instrument_id)
 
     def _roll_to_next_window(self, exhausted_message: str) -> None:
         self.log.info(f"Window ending ({_fmt_ns(self._window_end_ns)} UTC) — rolling over")
@@ -153,6 +302,7 @@ class WindowedPolymarketStrategy(Strategy):
     def _clear_active_entry_order(self, client_order_id) -> None:
         if client_order_id != self._entry_order_client_id:
             return
+        self._cancel_entry_order_timeouts(client_order_id)
         self._entry_order = None
         self._entry_order_pending = False
         self._entry_order_client_id = None
@@ -208,8 +358,8 @@ class WindowedPolymarketStrategy(Strategy):
                 f"(current={self._pm_instrument_id}) — flattening immediately"
             )
             self._close_positions_for_instrument(tracked_instrument_id, reason="late fill")
+            self._schedule_late_fill_cleanup_timeout(tracked_instrument_id)
             self._clear_active_entry_order(event.client_order_id)
-            self._entry_orders_flatten_on_fill.discard(event.client_order_id)
         elif (
             event.client_order_id == self._entry_order_client_id
             and event.order_side == OrderSide.BUY
@@ -219,6 +369,14 @@ class WindowedPolymarketStrategy(Strategy):
 
         self._trade_count += 1
         self.log.info(f"Fill #{self._trade_count}: price={event.last_px} qty={event.last_qty}")
+
+    def on_position_closed(self, event) -> None:
+        if (
+            event.instrument_id in self._late_fill_cleanup_pending
+            and not self._has_open_position_on_instrument(event.instrument_id)
+        ):
+            self.log.info(f"Late-fill cleanup complete on {event.instrument_id} — flat again")
+            self._cancel_late_fill_cleanup_timeout(event.instrument_id)
 
 
 def _fmt_ns(ts_ns: int) -> str:

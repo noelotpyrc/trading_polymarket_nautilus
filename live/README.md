@@ -158,23 +158,21 @@ python live/runs/profile.py btc_updown_15m_live --print-profile
 - The node will stop cleanly when it runs out of pre-loaded windows and will log that a restart is required.
 - Daily restart is the intended operating model for this phase. There is no automatic cross-day market extension yet.
 - Run the sandbox validation sequence in `docs/live_testing_plan.md` before considering any real-order rehearsal.
+- The detailed health-guard policy lives in [docs/live_health_guard_policy.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_health_guard_policy.md).
 
 ## Next Steps
 
 The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next implementation stages are:
 
-1. Health guards / fail-safe controls
-   - Purpose: stop or block trading when feeds are stale or state is unsafe.
-   - Success: degraded feeds cannot trigger accidental entries.
-2. Longer sandbox soak runs
+1. Longer sandbox soak runs
    - Purpose: prove multi-hour stability.
    - Success: repeated rollovers and long runtimes remain clean.
-3. Live order lifecycle rehearsal
+2. Live order lifecycle rehearsal
    - Purpose: prove live submit/open/cancel behavior with no intended fill.
    - Success: a tiny non-marketable live order opens and cancels cleanly.
-4. Minimum-size live fill rehearsal
+3. Minimum-size live fill rehearsal
    - Purpose: prove the live execution path end-to-end.
    - Success: one minimum-size live round trip reconciles with Polymarket.
-5. Observability tightening
+4. Observability tightening
    - Purpose: make the live system operable at session and multi-node scale.
    - Success: logs and runbook are enough to diagnose failures without code inspection.

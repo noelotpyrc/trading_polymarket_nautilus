@@ -52,6 +52,14 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
         value = random.random()
         mid_str = self._quote_state_str(bar.ts_event)
         positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
+        stale_reason = self._signal_bar_stale_reason(bar.ts_event)
+
+        if stale_reason is not None:
+            self.log.warning(
+                f"BTC={bar.close} rand={value:.3f} | mid={mid_str} | "
+                f"signal blocked ({stale_reason})"
+            )
+            return
 
         if positions and value > self._exit_threshold:
             self.log.info(

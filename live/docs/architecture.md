@@ -232,19 +232,16 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
 
-1. Health guards / fail-safe controls
-   - Purpose: stop or block trading when feeds are stale or process state is unsafe.
-   - Success: stale or degraded inputs do not produce accidental orders.
-2. Longer sandbox soak runs
+1. Longer sandbox soak runs
    - Purpose: prove multi-hour stability instead of startup correctness only.
    - Success: repeated rollovers and long runtimes finish cleanly.
-3. Live order lifecycle rehearsal
+2. Live order lifecycle rehearsal
    - Purpose: prove real submit/open/cancel behavior without intended fill risk.
    - Success: a tiny non-marketable live limit order opens, cancels, and leaves no residue.
-4. Minimum-size live fill rehearsal
+3. Minimum-size live fill rehearsal
    - Purpose: prove real live fills and venue reconciliation end-to-end.
    - Success: one minimum-size live round trip reconciles cleanly.
-5. Observability tightening
+4. Observability tightening
    - Purpose: make long-running live processes operable.
    - Success: operators can diagnose failures from logs and runbook alone.
 

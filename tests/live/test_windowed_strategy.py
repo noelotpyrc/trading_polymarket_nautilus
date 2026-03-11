@@ -25,7 +25,11 @@ class LifecycleHarness(WindowedPolymarketStrategy):
     def __init__(self, config: HarnessConfig):
         super().__init__(config)
         self.canceled_orders = []
+        self.canceled_timer_names = []
         self.closed_instruments = []
+        self.guard_alerts = []
+        self.now_ns = 0
+        self.open_positions = set()
         self.subscription_events = []
         self.alerts = []
         self.stop_called = False
@@ -47,6 +51,18 @@ class LifecycleHarness(WindowedPolymarketStrategy):
 
     def stop(self):
         self.stop_called = True
+
+    def _now_ns(self) -> int:
+        return self.now_ns
+
+    def _has_open_position_on_instrument(self, instrument_id):
+        return instrument_id in self.open_positions
+
+    def _set_guard_time_alert(self, name: str, alert_time_ns: int, callback) -> None:
+        self.guard_alerts.append((name, alert_time_ns, callback))
+
+    def _cancel_guard_timer(self, name: str) -> None:
+        self.canceled_timer_names.append(name)
 
     def _on_window_end(self, event) -> None:
         raise NotImplementedError
@@ -112,11 +128,39 @@ class TestWindowedPolymarketStrategy:
         strategy._entry_order_client_id = "O-1"
         strategy._entry_order_pending = True
         strategy._entry_order_instruments["O-1"] = strategy._pm_instrument_id
+        strategy._entry_order_timer_names["O-1"] = ("cancel-O-1", "escalate-O-1")
+        strategy._entry_order_timeout_order_ids["cancel-O-1"] = "O-1"
+        strategy._entry_order_timeout_order_ids["escalate-O-1"] = "O-1"
 
         getattr(strategy, handler_name)(event)
 
         assert strategy._entry_order_pending is False
         assert strategy._entry_order_client_id is None
+        assert strategy.canceled_timer_names == ["cancel-O-1", "escalate-O-1"]
+
+    def test_entry_order_cancel_timeout_requests_cancel_and_keeps_pending(self):
+        strategy = _strategy()
+        strategy._entry_order = DummyOrder("O-1")
+        strategy._entry_order_client_id = "O-1"
+        strategy._entry_order_pending = True
+        strategy._entry_order_instruments["O-1"] = strategy._pm_instrument_id
+
+        strategy._handle_entry_order_cancel_timeout_for("O-1")
+
+        assert strategy.canceled_orders == ["O-1"]
+        assert strategy._entry_order_pending is True
+        assert "O-1" in strategy._entry_orders_flatten_on_fill
+
+    def test_entry_order_escalation_timeout_stops_when_order_is_unresolved(self):
+        strategy = _strategy()
+        strategy._entry_order = DummyOrder("O-1")
+        strategy._entry_order_client_id = "O-1"
+        strategy._entry_order_pending = True
+        strategy._entry_order_instruments["O-1"] = strategy._pm_instrument_id
+
+        strategy._handle_entry_order_escalation_timeout_for("O-1")
+
+        assert strategy.stop_called is True
 
     def test_rollover_cancels_pending_and_subscribes_new_before_old(self):
         strategy = _strategy()
@@ -178,3 +222,26 @@ class TestWindowedPolymarketStrategy:
         assert strategy._entry_order_pending is False
         assert strategy._entered_this_window is False
         assert strategy._trade_count == 1
+        assert strategy.guard_alerts[0][0] == "LATE-FILL-CHECK:a.POLYMARKET"
+
+    def test_late_fill_cleanup_timeout_stops_when_position_remains_open(self):
+        strategy = _strategy()
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy.open_positions.add(instrument)
+        strategy._schedule_late_fill_cleanup_timeout(instrument)
+
+        strategy._handle_late_fill_cleanup_timeout_for(instrument)
+
+        assert strategy.stop_called is True
+
+    def test_position_closed_cancels_late_fill_cleanup_timer_when_flat(self):
+        strategy = _strategy()
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy.open_positions.add(instrument)
+        strategy._schedule_late_fill_cleanup_timeout(instrument)
+        strategy.open_positions.clear()
+
+        strategy.on_position_closed(SimpleNamespace(instrument_id=instrument))
+
+        assert strategy.canceled_timer_names == ["LATE-FILL-CHECK:a.POLYMARKET"]
+        assert instrument not in strategy._late_fill_cleanup_pending

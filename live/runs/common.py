@@ -81,17 +81,26 @@ def run_strategy(
     pm_ids = [window[0] for window in windows]
 
     node = build_node(pm_ids, sandbox=sandbox, binance_us=binance_us)
-    node.trader.add_strategy(
-        build_strategy(
-            strategy_name,
-            windows=windows,
-            outcome_side=outcome_side,
-            strategy_config=strategy_config,
-        )
+    strategy = build_strategy(
+        strategy_name,
+        windows=windows,
+        outcome_side=outcome_side,
+        strategy_config=strategy_config,
     )
+    strategy.set_process_stop_callback(node.stop)
+    node.trader.add_strategy(strategy)
     node.build()
-    schedule_stop(node, run_secs)
-    node.run()
+    timer = schedule_stop(
+        lambda: strategy.request_process_stop(
+            f"Auto-stop timer elapsed after {run_secs}s"
+        ),
+        run_secs,
+    )
+    try:
+        node.run()
+    finally:
+        if timer is not None:
+            timer.cancel()
 
 
 def _strategy_spec(strategy_name: str) -> StrategySpec:

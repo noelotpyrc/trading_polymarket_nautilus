@@ -58,6 +58,7 @@ def polymarket_data_config(
         api_secret=api_secret,
         passphrase=passphrase,
         funder=funder,
+        drop_quotes_missing_side=False,
         instrument_config=PolymarketInstrumentProviderConfig(
             load_ids=frozenset(pm_instrument_ids),
         ),

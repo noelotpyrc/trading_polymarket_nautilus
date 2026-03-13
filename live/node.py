@@ -7,7 +7,7 @@ Importable helpers for use by any strategy runner:
   - build_node(pm_instrument_ids, sandbox, binance_us)
   - make_arg_parser(description)
   - prepare_run(...)
-  - schedule_stop(node, run_secs)
+  - schedule_stop(stop_target, run_secs)
 
 Run scripts live in live/runs/ — each runner assembles its own node
 by importing these helpers plus the client configs from live/config.py.
@@ -180,12 +180,13 @@ def prepare_run(
     return windows
 
 
-def schedule_stop(node, run_secs: int | None):
+def schedule_stop(stop_target, run_secs: int | None):
     """Schedule a bounded stop for manual/sandbox runs."""
     if run_secs is None:
         return None
 
-    timer = threading.Timer(run_secs, node.stop)
+    callback = stop_target.stop if hasattr(stop_target, "stop") else stop_target
+    timer = threading.Timer(run_secs, callback)
     timer.daemon = True
     timer.start()
     return timer

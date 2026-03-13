@@ -1,6 +1,6 @@
 # Live Health Guard Policy
 
-Decision reference for Stage 5 live-process safeguards. This document defines the runtime health states, what counts as stale or incomplete input, and how the node should react when signal or execution state is degraded.
+Decision reference for Stage 5 live-process safeguards. This document defines the runtime health states, what counts as stale or incomplete input, how known residual exposure should be handled after a Polymarket window closes, and how the node should react when signal or execution state is degraded.
 
 ---
 
@@ -9,6 +9,7 @@ Decision reference for Stage 5 live-process safeguards. This document defines th
 - `healthy`: normal trading allowed.
 - `initializing`: expected startup state. No new entries yet, but the node is not considered degraded.
 - `degraded_entry_blocked`: process stays up, but no new entries are allowed. Cancels, exits, rollover, and cleanup are still allowed.
+- `carried_residual`: an ended-window Polymarket position is known and intentionally being held to market resolution because flattening is no longer realistic or worthwhile. New-window trading may continue.
 - `stop_required`: process state is not trustworthy enough to continue. The node should do a controlled stop.
 - `planned_stop`: expected clean stop such as bounded runtime or window exhaustion. Not a degraded state.
 
@@ -22,7 +23,7 @@ An input is `stale` when it exists, but is too old to trust for new entry decisi
 
 Examples:
 - latest Binance 1-minute signal bar is too old relative to wall clock
-- latest valid two-sided Polymarket quote is too old for the active instrument
+- latest Polymarket quote is too old for the active instrument
 
 ### Incomplete
 
@@ -30,7 +31,8 @@ An input is `incomplete` when the required structure is missing.
 
 Examples:
 - not enough Binance bars to compute the signal yet
-- no valid two-sided Polymarket quote exists for the active instrument
+- no Polymarket quote has been seen yet for the active instrument
+- the quote exists, but the side needed for the intended action has zero size
 - warmup request is still in flight
 
 ### Gap
@@ -62,12 +64,13 @@ This applies when:
 | Binance bar series gapped | One or more closed BTC 1-minute bars are missing from the accepted series | `degraded_entry_blocked` | Mark signal invalid and block new entries | No entries while the signal window is contaminated |
 | Binance gap healing | Missing range is being repaired via historical backfill | `degraded_entry_blocked` | Buffer live bars, merge/sort/dedupe after backfill | Trading resumes only after the series is contiguous again |
 | Persistent Binance outage | Binance bars remain stale or gapped for an extended period | `degraded_entry_blocked` | Keep node alive, block entries, log loudly, alert operator | Process remains safe without silent re-entry |
-| Polymarket quote incomplete | No valid two-sided quote for the active instrument | `degraded_entry_blocked` | Block new entries | One-sided or missing quote never triggers entry |
-| Polymarket quote stale | Last valid two-sided quote for the active instrument is older than `120s` | `degraded_entry_blocked` | Block new entries | No entries on stale Polymarket price |
+| Polymarket quote incomplete | No quote has been seen yet, or the side needed for the intended action has zero size | `degraded_entry_blocked` | Block new entries | Missing-side or missing quote state never triggers entry |
+| Polymarket quote stale | Last Polymarket quote for the active instrument is older than `120s` | `degraded_entry_blocked` | Block new entries | No entries on stale Polymarket price |
 | Entry order pending too long | Entry order is still pending after `90s` | `degraded_entry_blocked` | Cancel the order and keep blocking entries | Order resolves to fill/cancel/deny/reject |
 | Entry order unresolved after cancel grace | Entry order still has no terminal state after `180s` | `stop_required` | Stop node and require manual reconciliation | Node exits with the order id and reason in logs |
-| Late fill on old window / canceled entry | An obsolete order fills after rollover or after cancel was requested | `degraded_entry_blocked` | Flatten immediately and keep blocking entries until flat | Residual exposure is removed and current state is clean |
-| Late-fill cleanup fails | Residual late-fill position is not flat after `60s` | `stop_required` | Stop node | No continued trading with hidden exposure |
+| Late fill / obsolete fill while the market is still tradable | A canceled or obsolete order fills, but the instrument is still in an active trading window | `degraded_entry_blocked` | Flatten immediately and keep blocking entries until flat | Residual exposure is removed and current state is clean |
+| Known uncloseable residual | A position remains known but cannot be flattened normally because the exit partially fills into below-min size or because ended-window liquidity disappears | `carried_residual` | Stop retrying exits, poll for market resolution, allow other windows to continue | Residual stays tracked until the market resolves |
+| Unknown order / position state | Order or position state cannot be reconciled confidently after cancel/fill/disconnect/reconnect | `stop_required` | Stop node and require manual reconciliation | No continued trading with uncertain exposure |
 | Window exhaustion | No next preloaded window exists | `planned_stop` | Stop node with restart-needed message | Clean stop; not treated as failure |
 | Lifecycle invariant violation | Impossible internal strategy/order/window state | `stop_required` | Best-effort cancel/flatten, then stop | Trading halts immediately with a critical log |
 
@@ -115,13 +118,48 @@ Common cases:
 - the strategy rolled from window A to window B, then a fill arrives for window A
 - the strategy sent cancel for an entry order, but the venue still filled it before cancel took effect
 
-This is an unintended exposure problem. The correct response is to flatten the unexpected position immediately and avoid new entries until flatness is confirmed.
+This is an unintended exposure problem. The correct response depends on market state:
+
+- if the market is still tradable, flatten the unexpected position immediately and avoid new entries until flatness is confirmed
+- if the window has ended and the residual is known but no longer realistically closeable, carry it to resolution instead of stopping the node
 
 ### Flatten
 
 `Flatten` means removing exposure so net position becomes zero on that instrument.
 
 In this project, flattening means closing the unexpected YES or NO token position immediately.
+
+### Known residual vs unknown exposure/state
+
+`Known residual` means the node knows exactly what position remains, even if it cannot flatten it immediately.
+
+Examples:
+- a partial exit leaves `0.4` shares, below the market minimum
+- no executable bid exists after the window closes, so the exact old-window position remains open
+- a late fill creates a small, known YES/NO position on a window that has already ended
+
+`Unknown exposure/state` means the node cannot trust its own answer about whether exposure or open orders still exist.
+
+Examples:
+- an entry order was submitted, but no terminal state ever arrives
+- cancel was requested, but after disconnect/reconnect the node cannot tell whether the order is canceled, still open, or filled
+- venue-side and Nautilus-side order or position state no longer reconcile
+
+The project policy is:
+- known residual that cannot be flattened normally -> carry to resolution
+- unknown order or exposure state -> stop the node
+
+### Carry to resolution
+
+When a Polymarket window has ended and the remaining YES/NO exposure is known, the node should:
+
+1. stop retrying futile exits
+2. track the residual by instrument
+3. poll Polymarket market metadata until the market resolves
+4. record whether the carried YES/NO token won or lost (`1` or `0`)
+5. allow current-window trading to continue while that old residual is tracked
+
+Manual redemption is still out of scope for the current implementation.
 
 ---
 
@@ -132,11 +170,14 @@ Current implementation covers:
 - Binance stale/gap detection with entry blocking in `btc_updown`
 - explicit degraded-state logging in `btc_updown`
 - pending-entry timeout and cancel escalation
-- late-fill cleanup escalation
+- Polymarket-compatible exit submission for live and sandbox
+- carry-to-resolution for known ended-window residuals
+- process-stop finalization that waits for carried residuals to resolve
 
 Out of scope for the first pass:
 - automatic node stop purely from Binance staleness
 - automatic node stop purely from Polymarket quote staleness
+- automatic token redemption after resolution
 - production alerting integrations
 
 Guardrail fault-injection E2E coverage for these policies now lives in [tests/live/test_guardrails_e2e.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_guardrails_e2e.py).

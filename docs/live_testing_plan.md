@@ -4,6 +4,8 @@ How to validate the live Nautilus process before deploying with meaningful capit
 
 Polymarket has no testnet. Validation must progress from sandboxed live-data runs to tightly controlled live order rehearsals.
 
+For the detailed fix inventory and current committed vs local-only status, see [docs/live_hardening_status.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_hardening_status.md).
+
 ---
 
 ## Current Status
@@ -17,13 +19,18 @@ The current repo is through the sandbox gate:
 - Outcome-side selection is implemented for runner profiles and ad hoc runners
 - Stage 5 health guards are implemented for Binance signal validity, warmup timeout, and PM order-lifecycle escalation
 - Stage 6 guardrail fault-injection E2E coverage is implemented
+- Polymarket market-entry orders now use IOC, and known residual entry-order remainders are canceled when the related position is cleaned up
+- Stage 7 side-aware Polymarket quote handling is implemented for the live strategies and data config
+- Ended-window residual positions now carry to Polymarket resolution instead of forcing an immediate stop
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
 - Real Polymarket order submission and cancel behavior
 - Real live fill handling and venue reconciliation
-- End-to-end guardrail behavior under deterministic fault injection
 - Multi-hour stability under production-style supervision
+- Log-volume reduction from one-sided Polymarket books under a fresh multi-hour soak run
+- Resolution polling against live closed-market data
+- Automated post-resolution settlement / redemption handling, which is intentionally deferred to a separate external process
 
 ---
 
@@ -155,13 +162,15 @@ Detailed runtime definitions and the action matrix live in [docs/live_health_gua
 - `btc_updown` now blocks signal-driven decisions on stale Binance bars and on Binance bar-series gaps until the gap ages out of the signal window
 - `btc_updown` now stops cleanly when historical warmup times out or returns no historical bars
 - Shared PM entry orders now cancel after the pending timeout and escalate to stop if they never resolve
-- Shared PM late fills now trigger immediate flattening plus a cleanup timeout that stops the node if flatness is not restored
+- Shared PM late fills now trigger immediate flattening; if a known residual remains on an ended window, it carries to resolution instead of forcing a stop
+- Strategy-managed process stop now waits for carried residuals to resolve before final node shutdown
 - Explicit runtime-health transitions are logged for `btc_updown`, and PM guardrail escalations log the order or instrument involved
 
 **Success criteria**
 - New entries are blocked when feed freshness conditions are violated
 - Unsafe state leads to clean stop or explicit degraded-mode behavior
 - Tests prove stale-input conditions do not produce accidental orders
+- Known old-window residuals remain tracked to resolution instead of causing unnecessary node stops
 - Operators can identify the failure cause from logs alone
 
 ---
@@ -180,18 +189,51 @@ Exercise the implemented safeguard paths end-to-end with deterministic synthetic
 - Uses one BacktestEngine scenario for Binance gap block-and-recover
 - Uses deterministic scenario harnesses for:
   - pending entry timeout -> cancel -> stop escalation
-  - late fill -> flatten -> cleanup success/failure
+  - late fill -> flatten -> cleanup success / carry-to-resolution
   - warmup timeout -> stop
 
 **Success criteria**
 - Gap-contaminated Binance signal input cannot produce new entries until the gap is healed or ages out of the signal window
 - A stuck pending entry order is canceled on schedule and escalates to stop if it never resolves
-- A late fill creates immediate flatten behavior and stops if flatness is not restored
+- A late fill creates immediate flatten behavior, and ended-window residuals move into resolution tracking instead of forcing a stop
 - Warmup timeout causes a clean stop with the expected reason
 
 ---
 
-## Stage 7 — Longer Sandbox Soak Runs
+## Stage 7 — Side-Aware Polymarket Quote Handling
+
+Move from dropping one-sided Polymarket quotes to consuming them explicitly and safely.
+
+**Purpose**
+- Model the real Polymarket book state more faithfully instead of hiding one-sided markets
+- Reduce `Dropping QuoteTick` log spam at the root rather than only suppressing it
+- Make strategy entry/exit gating depend on the actual side-specific liquidity that exists
+
+**What we will implement**
+- Set `drop_quotes_missing_side=False` for the Polymarket data client
+- Track quote prices and sizes explicitly in the live strategies
+- Define side-aware tradability:
+  - `buy_tradable`: fresh quote and positive ask size
+  - `sell_tradable`: fresh quote and positive bid size
+  - `two_sided`: both sides have positive size
+- Only use midpoint pricing when the quote is genuinely two-sided
+
+**Implementation status**
+- Implemented in `live/config.py` and the shared `WindowedPolymarketStrategy`
+- BUY entry decisions now require a fresh quote with positive ask size
+- Active-window SELL / flatten decisions from strategy logic now require a fresh quote with positive bid size
+- Heartbeat / signal logs now show side-specific quote state instead of assuming a usable midpoint
+- Focused unit and integration coverage was updated for one-sided quote handling
+
+**Success criteria**
+- One-sided Polymarket books no longer generate overwhelming dropped-quote warnings
+- BUY entry logic never treats a synthetic or zero-sized ask as executable liquidity
+- SELL / flatten logic never treats a synthetic or zero-sized bid as executable liquidity
+- Tests prove the strategy behaves correctly when the market transitions between one-sided and two-sided states
+
+---
+
+## Stage 8 — Longer Sandbox Soak Runs
 
 Run the live process for hours, not minutes.
 
@@ -203,6 +245,7 @@ Run the live process for hours, not minutes.
 **What we will implement**
 - Multi-hour sandbox runs for the intended runner profiles
 - Log review for reconnects, rollover continuity, pending-order cleanup, and shutdown
+- Tooling support exists in [live/soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py) to run bounded profiles sequentially and persist logs plus summaries under `logs/soak/`
 
 **Success criteria**
 - Multi-hour sandbox runs complete without uncaught exceptions
@@ -212,7 +255,7 @@ Run the live process for hours, not minutes.
 
 ---
 
-## Stage 8 — Live Order Lifecycle Rehearsal (No Intended Fill)
+## Stage 9 — Live Order Lifecycle Rehearsal (No Intended Fill)
 
 Submit a tiny live order that is intended to rest, then cancel it.
 
@@ -237,7 +280,7 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 ---
 
-## Stage 9 — Minimum-Size Live Fill Rehearsal
+## Stage 10 — Minimum-Size Live Fill Rehearsal
 
 Execute the smallest practical live position, then flatten it.
 
@@ -264,7 +307,7 @@ Execute the smallest practical live position, then flatten it.
 
 ---
 
-## Stage 10 — Observability Tightening
+## Stage 11 — Observability Tightening
 
 Make the system operable once multiple long-running nodes exist.
 
@@ -282,6 +325,27 @@ Make the system operable once multiple long-running nodes exist.
 - Every run produces durable logs with enough context to diagnose failures
 - Operators can answer what happened, when, and what action is needed from logs alone
 - Restart and recovery expectations are documented and consistent with actual behavior
+
+---
+
+## Stage 12 — External Resolution Settlement / Redemption
+
+Automate post-resolution settlement tracking and token redemption outside the Nautilus live trading node.
+
+**Purpose**
+- Separate active trading concerns from post-resolution operational settlement
+- Handle Polymarket resolution/redemption with a workflow that can inspect wallet balances, open orders, and venue state directly
+- Avoid forcing the live trading node to own long-tail redemption logic
+
+**What we will implement**
+- A separate process, not built on Nautilus strategy/runtime primitives
+- Resolution-state polling and wallet-level reconciliation
+- Automated or operator-assisted redemption workflow for resolved YES/NO positions
+
+**Success criteria**
+- Resolved carried positions can be reconciled and redeemed without manual log spelunking
+- The external process can confirm final wallet state after redemption
+- The live trading node can stay focused on trading-window execution and residual tracking only
 
 ---
 
@@ -306,13 +370,19 @@ Stage 4
 Stage 5
   -> add stale-feed / fail-safe controls
 Stage 6
-  -> run multi-hour sandbox soak sessions on the production profiles
+  -> run deterministic guardrail fault-injection E2E scenarios
 Stage 7
-  -> submit a tiny non-marketable live limit order and cancel it
+  -> make Polymarket quote handling side-aware and reduce dropped-quote log spam
 Stage 8
-  -> execute one minimum-size live fill-and-flatten rehearsal
+  -> run multi-hour sandbox soak sessions on the production profiles
 Stage 9
+  -> submit a tiny non-marketable live limit order and cancel it
+Stage 10
+  -> execute one minimum-size live fill-and-flatten rehearsal
+Stage 11
   -> tighten log retention and operator-facing observability
+Stage 12
+  -> automate post-resolution settlement / redemption in a separate process
 ```
 
 ---

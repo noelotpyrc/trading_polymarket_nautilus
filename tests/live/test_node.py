@@ -308,6 +308,30 @@ class TestScheduleStop:
         assert calls["callback"] == node.stop
         assert calls["started"] is True
 
+    def test_accepts_callable_stop_target(self, monkeypatch):
+        calls = {}
+
+        class FakeTimer:
+            def __init__(self, interval, callback):
+                calls["interval"] = interval
+                calls["callback"] = callback
+                self.daemon = False
+
+            def start(self):
+                calls["started"] = True
+
+        def stop_callback():
+            calls["invoked"] = True
+
+        monkeypatch.setattr("live.node.threading.Timer", FakeTimer)
+
+        timer = schedule_stop(stop_callback, 45)
+
+        assert timer is not None
+        assert calls["interval"] == 45
+        assert calls["callback"] is stop_callback
+        assert calls["started"] is True
+
     def test_returns_none_for_unbounded_runs(self):
         assert schedule_stop(MagicMock(), None) is None
 

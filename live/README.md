@@ -2,6 +2,8 @@
 
 Scripts for real-time trading on Polymarket. Uses authenticated APIs — requires a funded EOA wallet on Polygon.
 
+For the detailed live hardening inventory and current committed vs local-only status, see [docs/live_hardening_status.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_hardening_status.md).
+
 ---
 
 ## One-time Setup
@@ -72,6 +74,7 @@ Both are handled automatically by `py-clob-client`.
 ```
 node.py              # Shared TradingNode helpers (window resolution + client wiring)
 config.py            # Client config builders (Binance + Polymarket data/exec clients)
+resolution.py        # Polymarket market-resolution polling helpers
 profiles/
   catalog/           # Checked-in runner profile TOML files
 runs/
@@ -79,6 +82,7 @@ runs/
   profile.py         # Generic profile runner (`--list`, print/override support)
   profiles/          # Fixed per-profile entrypoints
   random_signal.py   # Infrastructure test runner: fast stack exercise
+soak.py             # Sequential bounded soak runner with durable logs/summaries
 trade.py             # Ad-hoc order placement CLI (manual BUY/SELL for testing)
 strategies/
   btc_updown.py      # Infrastructure test strategy logic
@@ -129,6 +133,13 @@ Both strategies are infrastructure test strategies for validating the Nautilus l
 
 At startup the node validates credentials, resolves upcoming market windows from Gamma, pre-loads their instruments, and trades until the pre-loaded schedule is exhausted. The expected behavior for this phase is to restart the node each day; missing the first window after restart is acceptable.
 
+If an old Polymarket window cannot be fully flattened after it ends, the node now carries that known residual YES/NO position to resolution instead of forcing an unnecessary stop. Post-resolution settlement / redemption is intentionally deferred to a separate external process.
+
+The live Polymarket feed now keeps one-sided books visible by allowing synthetic quotes from Nautilus. Strategy logic is side-aware:
+- BUY entry requires a fresh ask with positive size
+- active-window SELL / flatten decisions require a fresh bid with positive size
+- midpoint pricing is only used when both sides have positive size
+
 ## Runner Profiles
 
 - Profile files live in [live/profiles/catalog](/Users/noel/projects/trading_polymarket_nautilus/live/profiles/catalog).
@@ -157,8 +168,32 @@ python live/runs/profile.py btc_updown_15m_live --print-profile
 - On BTC up/down markets, `outcome_side=yes` maps to `Up` and `outcome_side=no` maps to `Down`.
 - The node will stop cleanly when it runs out of pre-loaded windows and will log that a restart is required.
 - Daily restart is the intended operating model for this phase. There is no automatic cross-day market extension yet.
+- If an ended-window residual cannot be flattened because liquidity disappears or the remaining size is below minimum order size, the node carries it to resolution and logs the outcome once Polymarket resolves the market.
+- A requested process stop waits for any carried residuals to resolve before final node shutdown.
 - Run the sandbox validation sequence in `docs/live_testing_plan.md` before considering any real-order rehearsal.
 - The detailed health-guard policy lives in [docs/live_health_guard_policy.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_health_guard_policy.md).
+
+## Soak Runs
+
+Use [soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py) for the longer multi-hour sandbox sessions after the side-aware Polymarket quote update lands. It runs one or more profiles sequentially, captures stdout/stderr, and writes per-run plus batch summaries under `logs/soak/`.
+
+```bash
+# 4h soak on one sandbox profile
+python live/soak.py random_signal_15m_sandbox --run-secs 14400 --label stage7_4h
+
+# 8h soak on two profiles, continue even if the first fails
+python live/soak.py random_signal_15m_sandbox btc_updown_15m_sandbox --run-secs 28800 --label stage7_8h --keep-going
+```
+
+Safety defaults:
+- sandbox profiles only unless `--allow-live` is passed
+- bounded runtime required unless `--allow-unbounded` is passed
+
+Artifacts:
+- `runner.log` — combined stdout/stderr for the profile run
+- `profile.json` — resolved profile settings used for the run
+- `summary.json` — exit code, duration, log path, and status
+- batch-level `summary.json` — overall batch status across all profiles
 
 ## Next Steps
 
@@ -176,3 +211,6 @@ The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/t
 4. Observability tightening
    - Purpose: make the live system operable at session and multi-node scale.
    - Success: logs and runbook are enough to diagnose failures without code inspection.
+5. External settlement / redemption automation
+   - Purpose: handle post-resolution reconciliation outside Nautilus.
+   - Success: resolved residuals can be reconciled and redeemed by a separate process.

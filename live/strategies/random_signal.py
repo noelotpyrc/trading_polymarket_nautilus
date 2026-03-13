@@ -11,6 +11,7 @@ import random
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.enums import OrderSide
 
 from live.strategies.windowed import WindowedPolymarketStrategy, _fmt_ns
 
@@ -50,23 +51,31 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
 
     def on_bar(self, bar: Bar):
         value = random.random()
-        mid_str = self._quote_state_str(bar.ts_event)
+        quote_str = self._quote_state_str(bar.ts_event)
         positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
         stale_reason = self._signal_bar_stale_reason(bar.ts_event)
 
         if stale_reason is not None:
             self.log.warning(
-                f"BTC={bar.close} rand={value:.3f} | mid={mid_str} | "
+                f"BTC={bar.close} rand={value:.3f} | {quote_str} | "
                 f"signal blocked ({stale_reason})"
             )
             return
 
         if positions and value > self._exit_threshold:
+            reason = self._exit_guard_reason(bar.ts_event)
+            if reason is not None:
+                self.log.info(
+                    f"BTC={bar.close} rand={value:.3f} → EXIT skipped ({reason}) | {quote_str}"
+                )
+                return
             self.log.info(
-                f"BTC={bar.close} rand={value:.3f} > {self._exit_threshold} → EXIT  mid={mid_str}"
+                f"BTC={bar.close} rand={value:.3f} > {self._exit_threshold} → EXIT  {quote_str}"
             )
-            for pos in positions:
-                self.close_position(pos)
+            self._close_positions_for_instrument(
+                self._pm_instrument_id,
+                reason="signal exit",
+            )
             return
 
         if (
@@ -77,19 +86,21 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
         ):
             reason = self._entry_guard_reason(bar.ts_event)
             if reason is not None:
-                self.log.info(f"BTC={bar.close} rand={value:.3f} → ENTER skipped ({reason})")
+                self.log.info(
+                    f"BTC={bar.close} rand={value:.3f} → ENTER skipped ({reason}) | {quote_str}"
+                )
                 return
             self.log.info(
-                f"BTC={bar.close} rand={value:.3f} > {self._entry_threshold} → ENTER  mid={mid_str}"
+                f"BTC={bar.close} rand={value:.3f} > {self._entry_threshold} → ENTER  {quote_str}"
             )
             super()._submit_entry_order(self._trade_amount)
             self.log.info(
                 f"BUY {self._selected_outcome_label()} ${self._trade_amount} "
-                f"on {self._pm_instrument_id}"
+                f"on {self._pm_instrument_id}{self._quote_execution_str(OrderSide.BUY)}"
             )
         else:
             self.log.info(
-                f"BTC={bar.close} rand={value:.3f} | mid={mid_str} | "
+                f"BTC={bar.close} rand={value:.3f} | {quote_str} | "
                 f"entered={self._entered_this_window} | positions={len(positions)}"
             )
 

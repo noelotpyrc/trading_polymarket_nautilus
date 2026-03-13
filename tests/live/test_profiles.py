@@ -4,6 +4,7 @@ import json
 import pytest
 
 from live.profiles import ProfileError, RunnerProfile, available_profile_names, load_profile
+from live.runs import common as common_run
 from live.runs.common import build_strategy, validate_strategy_config
 from live.runs import profile as profile_run
 from live.runs.profiles import btc_updown_15m_live as btc_updown_15m_live_run
@@ -148,6 +149,84 @@ class TestSharedStrategyLauncher:
     def test_validate_strategy_config_rejects_reserved_outcome_side(self):
         with pytest.raises(ValueError, match="reserved runtime keys"):
             validate_strategy_config("btc_updown", {"outcome_side": "no"})
+
+    def test_run_strategy_uses_strategy_managed_process_stop(self, monkeypatch):
+        calls = {"node_stop": 0}
+
+        class FakeNode:
+            def __init__(self):
+                self.trader = self
+
+            def add_strategy(self, strategy):
+                calls["added_strategy"] = strategy
+
+            def build(self):
+                calls["built"] = True
+
+            def run(self):
+                calls["ran"] = True
+
+            def stop(self):
+                calls["node_stop"] += 1
+
+        class FakeStrategy:
+            def __init__(self):
+                self.stop_callback = None
+                self.requested_stop_reasons = []
+
+            def set_process_stop_callback(self, callback):
+                self.stop_callback = callback
+
+            def request_process_stop(self, reason):
+                self.requested_stop_reasons.append(reason)
+
+        strategy = FakeStrategy()
+        node = FakeNode()
+        timer_callbacks = []
+        canceled = []
+
+        class FakeTimer:
+            def __init__(self, callback):
+                self._callback = callback
+
+            def cancel(self):
+                canceled.append(True)
+
+        monkeypatch.setattr(
+            common_run,
+            "prepare_run",
+            lambda **kwargs: [("a.POLYMARKET", 1_000)],
+        )
+        monkeypatch.setattr(common_run, "build_node", lambda *args, **kwargs: node)
+        monkeypatch.setattr(common_run, "build_strategy", lambda *args, **kwargs: strategy)
+        monkeypatch.setattr(
+            common_run,
+            "schedule_stop",
+            lambda stop_target, run_secs: timer_callbacks.append(stop_target) or FakeTimer(stop_target),
+        )
+
+        common_run.run_strategy(
+            "btc_updown",
+            slug_pattern="btc-updown-15m",
+            hours_ahead=4,
+            outcome_side="yes",
+            sandbox=True,
+            binance_us=False,
+            run_secs=180,
+            strategy_config={"trade_amount_usdc": 5.0},
+        )
+
+        assert calls["added_strategy"] is strategy
+        assert calls["built"] is True
+        assert calls["ran"] is True
+        assert strategy.stop_callback == node.stop
+        assert len(timer_callbacks) == 1
+
+        timer_callbacks[0]()
+
+        assert strategy.requested_stop_reasons == ["Auto-stop timer elapsed after 180s"]
+        assert calls["node_stop"] == 0
+        assert canceled == [True]
 
 
 class TestProfileRunner:

@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 
 from nautilus_trader.config import StrategyConfig
 from nautilus_trader.model.data import Bar, BarType
+from nautilus_trader.model.enums import OrderSide
 
 from live.strategies.windowed import WindowedPolymarketStrategy, _fmt_ns
 
@@ -124,8 +125,14 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
         positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
 
         if positions and signal == -1:
-            for pos in positions:
-                self.close_position(pos)
+            reason = self._exit_guard_reason(signal_ts_ns)
+            if reason is not None:
+                self.log.info(f"Bearish exit skipped on {self._pm_instrument_id}: {reason}")
+                return
+            self._close_positions_for_instrument(
+                self._pm_instrument_id,
+                reason="signal exit",
+            )
             return
 
         if (
@@ -139,10 +146,9 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
                 self.log.info(f"Bullish entry skipped on {self._pm_instrument_id}: {reason}")
                 return
             super()._submit_entry_order(self._trade_amount)
-            mid_str = f" mid={self._pm_mid:.4f}" if self._pm_mid else ""
             self.log.info(
                 f"BUY {self._selected_outcome_label()} ${self._trade_amount} "
-                f"on {self._pm_instrument_id}{mid_str}"
+                f"on {self._pm_instrument_id}{self._quote_execution_str(OrderSide.BUY)}"
             )
 
     def _compute_signal(self) -> int:
@@ -193,18 +199,20 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
                 latest_close = close
 
         if latest_ts_ns is None or latest_close is None:
-            self.log.error(
+            reason = (
                 f"BTC warmup returned no usable bars (request_id={request_id}); stopping"
             )
-            self.stop()
+            self.log.error(reason)
+            self._dispatch_process_stop(reason)
             return
 
         if historical_count == 0:
-            self.log.error(
+            reason = (
                 f"BTC warmup completed with no historical bars "
                 f"(buffered={buffered_count}, request_id={request_id}); stopping"
             )
-            self.stop()
+            self.log.error(reason)
+            self._dispatch_process_stop(reason)
             return
 
         signal_str = self._signal_status_for_ts(latest_ts_ns)
@@ -219,10 +227,11 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
             return
 
         self._warmup_request_inflight = False
-        self.log.error(
+        reason = (
             f"BTC warmup timed out after {self._WARMUP_TIMEOUT_NS // 1_000_000_000}s — stopping"
         )
-        self.stop()
+        self.log.error(reason)
+        self._dispatch_process_stop(reason)
 
     def _process_live_bar(self, ts_ns: int, close: float, *, close_str: str) -> None:
         if not self._record_btc_close(ts_ns, close):

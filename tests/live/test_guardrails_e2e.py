@@ -11,6 +11,7 @@ from nautilus_trader.model.identifiers import InstrumentId, Venue
 from nautilus_trader.model.objects import Money
 from nautilus_trader.test_kit.providers import TestInstrumentProvider
 
+from live.resolution import MarketResolution
 from live.strategies.btc_updown import BtcUpDownConfig, BtcUpDownStrategy
 from live.strategies.windowed import WindowedPolymarketStrategy
 
@@ -90,15 +91,18 @@ def _make_engine():
 
 class TimerEvent:
     def __init__(self, name: str):
-        self._name = name
-
-    def to_str(self) -> str:
-        return self._name
+        self.name = name
 
 
 class DummyOrder:
     def __init__(self, client_order_id: str):
         self.client_order_id = client_order_id
+
+
+class DummyPosition:
+    def __init__(self, instrument_id: InstrumentId, quantity: float):
+        self.instrument_id = instrument_id
+        self.quantity = quantity
 
 
 class ScenarioConfig(StrategyConfig, frozen=True):
@@ -118,6 +122,8 @@ class GuardrailScenarioStrategy(WindowedPolymarketStrategy):
         self.closed_instruments = []
         self.submitted_order_ids = []
         self.open_positions = set()
+        self.min_quantity_by_instrument = {}
+        self.market_resolution_responses = {}
         self.stop_called = False
 
     def on_start(self):
@@ -164,8 +170,36 @@ class GuardrailScenarioStrategy(WindowedPolymarketStrategy):
     def cancel_order(self, order, *args, **kwargs):
         self.canceled_orders.append(order.client_order_id)
 
-    def _close_positions_for_instrument(self, instrument_id, reason: str) -> None:
-        self.closed_instruments.append((instrument_id, reason))
+    def _open_positions_for_instrument(self, instrument_id):
+        if instrument_id not in self.open_positions:
+            return []
+        return [DummyPosition(instrument_id, 5.0)]
+
+    def _instrument_min_quantity(self, instrument_id):
+        return self.min_quantity_by_instrument.get(instrument_id)
+
+    def _fetch_market_resolution(self, instrument_id):
+        response = self.market_resolution_responses[instrument_id]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    def _submit_exit_order_for_position(
+        self,
+        position,
+        *,
+        reason: str,
+        allow_resolution_carry: bool,
+    ) -> bool:
+        self.closed_instruments.append((position.instrument_id, reason))
+        return super()._submit_exit_order_for_position(
+            position,
+            reason=reason,
+            allow_resolution_carry=allow_resolution_carry,
+        )
+
+    def close_position(self, position, *args, **kwargs):
+        return None
 
     def _has_open_position_on_instrument(self, instrument_id):
         return instrument_id in self.open_positions
@@ -271,6 +305,8 @@ class TestGuardrailFaultInjectionE2E:
             instrument_id=InstrumentId.from_str("a.POLYMARKET"),
             bid_price=0.50,
             ask_price=0.52,
+            bid_size=100.0,
+            ask_size=100.0,
             ts_event=100,
         ))
 
@@ -295,6 +331,8 @@ class TestGuardrailFaultInjectionE2E:
             instrument_id=old_instrument,
             bid_price=0.50,
             ask_price=0.52,
+            bid_size=100.0,
+            ask_size=100.0,
             ts_event=100,
         ))
         assert strategy.maybe_submit_entry(100) is None
@@ -309,16 +347,16 @@ class TestGuardrailFaultInjectionE2E:
             last_qty="5",
         ))
 
-        assert strategy.closed_instruments == [(old_instrument, "window end"), (old_instrument, "late fill")]
-        assert "LATE-FILL-CHECK:a.POLYMARKET" in strategy.guard_alerts
+        assert strategy.closed_instruments == [(old_instrument, "late fill")]
+        assert "POSITION-CLEANUP:a.POLYMARKET" in strategy.guard_alerts
 
         strategy.open_positions.clear()
         strategy.on_position_closed(SimpleNamespace(instrument_id=old_instrument))
 
         assert strategy.stop_called is False
-        assert "LATE-FILL-CHECK:a.POLYMARKET" not in strategy.guard_alerts
+        assert "POSITION-CLEANUP:a.POLYMARKET" not in strategy.guard_alerts
 
-    def test_late_fill_cleanup_stops_when_position_remains_open(self):
+    def test_late_fill_cleanup_carries_residual_to_resolution_when_window_has_ended(self):
         strategy = GuardrailScenarioStrategy(ScenarioConfig(
             pm_instrument_ids=("a.POLYMARKET", "b.POLYMARKET"),
             window_end_times_ns=(1_000_000_000, 2_000_000_000),
@@ -329,6 +367,8 @@ class TestGuardrailFaultInjectionE2E:
             instrument_id=old_instrument,
             bid_price=0.50,
             ask_price=0.52,
+            bid_size=100.0,
+            ask_size=100.0,
             ts_event=100,
         ))
         assert strategy.maybe_submit_entry(100) is None
@@ -343,9 +383,58 @@ class TestGuardrailFaultInjectionE2E:
             last_qty="5",
         ))
 
-        strategy.trigger_guard("LATE-FILL-CHECK:a.POLYMARKET")
+        strategy.now_ns = strategy._POSITION_CLEANUP_TIMEOUT_NS + 1
+        strategy.trigger_guard("POSITION-CLEANUP:a.POLYMARKET")
 
-        assert strategy.stop_called is True
+        assert strategy.stop_called is False
+        assert strategy._resolution_pending_instruments == {old_instrument: "late fill"}
+        assert "RESOLUTION-CHECK:a.POLYMARKET" in strategy.guard_alerts
+
+    def test_active_window_below_min_residual_carries_instead_of_stopping(self):
+        strategy = GuardrailScenarioStrategy(ScenarioConfig(
+            pm_instrument_ids=("a.POLYMARKET", "b.POLYMARKET"),
+            window_end_times_ns=(1_000_000_000, 2_000_000_000),
+        ))
+        strategy.on_start()
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy.open_positions.add(instrument)
+        strategy.min_quantity_by_instrument[instrument] = 10.0
+
+        strategy._close_positions_for_instrument(instrument, reason="signal exit")
+
+        assert strategy.stop_called is False
+        assert strategy._resolution_pending_instruments == {instrument: "signal exit"}
+        assert "RESOLUTION-CHECK:a.POLYMARKET" in strategy.guard_alerts
+
+    def test_process_stop_dispatches_after_carried_residual_resolves(self):
+        strategy = GuardrailScenarioStrategy(ScenarioConfig(
+            pm_instrument_ids=("a.POLYMARKET",),
+            window_end_times_ns=(1_000_000_000,),
+        ))
+        callbacks = []
+        strategy.set_process_stop_callback(lambda: callbacks.append("stop"))
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy.open_positions.add(instrument)
+        strategy.min_quantity_by_instrument[instrument] = 10.0
+        strategy.now_ns = 1_500_000_000
+        strategy.market_resolution_responses[instrument] = MarketResolution(
+            condition_id="cond-a",
+            token_id="token-a",
+            market_closed=True,
+            target_token_outcome="Yes",
+            winning_token_id="token-a",
+            winning_outcome="Yes",
+        )
+
+        strategy.request_process_stop("stop for daily restart")
+
+        assert callbacks == []
+        assert strategy._resolution_pending_instruments == {instrument: "stop for daily restart"}
+
+        strategy.trigger_guard("RESOLUTION-CHECK:a.POLYMARKET")
+
+        assert callbacks == ["stop"]
+        assert strategy.stop_called is False
 
     def test_warmup_timeout_stops_from_startup_flow(self):
         strategy = WarmupScenarioHarness(

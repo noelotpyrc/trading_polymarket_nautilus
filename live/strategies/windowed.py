@@ -1,10 +1,25 @@
 """Shared live lifecycle for windowed Polymarket test strategies."""
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from nautilus_trader.model.enums import OrderSide
+from nautilus_trader.adapters.polymarket.common.symbol import (
+    get_polymarket_condition_id,
+    get_polymarket_token_id,
+)
+from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import Quantity
 from nautilus_trader.trading.strategy import Strategy
+
+from live.resolution import fetch_market_resolution
+
+
+@dataclass(frozen=True)
+class _InstrumentCleanupState:
+    reason: str
+    deadline_ns: int
+    allow_resolution_carry: bool
 
 
 class WindowedPolymarketStrategy(Strategy):
@@ -12,7 +27,9 @@ class WindowedPolymarketStrategy(Strategy):
     _SIGNAL_BAR_STALE_AFTER_NS = 150_000_000_000
     _ENTRY_ORDER_CANCEL_AFTER_NS = 90_000_000_000
     _ENTRY_ORDER_ESCALATE_AFTER_NS = 180_000_000_000
-    _LATE_FILL_FLATTEN_TIMEOUT_NS = 60_000_000_000
+    _POSITION_CLEANUP_RETRY_INTERVAL_NS = 5_000_000_000
+    _POSITION_CLEANUP_TIMEOUT_NS = 60_000_000_000
+    _RESOLUTION_POLL_INTERVAL_NS = 30_000_000_000
 
     def __init__(self, config):
         super().__init__(config)
@@ -33,20 +50,47 @@ class WindowedPolymarketStrategy(Strategy):
 
         self._pm_mid: float | None = None
         self._pm_mid_ts_ns: int | None = None
+        self._pm_bid: float | None = None
+        self._pm_ask: float | None = None
+        self._pm_bid_size: float = 0.0
+        self._pm_ask_size: float = 0.0
         self._entered_this_window = False
 
         self._entry_order = None
         self._entry_order_pending = False
         self._entry_order_client_id = None
         self._entry_order_instruments: dict[object, InstrumentId] = {}
+        self._entry_orders_by_id: dict[object, object] = {}
         self._entry_orders_flatten_on_fill: set[object] = set()
         self._entry_order_timer_names: dict[object, tuple[str, str]] = {}
         self._entry_order_timeout_order_ids: dict[str, object] = {}
-        self._late_fill_timer_names: dict[InstrumentId, str] = {}
-        self._late_fill_timeout_instruments: dict[str, InstrumentId] = {}
-        self._late_fill_cleanup_pending: set[InstrumentId] = set()
+        self._position_cleanup_timer_names: dict[InstrumentId, str] = {}
+        self._position_cleanup_timer_instruments: dict[str, InstrumentId] = {}
+        self._position_cleanup_states: dict[InstrumentId, _InstrumentCleanupState] = {}
+        self._resolution_timer_names: dict[InstrumentId, str] = {}
+        self._resolution_timer_instruments: dict[str, InstrumentId] = {}
+        self._resolution_pending_instruments: dict[InstrumentId, str] = {}
+        self._resolution_settled_instruments: set[InstrumentId] = set()
+        self._process_stop_callback: Callable[[], None] | None = None
+        self._process_stop_requested = False
+        self._process_stop_dispatched = False
+        self._process_stop_reason: str | None = None
 
         self._trade_count = 0
+
+    def set_process_stop_callback(self, callback: Callable[[], None]) -> None:
+        self._process_stop_callback = callback
+
+    def request_process_stop(self, reason: str) -> None:
+        if self._process_stop_requested:
+            return
+
+        self._process_stop_requested = True
+        self._process_stop_reason = reason
+        self.log.warning(reason)
+        self._cancel_pending_entry_order(reason)
+        self._close_positions_for_all_windows(reason=reason, monitor_cleanup=True)
+        self._maybe_finalize_process_stop()
 
     def _window_alert_name(self) -> str:
         return f"window_end_{self._window_idx}"
@@ -57,7 +101,9 @@ class WindowedPolymarketStrategy(Strategy):
 
     def _stop_window_lifecycle(self) -> None:
         self._cancel_pending_entry_order("strategy stop")
-        self._close_positions_for_all_windows()
+        self._cancel_all_position_cleanup()
+        self._cancel_all_resolution_tracking()
+        self._close_positions_for_all_windows(reason="strategy stop", monitor_cleanup=False)
 
     def _set_next_window_alert(self) -> None:
         self.clock.set_time_alert_ns(
@@ -68,18 +114,34 @@ class WindowedPolymarketStrategy(Strategy):
 
     def on_quote_tick(self, tick) -> None:
         if tick.instrument_id == self._pm_instrument_id:
-            self._pm_mid = (float(tick.bid_price) + float(tick.ask_price)) / 2
+            self._pm_bid = float(tick.bid_price)
+            self._pm_ask = float(tick.ask_price)
+            self._pm_bid_size = float(tick.bid_size)
+            self._pm_ask_size = float(tick.ask_size)
+            if self._pm_bid_size > 0 and self._pm_ask_size > 0:
+                self._pm_mid = (self._pm_bid + self._pm_ask) / 2
+            else:
+                self._pm_mid = None
             self._pm_mid_ts_ns = tick.ts_event
 
     def _entry_guard_reason(self, signal_ts_ns: int) -> str | None:
         if self._entry_order_pending:
             return "entry order still pending"
-        if self._pm_mid is None or self._pm_mid_ts_ns is None:
-            return "PM quote unavailable"
+        return self._quote_guard_reason(signal_ts_ns, require_side="ask")
 
+    def _exit_guard_reason(self, signal_ts_ns: int) -> str | None:
+        return self._quote_guard_reason(signal_ts_ns, require_side="bid")
+
+    def _quote_guard_reason(self, signal_ts_ns: int, *, require_side: str | None) -> str | None:
+        if self._pm_mid_ts_ns is None:
+            return "PM quote unavailable"
         quote_age_ns = max(0, signal_ts_ns - self._pm_mid_ts_ns)
         if quote_age_ns > self._QUOTE_STALE_AFTER_NS:
             return f"PM quote stale ({quote_age_ns // 1_000_000_000}s old)"
+        if require_side == "ask" and self._pm_ask_size <= 0:
+            return "PM ask unavailable"
+        if require_side == "bid" and self._pm_bid_size <= 0:
+            return "PM bid unavailable"
 
         return None
 
@@ -94,23 +156,43 @@ class WindowedPolymarketStrategy(Strategy):
         return None
 
     def _quote_state_str(self, now_ns: int) -> str:
-        if self._pm_mid is None or self._pm_mid_ts_ns is None:
+        if self._pm_mid_ts_ns is None:
             return "n/a"
         quote_age_ns = max(0, now_ns - self._pm_mid_ts_ns)
-        return f"{self._pm_mid:.4f} age={quote_age_ns // 1_000_000_000}s"
+        bid_str = "n/a" if self._pm_bid is None else f"{self._pm_bid:.4f}x{self._pm_bid_size:.3f}"
+        ask_str = "n/a" if self._pm_ask is None else f"{self._pm_ask:.4f}x{self._pm_ask_size:.3f}"
+        mid_str = "n/a" if self._pm_mid is None else f"{self._pm_mid:.4f}"
+        return (
+            f"mid={mid_str} bid={bid_str} ask={ask_str} "
+            f"age={quote_age_ns // 1_000_000_000}s"
+        )
+
+    def _quote_execution_str(self, side: OrderSide) -> str:
+        if side == OrderSide.BUY:
+            if self._pm_ask is None:
+                return ""
+            return f" ask={self._pm_ask:.4f} ask_sz={self._pm_ask_size:.3f}"
+        if self._pm_bid is None:
+            return ""
+        return f" bid={self._pm_bid:.4f} bid_sz={self._pm_bid_size:.3f}"
+
+    def _build_entry_order(self, quantity: Quantity):
+        return self.order_factory.market(
+            instrument_id=self._pm_instrument_id,
+            order_side=OrderSide.BUY,
+            quantity=quantity,
+            time_in_force=TimeInForce.IOC,
+            quote_quantity=True,
+        )
 
     def _submit_entry_order(self, trade_amount: float) -> None:
         qty_str = f"{trade_amount:.6f}".rstrip("0").rstrip(".")
-        order = self.order_factory.market(
-            instrument_id=self._pm_instrument_id,
-            order_side=OrderSide.BUY,
-            quantity=Quantity.from_str(qty_str),
-            quote_quantity=True,
-        )
+        order = self._build_entry_order(Quantity.from_str(qty_str))
         self._entry_order = order
         self._entry_order_pending = True
         self._entry_order_client_id = order.client_order_id
         self._entry_order_instruments[order.client_order_id] = self._pm_instrument_id
+        self._entry_orders_by_id[order.client_order_id] = order
         self._schedule_entry_order_timeouts(order.client_order_id)
         self.submit_order(order)
 
@@ -125,30 +207,156 @@ class WindowedPolymarketStrategy(Strategy):
         self.cancel_order(self._entry_order)
         self.log.warning(f"Canceling pending entry order ({reason}): {self._entry_order_client_id}")
 
-    def _close_positions_for_instrument(self, instrument_id: InstrumentId, reason: str) -> None:
-        for pos in self.cache.positions_open(instrument_id=instrument_id):
-            self.close_position(pos)
-            self.log.info(f"Closed position on {instrument_id} ({reason})")
+    def _open_positions_for_instrument(self, instrument_id: InstrumentId):
+        return list(self.cache.positions_open(instrument_id=instrument_id))
 
-    def _close_positions_for_all_windows(self) -> None:
+    def _close_positions_for_instrument(
+        self,
+        instrument_id: InstrumentId,
+        reason: str,
+        *,
+        monitor_cleanup: bool = True,
+        retry: bool = False,
+        allow_resolution_carry: bool = False,
+    ) -> None:
+        self._cancel_tracked_entry_orders_for_instrument(
+            instrument_id,
+            reason=reason,
+            skip_client_order_id=self._entry_order_client_id,
+        )
+        positions = self._open_positions_for_instrument(instrument_id)
+        if not positions:
+            if monitor_cleanup:
+                self._cancel_position_cleanup(instrument_id)
+                self._cancel_resolution_tracking(instrument_id)
+                self._resolution_settled_instruments.discard(instrument_id)
+                self._maybe_finalize_process_stop()
+            return
+
+        if (
+            instrument_id in self._resolution_pending_instruments
+            or instrument_id in self._resolution_settled_instruments
+        ):
+            if monitor_cleanup:
+                self._maybe_finalize_process_stop()
+            return
+
+        if monitor_cleanup and instrument_id in self._position_cleanup_states and not retry:
+            return
+
+        if monitor_cleanup:
+            existing = self._position_cleanup_states.get(instrument_id)
+            deadline_ns = (
+                existing.deadline_ns
+                if existing is not None
+                else self._now_ns() + self._POSITION_CLEANUP_TIMEOUT_NS
+            )
+            self._position_cleanup_states[instrument_id] = _InstrumentCleanupState(
+                reason=reason,
+                deadline_ns=deadline_ns,
+                allow_resolution_carry=allow_resolution_carry,
+            )
+
+        for pos in positions:
+            if not self._submit_exit_order_for_position(
+                pos,
+                reason=reason,
+                allow_resolution_carry=allow_resolution_carry,
+            ):
+                return
+
+        if monitor_cleanup:
+            self._schedule_position_cleanup_retry(instrument_id)
+
+    def _close_positions_for_all_windows(self, *, reason: str, monitor_cleanup: bool) -> None:
         seen = set()
         for instrument_id_str, _ in self._windows:
             instrument_id = InstrumentId.from_str(instrument_id_str)
             if instrument_id in seen:
                 continue
             seen.add(instrument_id)
-            self._close_positions_for_instrument(instrument_id, reason="strategy stop")
+            self._close_positions_for_instrument(
+                instrument_id,
+                reason=reason,
+                monitor_cleanup=monitor_cleanup,
+                allow_resolution_carry=monitor_cleanup and self._window_has_ended(instrument_id),
+            )
 
     def _has_open_position_on_instrument(self, instrument_id: InstrumentId) -> bool:
-        return bool(self.cache.positions_open(instrument_id=instrument_id))
+        return bool(self._open_positions_for_instrument(instrument_id))
+
+    def _window_has_ended(self, instrument_id: InstrumentId) -> bool:
+        if (
+            instrument_id in self._resolution_pending_instruments
+            or instrument_id in self._resolution_settled_instruments
+        ):
+            return True
+
+        instrument_str = str(instrument_id)
+        matching_indices = [
+            index
+            for index, (window_instrument_id, _) in enumerate(self._windows)
+            if window_instrument_id == instrument_str
+        ]
+        if not matching_indices:
+            return False
+
+        if any(index < self._window_idx for index in matching_indices):
+            return True
+
+        end_ns = max(
+            window_end_ns
+            for window_instrument_id, window_end_ns in self._windows
+            if window_instrument_id == instrument_str
+        )
+        if self._now_ns() >= end_ns:
+            return True
+
+        return self._window_idx >= len(self._windows) and instrument_id == self._pm_instrument_id
 
     def _guard_timer_name(self, prefix: str, suffix: str) -> str:
         return f"{prefix}:{suffix}"
+
+    def _is_order_closed(self, order) -> bool:
+        is_closed = getattr(order, "is_closed", None)
+        if callable(is_closed):
+            return bool(is_closed())
+        if is_closed is None:
+            return False
+        return bool(is_closed)
+
+    def _cancel_tracked_entry_orders_for_instrument(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        reason: str,
+        skip_client_order_id=None,
+    ) -> None:
+        for client_order_id, tracked_instrument_id in list(self._entry_order_instruments.items()):
+            if tracked_instrument_id != instrument_id or client_order_id == skip_client_order_id:
+                continue
+
+            order = self._entry_orders_by_id.get(client_order_id)
+            if order is None or self._is_order_closed(order):
+                continue
+
+            self._entry_orders_flatten_on_fill.add(client_order_id)
+            self.cancel_order(order)
+            self.log.warning(
+                f"Canceling residual entry order ({reason}): {client_order_id}"
+            )
 
     def _client_order_ref(self, client_order_id) -> str:
         if hasattr(client_order_id, "to_str"):
             return client_order_id.to_str()
         return str(client_order_id)
+
+    def _guard_event_name(self, event) -> str:
+        if hasattr(event, "name"):
+            return str(event.name)
+        if hasattr(event, "to_str"):
+            return event.to_str()
+        return str(event)
 
     def _set_guard_time_alert(self, name: str, alert_time_ns: int, callback) -> None:
         self.clock.set_time_alert_ns(
@@ -212,74 +420,268 @@ class WindowedPolymarketStrategy(Strategy):
         if not self._entry_order_pending or client_order_id != self._entry_order_client_id:
             return
 
-        self.log.error(
+        reason = (
             f"Entry order unresolved after cancel grace "
             f"({self._ENTRY_ORDER_ESCALATE_AFTER_NS // 1_000_000_000}s) "
             f"— stopping for manual reconciliation: {client_order_id}"
         )
-        self.stop()
+        self.log.error(reason)
+        self._dispatch_process_stop(reason)
 
     def _on_entry_order_cancel_timeout(self, event) -> None:
-        client_order_id = self._entry_order_timeout_order_ids.get(event.to_str())
+        client_order_id = self._entry_order_timeout_order_ids.get(self._guard_event_name(event))
         if client_order_id is not None:
             self._handle_entry_order_cancel_timeout_for(client_order_id)
 
     def _on_entry_order_escalation_timeout(self, event) -> None:
-        client_order_id = self._entry_order_timeout_order_ids.get(event.to_str())
+        client_order_id = self._entry_order_timeout_order_ids.get(self._guard_event_name(event))
         if client_order_id is not None:
             self._handle_entry_order_escalation_timeout_for(client_order_id)
 
-    def _schedule_late_fill_cleanup_timeout(self, instrument_id: InstrumentId) -> None:
-        if instrument_id in self._late_fill_timer_names:
-            return
+    def _position_cleanup_timer_name(self, instrument_id: InstrumentId) -> str:
+        return self._guard_timer_name("POSITION-CLEANUP", str(instrument_id))
 
-        timer_name = self._guard_timer_name("LATE-FILL-CHECK", str(instrument_id))
-        self._late_fill_timer_names[instrument_id] = timer_name
-        self._late_fill_timeout_instruments[timer_name] = instrument_id
-        self._late_fill_cleanup_pending.add(instrument_id)
+    def _schedule_position_cleanup_retry(self, instrument_id: InstrumentId) -> None:
+        timer_name = self._position_cleanup_timer_name(instrument_id)
+        previous_name = self._position_cleanup_timer_names.get(instrument_id)
+        if previous_name is not None:
+            self._position_cleanup_timer_instruments.pop(previous_name, None)
+            self._cancel_guard_timer(previous_name)
+
+        self._position_cleanup_timer_names[instrument_id] = timer_name
+        self._position_cleanup_timer_instruments[timer_name] = instrument_id
         self._set_guard_time_alert(
             timer_name,
-            self._now_ns() + self._LATE_FILL_FLATTEN_TIMEOUT_NS,
-            self._on_late_fill_cleanup_timeout,
+            self._now_ns() + self._POSITION_CLEANUP_RETRY_INTERVAL_NS,
+            self._on_position_cleanup_retry,
         )
 
-    def _cancel_late_fill_cleanup_timeout(self, instrument_id: InstrumentId) -> None:
-        timer_name = self._late_fill_timer_names.pop(instrument_id, None)
-        if timer_name is None:
+    def _cancel_position_cleanup(self, instrument_id: InstrumentId) -> None:
+        timer_name = self._position_cleanup_timer_names.pop(instrument_id, None)
+        if timer_name is not None:
+            self._position_cleanup_timer_instruments.pop(timer_name, None)
+            self._cancel_guard_timer(timer_name)
+        self._position_cleanup_states.pop(instrument_id, None)
+
+    def _cancel_all_position_cleanup(self) -> None:
+        for instrument_id in list(self._position_cleanup_timer_names):
+            self._cancel_position_cleanup(instrument_id)
+
+    def _resolution_timer_name(self, instrument_id: InstrumentId) -> str:
+        return self._guard_timer_name("RESOLUTION-CHECK", str(instrument_id))
+
+    def _schedule_resolution_check(self, instrument_id: InstrumentId) -> None:
+        timer_name = self._resolution_timer_name(instrument_id)
+        previous_name = self._resolution_timer_names.get(instrument_id)
+        if previous_name is not None:
+            self._resolution_timer_instruments.pop(previous_name, None)
+            self._cancel_guard_timer(previous_name)
+
+        self._resolution_timer_names[instrument_id] = timer_name
+        self._resolution_timer_instruments[timer_name] = instrument_id
+        self._set_guard_time_alert(
+            timer_name,
+            self._now_ns() + self._RESOLUTION_POLL_INTERVAL_NS,
+            self._on_resolution_check,
+        )
+
+    def _cancel_resolution_tracking(self, instrument_id: InstrumentId) -> None:
+        timer_name = self._resolution_timer_names.pop(instrument_id, None)
+        if timer_name is not None:
+            self._resolution_timer_instruments.pop(timer_name, None)
+            self._cancel_guard_timer(timer_name)
+        self._resolution_pending_instruments.pop(instrument_id, None)
+
+    def _cancel_all_resolution_tracking(self) -> None:
+        for instrument_id in list(self._resolution_timer_names):
+            self._cancel_resolution_tracking(instrument_id)
+
+    def _carry_positions_to_resolution(self, instrument_id: InstrumentId, reason: str) -> None:
+        self._cancel_position_cleanup(instrument_id)
+        self._resolution_settled_instruments.discard(instrument_id)
+        self._resolution_pending_instruments[instrument_id] = reason
+        self.log.warning(
+            f"Carrying residual position on {instrument_id} to market resolution ({reason})"
+        )
+        self._schedule_resolution_check(instrument_id)
+
+    def _fetch_market_resolution(self, instrument_id: InstrumentId):
+        return fetch_market_resolution(
+            get_polymarket_condition_id(instrument_id),
+            get_polymarket_token_id(instrument_id),
+        )
+
+    def _handle_resolution_check_for(self, instrument_id: InstrumentId) -> None:
+        reason = self._resolution_pending_instruments.get(instrument_id)
+        if reason is None:
+            self._cancel_resolution_tracking(instrument_id)
             return
 
-        self._late_fill_timeout_instruments.pop(timer_name, None)
-        self._late_fill_cleanup_pending.discard(instrument_id)
-        self._cancel_guard_timer(timer_name)
-
-    def _handle_late_fill_cleanup_timeout_for(self, instrument_id: InstrumentId) -> None:
         if not self._has_open_position_on_instrument(instrument_id):
-            self._cancel_late_fill_cleanup_timeout(instrument_id)
+            self.log.info(
+                f"Residual position on {instrument_id} closed before resolution ({reason})"
+            )
+            self._cancel_resolution_tracking(instrument_id)
+            self._resolution_settled_instruments.discard(instrument_id)
+            self._maybe_finalize_process_stop()
             return
 
-        self.log.error(
-            f"Late-fill cleanup did not flatten {instrument_id} within "
-            f"{self._LATE_FILL_FLATTEN_TIMEOUT_NS // 1_000_000_000}s — stopping"
-        )
-        self.stop()
+        try:
+            resolution = self._fetch_market_resolution(instrument_id)
+        except Exception as exc:
+            self.log.warning(f"Resolution check failed for {instrument_id}: {exc}")
+            self._schedule_resolution_check(instrument_id)
+            return
 
-    def _on_late_fill_cleanup_timeout(self, event) -> None:
-        instrument_id = self._late_fill_timeout_instruments.get(event.to_str())
+        if not resolution.resolved or resolution.token_won is None:
+            self._schedule_resolution_check(instrument_id)
+            return
+
+        settlement_value = "1.00" if resolution.token_won else "0.00"
+        result_label = "WIN" if resolution.token_won else "LOSS"
+        winner_label = resolution.winning_outcome or "unknown"
+        token_label = resolution.target_token_outcome or self._selected_outcome_label()
+        self.log.warning(
+            f"Resolved residual on {instrument_id}: {token_label} {result_label} "
+            f"(winner={winner_label}, settlement={settlement_value}). "
+            "Manual redemption is not automated."
+        )
+        self._cancel_resolution_tracking(instrument_id)
+        self._resolution_settled_instruments.add(instrument_id)
+        self._maybe_finalize_process_stop()
+
+    def _on_resolution_check(self, event) -> None:
+        instrument_id = self._resolution_timer_instruments.get(self._guard_event_name(event))
         if instrument_id is not None:
-            self._handle_late_fill_cleanup_timeout_for(instrument_id)
+            self._handle_resolution_check_for(instrument_id)
+
+    def _instrument_min_quantity(self, instrument_id: InstrumentId) -> float | None:
+        instrument = self.cache.instrument(instrument_id)
+        if instrument is None or instrument.min_quantity is None:
+            return None
+        return float(instrument.min_quantity)
+
+    def _submit_exit_order_for_position(
+        self,
+        position,
+        *,
+        reason: str,
+        allow_resolution_carry: bool,
+    ) -> bool:
+        min_qty = self._instrument_min_quantity(position.instrument_id)
+        quantity = float(position.quantity)
+        if min_qty is not None and quantity < min_qty:
+            self.log.warning(
+                f"Residual on {position.instrument_id} below minimum close size "
+                f"({quantity:.6f} < {min_qty:.6f}) — carrying to resolution ({reason})"
+            )
+            self._carry_positions_to_resolution(position.instrument_id, reason)
+            return False
+
+        self.close_position(
+            position,
+            time_in_force=TimeInForce.IOC,
+            reduce_only=False,
+            quote_quantity=False,
+        )
+        self.log.info(
+            f"Submitted exit on {position.instrument_id} qty={position.quantity} ({reason})"
+        )
+        return True
+
+    def _on_position_cleanup_retry(self, event) -> None:
+        instrument_id = self._position_cleanup_timer_instruments.get(self._guard_event_name(event))
+        if instrument_id is None:
+            return
+
+        state = self._position_cleanup_states.get(instrument_id)
+        if state is None:
+            self._cancel_position_cleanup(instrument_id)
+            return
+
+        if not self._has_open_position_on_instrument(instrument_id):
+            self.log.info(f"Position cleanup complete on {instrument_id} — flat again")
+            self._cancel_position_cleanup(instrument_id)
+            self._maybe_finalize_process_stop()
+            return
+
+        if self._now_ns() >= state.deadline_ns:
+            if state.allow_resolution_carry:
+                self.log.warning(
+                    f"Position cleanup did not flatten {instrument_id} within "
+                    f"{self._POSITION_CLEANUP_TIMEOUT_NS // 1_000_000_000}s "
+                    f"({state.reason}) — carrying residual to resolution"
+                )
+                self._carry_positions_to_resolution(instrument_id, state.reason)
+            else:
+                failure_reason = (
+                    f"Position cleanup did not flatten {instrument_id} within "
+                    f"{self._POSITION_CLEANUP_TIMEOUT_NS // 1_000_000_000}s "
+                    f"({state.reason}) — stopping"
+                )
+                self._cancel_position_cleanup(instrument_id)
+                self.log.error(failure_reason)
+                self._dispatch_process_stop(failure_reason)
+            return
+
+        self.log.warning(
+            f"Position cleanup still open on {instrument_id} ({state.reason}) — retrying exit"
+        )
+        self._close_positions_for_instrument(
+            instrument_id,
+            reason=state.reason,
+            monitor_cleanup=True,
+            retry=True,
+            allow_resolution_carry=state.allow_resolution_carry,
+        )
+
+    def _maybe_finalize_process_stop(self) -> None:
+        if not self._process_stop_requested or self._process_stop_dispatched:
+            return
+        if self._entry_order_pending:
+            return
+        if self._position_cleanup_states:
+            return
+        if self._resolution_pending_instruments:
+            return
+
+        for instrument_id_str, _ in self._windows:
+            instrument_id = InstrumentId.from_str(instrument_id_str)
+            if instrument_id in self._resolution_settled_instruments:
+                continue
+            if self._has_open_position_on_instrument(instrument_id):
+                return
+
+        self._dispatch_process_stop()
+
+    def _dispatch_process_stop(self, reason: str | None = None) -> None:
+        if self._process_stop_dispatched:
+            return
+
+        self._process_stop_dispatched = True
+        stop_reason = reason or self._process_stop_reason or "process stop requested"
+        self.log.warning(f"Stopping node: {stop_reason}")
+
+        if self._process_stop_callback is not None:
+            self._process_stop_callback()
+        else:
+            self.stop()
 
     def _roll_to_next_window(self, exhausted_message: str) -> None:
         self.log.info(f"Window ending ({_fmt_ns(self._window_end_ns)} UTC) — rolling over")
 
         self._cancel_pending_entry_order("window rollover")
-        self._close_positions_for_instrument(self._pm_instrument_id, reason="window end")
+        self._close_positions_for_instrument(
+            self._pm_instrument_id,
+            reason="window end",
+            allow_resolution_carry=True,
+        )
 
         old_instrument_id = self._pm_instrument_id
 
         self._window_idx += 1
         if self._window_idx >= len(self._windows):
-            self.log.warning(exhausted_message)
-            self.stop()
+            self.request_process_stop(exhausted_message)
             return
 
         self._pm_instrument_id = InstrumentId.from_str(self._windows[self._window_idx][0])
@@ -287,6 +689,10 @@ class WindowedPolymarketStrategy(Strategy):
         self._entered_this_window = False
         self._pm_mid = None
         self._pm_mid_ts_ns = None
+        self._pm_bid = None
+        self._pm_ask = None
+        self._pm_bid_size = 0.0
+        self._pm_ask_size = 0.0
 
         self.subscribe_quote_ticks(self._pm_instrument_id)
         self.unsubscribe_quote_ticks(old_instrument_id)
@@ -316,6 +722,7 @@ class WindowedPolymarketStrategy(Strategy):
         if client_order_id not in self._entry_order_instruments and client_order_id != self._entry_order_client_id:
             return
         self._mark_entry_order_inactive(client_order_id)
+        self._entry_orders_by_id.pop(client_order_id, None)
         self.log.warning(message)
 
     def on_order_denied(self, event) -> None:
@@ -357,8 +764,11 @@ class WindowedPolymarketStrategy(Strategy):
                 f"Late fill detected on {tracked_instrument_id} "
                 f"(current={self._pm_instrument_id}) — flattening immediately"
             )
-            self._close_positions_for_instrument(tracked_instrument_id, reason="late fill")
-            self._schedule_late_fill_cleanup_timeout(tracked_instrument_id)
+            self._close_positions_for_instrument(
+                tracked_instrument_id,
+                reason="late fill",
+                allow_resolution_carry=self._window_has_ended(tracked_instrument_id),
+            )
             self._clear_active_entry_order(event.client_order_id)
         elif (
             event.client_order_id == self._entry_order_client_id
@@ -371,12 +781,27 @@ class WindowedPolymarketStrategy(Strategy):
         self.log.info(f"Fill #{self._trade_count}: price={event.last_px} qty={event.last_qty}")
 
     def on_position_closed(self, event) -> None:
+        self._cancel_tracked_entry_orders_for_instrument(
+            event.instrument_id,
+            reason="position closed",
+        )
+
+        if event.instrument_id in self._resolution_pending_instruments:
+            self.log.info(f"Carried residual closed on {event.instrument_id} before resolution")
+            self._cancel_resolution_tracking(event.instrument_id)
+            self._resolution_settled_instruments.discard(event.instrument_id)
+            self._maybe_finalize_process_stop()
+        elif event.instrument_id in self._resolution_settled_instruments:
+            self._resolution_settled_instruments.discard(event.instrument_id)
+            self._maybe_finalize_process_stop()
+
         if (
-            event.instrument_id in self._late_fill_cleanup_pending
+            event.instrument_id in self._position_cleanup_states
             and not self._has_open_position_on_instrument(event.instrument_id)
         ):
-            self.log.info(f"Late-fill cleanup complete on {event.instrument_id} — flat again")
-            self._cancel_late_fill_cleanup_timeout(event.instrument_id)
+            self.log.info(f"Position cleanup complete on {event.instrument_id} — flat again")
+            self._cancel_position_cleanup(event.instrument_id)
+            self._maybe_finalize_process_stop()
 
 
 def _fmt_ns(ts_ns: int) -> str:

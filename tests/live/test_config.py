@@ -17,6 +17,7 @@ class TestPolymarketDataConfig:
 
         assert config.private_key == "pk"
         assert config.api_key == "api-key"
+        assert config.drop_quotes_missing_side is False
         assert isinstance(config.instrument_config, PolymarketInstrumentProviderConfig)
         assert config.instrument_config.load_ids == frozenset(["foo.POLYMARKET"])
         assert config.instrument_config.use_gamma_markets is False

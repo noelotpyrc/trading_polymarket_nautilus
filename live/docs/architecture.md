@@ -16,6 +16,8 @@ Execution is routed through a Polymarket CLOB exec client (live) or a `SandboxEx
 live/
 ├── node.py                  # Shared infrastructure for live nodes
 ├── config.py                # TradingNodeConfig builders (live / sandbox)
+├── resolution.py            # Polymarket market-resolution polling helpers
+├── soak.py                  # Sequential bounded soak runner with durable logs
 ├── profiles/
 │   └── catalog/             # Checked-in runner profile TOML files
 ├── runs/
@@ -123,9 +125,9 @@ Both ad hoc runners and profile-driven runners use this path.
 
 Shared runner preflight. Validates mode-specific env vars, resolves windows, rejects duplicates/non-monotonic schedules, prints startup summary, and warns when the first window is close to expiry.
 
-### `schedule_stop(node, run_secs)`
+### `schedule_stop(stop_target, run_secs)`
 
-Arms a timer that calls `node.stop()` after `run_secs`. Used for bounded sandbox/manual validation sessions.
+Arms a timer that calls the provided stop target after `run_secs`. In live runners this is a strategy-managed stop request, so bounded runs still go through cancel/cleanup/resolution handling before the node shuts down.
 
 ---
 
@@ -154,7 +156,7 @@ Requires `signal_lookback + 1` bars to fire. With `warmup_days > 0`, the strateg
 
 **Data subscriptions:**
 - `subscribe_bars(btc_bar_type)` — Binance 1m bars
-- `subscribe_quote_ticks(pm_instrument_id)` — PM quote ticks for mid price
+- `subscribe_quote_ticks(pm_instrument_id)` — PM quote ticks for side-aware quote state
 
 ---
 
@@ -180,6 +182,17 @@ On each bar: draw `random()`. If above `entry_threshold` and no open position �
 
 **Data subscriptions:** same as BtcUpDownStrategy — intentionally identical to test the same feeds.
 
+### Side-Aware Quote Handling
+
+The live strategies no longer assume that every fresh Polymarket quote is a usable two-sided market.
+
+- the Polymarket data client now keeps one-sided books visible by allowing synthetic quotes for missing sides
+- BUY entry logic requires a fresh quote with positive ask size
+- active-window SELL / flatten logic requires a fresh quote with positive bid size
+- midpoint pricing is only used when both sides have positive size
+
+This reduces dropped-quote spam at the source and keeps strategy decisions aligned with the real side-specific liquidity that exists.
+
 These strategies exist to validate the live process, not to represent the eventual production trading logic.
 
 ---
@@ -197,6 +210,29 @@ Both strategies share the same window roll pattern. When a window expires:
 **Order is critical.** The Polymarket WS client disconnects when subscription count drops to zero. Subscribing NEW before unsubscribing OLD keeps the count above zero, preserving the live connection and ensuring NEW receives a dynamic subscribe on the active socket.
 
 Reversed order (unsubscribe first) causes the WS to disconnect before the new subscribe is sent — the new instrument never receives quote ticks. This was the root cause of `PM mid=n/a` observed in sandbox testing (confirmed by `tests/live/explore_nautilus_ws.py`).
+
+When the old window cannot be fully flattened after rollover:
+- active cleanup uses Polymarket-compatible IOC exits
+- if a known residual remains on the ended window, the strategy stops retrying futile exits and carries that residual to market resolution
+- current-window trading can continue while the old residual is tracked separately
+
+---
+
+## Residual Resolution Handling
+
+The live process now distinguishes between:
+- unknown order / exposure state, which is still stop-worthy
+- known old-window residual exposure, which is carried to resolution
+
+The carry-to-resolution flow is:
+
+1. an ended-window position cannot be fully flattened
+2. the strategy records that instrument as a carried residual
+3. [resolution.py](/Users/noel/projects/trading_polymarket_nautilus/live/resolution.py) polls Polymarket market metadata by condition id
+4. once the market is closed and a winning token is available, the strategy records the residual as a `WIN` or `LOSS`
+5. post-resolution settlement / redemption remains outside this node; it is deferred to a separate external process
+
+If a process stop is requested while carried residuals still exist, final node shutdown waits until those residuals resolve.
 
 ---
 
@@ -228,6 +264,19 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 5. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
 6. Daily restart is acceptable even if the first window after restart is missed.
 
+### Soak Harness
+
+- [soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py) is the operator tool for the longer multi-hour sandbox sessions after the side-aware Polymarket quote update lands.
+- It launches one or more profiles sequentially through the existing profile runner, captures stdout/stderr, and stores artifacts in `logs/soak/<timestamp>[_label]/`.
+- Default safety policy:
+  - sandbox profiles only
+  - bounded runtime required
+- Each profile run gets:
+  - `runner.log`
+  - `profile.json`
+  - `summary.json`
+- Each batch gets its own top-level `summary.json`.
+
 ## Next Milestones
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
@@ -244,6 +293,9 @@ The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/n
 4. Observability tightening
    - Purpose: make long-running live processes operable.
    - Success: operators can diagnose failures from logs and runbook alone.
+5. External settlement / redemption automation
+   - Purpose: handle post-resolution reconciliation outside Nautilus.
+   - Success: resolved residuals can be reconciled and redeemed by a separate process.
 
 ---
 

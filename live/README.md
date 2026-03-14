@@ -154,11 +154,12 @@ The live Polymarket feed now keeps one-sided books visible by allowing synthetic
 - Each profile pins strategy, market slug pattern, hours ahead, mode, Binance route, selected outcome side, bounded runtime if any, and strategy-specific knobs.
 - The checked-in `btc_updown` profiles currently set `warmup_days = 14`.
 - Fixed profile entrypoints are the preferred operator surface.
-- The only supported runtime override on a fixed profile is `--run-secs`:
+- The generic profile runner supports bounded runtime plus window-horizon overrides:
 
 ```bash
 python live/runs/profiles/btc_updown_15m_live.py --run-secs 300
 python live/runs/profile.py btc_updown_15m_live --print-profile
+python live/runs/profile.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800
 ```
 
 ## Operator Notes
@@ -181,6 +182,9 @@ Use [soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py) for
 # 4h soak on one sandbox profile
 python live/soak.py random_signal_15m_sandbox --run-secs 14400 --label stage7_4h
 
+# 8h soak on one sandbox profile while overriding the profile preload horizon
+python live/soak.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800 --label stage7_btc_8h
+
 # 8h soak on two profiles, continue even if the first fails
 python live/soak.py random_signal_15m_sandbox btc_updown_15m_sandbox --run-secs 28800 --label stage7_8h --keep-going
 ```
@@ -199,18 +203,19 @@ Artifacts:
 
 The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next implementation stages are:
 
-1. Longer sandbox soak runs
+1. External settlement / redemption automation
+   - Purpose: handle post-resolution reconciliation outside Nautilus.
+   - Design: [docs/wallet_resolution_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/wallet_resolution_plan.md)
+   - Success: resolved residuals can be reconciled and redeemed by a separate process.
+2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability.
    - Success: repeated rollovers and long runtimes remain clean.
-2. Live order lifecycle rehearsal
+3. Live order lifecycle rehearsal
    - Purpose: prove live submit/open/cancel behavior with no intended fill.
    - Success: a tiny non-marketable live order opens and cancels cleanly.
-3. Minimum-size live fill rehearsal
+4. Minimum-size live fill rehearsal
    - Purpose: prove the live execution path end-to-end.
    - Success: one minimum-size live round trip reconciles with Polymarket.
-4. Observability tightening
+5. Observability tightening
    - Purpose: make the live system operable at session and multi-node scale.
    - Success: logs and runbook are enough to diagnose failures without code inspection.
-5. External settlement / redemption automation
-   - Purpose: handle post-resolution reconciliation outside Nautilus.
-   - Success: resolved residuals can be reconciled and redeemed by a separate process.

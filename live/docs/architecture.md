@@ -86,6 +86,7 @@ The generic profile runner can load a profile by name or path:
 ```bash
 python live/runs/profile.py btc_updown_15m_live
 python live/runs/profile.py btc_updown_15m_live --print-profile
+python live/runs/profile.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800
 ```
 
 Fixed wrapper scripts in `live/runs/profiles/` provide one stable command per intended process. This is the preferred operator surface.
@@ -268,6 +269,7 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 
 - [soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py) is the operator tool for the longer multi-hour sandbox sessions after the side-aware Polymarket quote update lands.
 - It launches one or more profiles sequentially through the existing profile runner, captures stdout/stderr, and stores artifacts in `logs/soak/<timestamp>[_label]/`.
+- It can override `hours_ahead` for a longer soak without editing the checked-in profile itself.
 - Default safety policy:
   - sandbox profiles only
   - bounded runtime required
@@ -281,21 +283,22 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
 
-1. Longer sandbox soak runs
+1. External settlement / redemption automation
+   - Purpose: handle post-resolution reconciliation outside Nautilus.
+   - Design: [docs/wallet_resolution_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/wallet_resolution_plan.md)
+   - Success: resolved residuals can be reconciled and redeemed by a separate process.
+2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability instead of startup correctness only.
    - Success: repeated rollovers and long runtimes finish cleanly.
-2. Live order lifecycle rehearsal
+3. Live order lifecycle rehearsal
    - Purpose: prove real submit/open/cancel behavior without intended fill risk.
    - Success: a tiny non-marketable live limit order opens, cancels, and leaves no residue.
-3. Minimum-size live fill rehearsal
+4. Minimum-size live fill rehearsal
    - Purpose: prove real live fills and venue reconciliation end-to-end.
    - Success: one minimum-size live round trip reconciles cleanly.
-4. Observability tightening
+5. Observability tightening
    - Purpose: make long-running live processes operable.
    - Success: operators can diagnose failures from logs and runbook alone.
-5. External settlement / redemption automation
-   - Purpose: handle post-resolution reconciliation outside Nautilus.
-   - Success: resolved residuals can be reconciled and redeemed by a separate process.
 
 ---
 

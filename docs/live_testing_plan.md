@@ -233,7 +233,31 @@ Move from dropping one-sided Polymarket quotes to consuming them explicitly and 
 
 ---
 
-## Stage 8 — Longer Sandbox Soak Runs
+## Stage 8 — External Resolution Settlement / Redemption
+
+Automate post-resolution settlement tracking and token redemption outside the Nautilus live trading node.
+
+Detailed design and implementation plan:
+- [docs/wallet_resolution_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/wallet_resolution_plan.md)
+
+**Purpose**
+- Separate active trading concerns from post-resolution operational settlement
+- Handle Polymarket resolution/redemption with a workflow that can inspect wallet-held YES/NO positions and collateral directly
+- Avoid forcing the live trading node to own long-tail redemption logic
+
+**What we will implement**
+- A separate process, not built on Nautilus strategy/runtime primitives
+- Resolution-state polling plus a node-facing wallet-truth interface
+- Automated or operator-assisted redemption workflow for resolved YES/NO positions
+
+**Success criteria**
+- Resolved carried positions can be reconciled and redeemed without manual log spelunking
+- The external process can confirm final wallet state after redemption
+- The live trading node can stay focused on trading-window execution and residual tracking only
+
+---
+
+## Stage 9 — Longer Sandbox Soak Runs
 
 Run the live process for hours, not minutes.
 
@@ -255,7 +279,7 @@ Run the live process for hours, not minutes.
 
 ---
 
-## Stage 9 — Live Order Lifecycle Rehearsal (No Intended Fill)
+## Stage 10 — Live Order Lifecycle Rehearsal (No Intended Fill)
 
 Submit a tiny live order that is intended to rest, then cancel it.
 
@@ -280,7 +304,7 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 ---
 
-## Stage 10 — Minimum-Size Live Fill Rehearsal
+## Stage 11 — Minimum-Size Live Fill Rehearsal
 
 Execute the smallest practical live position, then flatten it.
 
@@ -307,7 +331,7 @@ Execute the smallest practical live position, then flatten it.
 
 ---
 
-## Stage 11 — Observability Tightening
+## Stage 12 — Observability Tightening
 
 Make the system operable once multiple long-running nodes exist.
 
@@ -325,27 +349,6 @@ Make the system operable once multiple long-running nodes exist.
 - Every run produces durable logs with enough context to diagnose failures
 - Operators can answer what happened, when, and what action is needed from logs alone
 - Restart and recovery expectations are documented and consistent with actual behavior
-
----
-
-## Stage 12 — External Resolution Settlement / Redemption
-
-Automate post-resolution settlement tracking and token redemption outside the Nautilus live trading node.
-
-**Purpose**
-- Separate active trading concerns from post-resolution operational settlement
-- Handle Polymarket resolution/redemption with a workflow that can inspect wallet balances, open orders, and venue state directly
-- Avoid forcing the live trading node to own long-tail redemption logic
-
-**What we will implement**
-- A separate process, not built on Nautilus strategy/runtime primitives
-- Resolution-state polling and wallet-level reconciliation
-- Automated or operator-assisted redemption workflow for resolved YES/NO positions
-
-**Success criteria**
-- Resolved carried positions can be reconciled and redeemed without manual log spelunking
-- The external process can confirm final wallet state after redemption
-- The live trading node can stay focused on trading-window execution and residual tracking only
 
 ---
 
@@ -374,15 +377,15 @@ Stage 6
 Stage 7
   -> make Polymarket quote handling side-aware and reduce dropped-quote log spam
 Stage 8
-  -> run multi-hour sandbox soak sessions on the production profiles
+  -> build external wallet-truth + resolution/redemption flow before live trading
 Stage 9
-  -> submit a tiny non-marketable live limit order and cancel it
+  -> run multi-hour sandbox soak sessions on the production profiles
 Stage 10
-  -> execute one minimum-size live fill-and-flatten rehearsal
+  -> submit a tiny non-marketable live limit order and cancel it
 Stage 11
-  -> tighten log retention and operator-facing observability
+  -> execute one minimum-size live fill-and-flatten rehearsal
 Stage 12
-  -> automate post-resolution settlement / redemption in a separate process
+  -> tighten log retention and operator-facing observability
 ```
 
 ---

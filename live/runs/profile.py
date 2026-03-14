@@ -51,6 +51,8 @@ def main_for_profile(profile_name: str, argv: list[str] | None = None) -> None:
 
     try:
         profile = load_profile(profile_name)
+        if args.hours_ahead is not None:
+            profile = profile.with_hours_ahead(args.hours_ahead)
         if args.run_secs is not None:
             profile = profile.with_run_secs(args.run_secs)
         validate_strategy_config(profile.strategy, profile.strategy_config)
@@ -66,6 +68,8 @@ def _make_profile_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a checked-in live runner profile")
     parser.add_argument("profile", nargs="?", help="Profile name or path to a TOML file")
     parser.add_argument("--list", action="store_true", help="List available checked-in profiles and exit")
+    parser.add_argument("--hours-ahead", type=int, default=None,
+                        help="Override profile window preload horizon in hours")
     parser.add_argument("--run-secs", type=int, default=None,
                         help="Override profile runtime for a bounded manual run")
     parser.add_argument("--print-profile", action="store_true",
@@ -75,6 +79,8 @@ def _make_profile_arg_parser() -> argparse.ArgumentParser:
 
 def _make_fixed_profile_arg_parser(profile_name: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=f"Run live profile {profile_name}")
+    parser.add_argument("--hours-ahead", type=int, default=None,
+                        help="Override profile window preload horizon in hours")
     parser.add_argument("--run-secs", type=int, default=None,
                         help="Override profile runtime for a bounded manual run")
     parser.add_argument("--print-profile", action="store_true",
@@ -84,6 +90,8 @@ def _make_fixed_profile_arg_parser(profile_name: str) -> argparse.ArgumentParser
 
 def _fixed_profile_argv(args) -> list[str]:
     argv: list[str] = []
+    if args.hours_ahead is not None:
+        argv.extend(["--hours-ahead", str(args.hours_ahead)])
     if args.run_secs is not None:
         argv.extend(["--run-secs", str(args.run_secs)])
     if args.print_profile:

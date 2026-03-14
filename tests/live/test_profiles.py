@@ -122,6 +122,19 @@ class TestRunnerProfiles:
         with pytest.raises(ProfileError, match="positive integer"):
             profile.with_run_secs(0)
 
+    def test_hours_ahead_override_requires_positive_value(self):
+        profile = RunnerProfile(
+            name="demo",
+            strategy="btc_updown",
+            slug_pattern="btc-updown-15m",
+            hours_ahead=4,
+            mode="live",
+            binance_feed="global",
+        )
+
+        with pytest.raises(ProfileError, match="positive integer"):
+            profile.with_hours_ahead(0)
+
 
 class TestSharedStrategyLauncher:
     def test_build_strategy_applies_profile_overrides(self):
@@ -308,6 +321,31 @@ class TestProfileRunner:
         profile_run.main_for_profile("btc_updown_15m_live", ["--run-secs", "90"])
 
         assert seen["profile"].run_secs == 90
+
+    def test_main_for_profile_applies_hours_ahead_override(self, monkeypatch):
+        seen = {}
+        profile = RunnerProfile(
+            name="btc_updown_15m_live",
+            strategy="btc_updown",
+            slug_pattern="btc-updown-15m",
+            hours_ahead=4,
+            mode="live",
+            binance_feed="global",
+            outcome_side="yes",
+            run_secs=None,
+            strategy_config={"trade_amount_usdc": 5.0},
+        )
+
+        monkeypatch.setattr(profile_run, "load_profile", lambda name: profile)
+        monkeypatch.setattr(
+            profile_run,
+            "run_profile",
+            lambda loaded_profile: seen.update({"profile": loaded_profile}),
+        )
+
+        profile_run.main_for_profile("btc_updown_15m_live", ["--hours-ahead", "8"])
+
+        assert seen["profile"].hours_ahead == 8
 
     def test_main_for_profile_prints_resolved_profile(self, monkeypatch, capsys):
         profile = RunnerProfile(

@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> None:
         batch = run_soak_batch(
             profile_refs=args.profiles,
             run_secs=args.run_secs,
+            hours_ahead=args.hours_ahead,
             output_root=Path(args.output_root),
             label=args.label,
             keep_going=args.keep_going,
@@ -51,6 +52,7 @@ def run_soak_batch(
     *,
     profile_refs: list[str],
     run_secs: int | None,
+    hours_ahead: int | None,
     output_root: Path,
     label: str | None,
     keep_going: bool,
@@ -70,6 +72,7 @@ def run_soak_batch(
         profile = _prepare_profile(
             profile,
             run_secs=run_secs,
+            hours_ahead=hours_ahead,
             allow_live=allow_live,
             allow_unbounded=allow_unbounded,
         )
@@ -93,6 +96,7 @@ def run_soak_batch(
         "finished_at": batch_finished_at.isoformat(),
         "duration_secs": round((batch_finished_at - batch_started_at).total_seconds(), 3),
         "profile_count": len(results),
+        "hours_ahead_override": hours_ahead,
         "run_secs_override": run_secs,
         "results": results,
     }
@@ -104,6 +108,8 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run bounded soak sessions for live profiles")
     parser.add_argument("profiles", nargs="*", help="Profile names or TOML paths to run sequentially")
     parser.add_argument("--list", action="store_true", help="List available checked-in profiles and exit")
+    parser.add_argument("--hours-ahead", type=int, default=None,
+                        help="Override each profile window preload horizon in hours")
     parser.add_argument("--run-secs", type=int, default=None,
                         help="Override each profile runtime for bounded soak sessions")
     parser.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT),
@@ -123,9 +129,12 @@ def _prepare_profile(
     profile: RunnerProfile,
     *,
     run_secs: int | None,
+    hours_ahead: int | None,
     allow_live: bool,
     allow_unbounded: bool,
 ) -> RunnerProfile:
+    if hours_ahead is not None:
+        profile = profile.with_hours_ahead(hours_ahead)
     if run_secs is not None:
         profile = profile.with_run_secs(run_secs)
 
@@ -158,6 +167,7 @@ def _run_profile(
         str(PROJECT_ROOT / "live" / "runs" / "profile.py"),
         _command_profile_ref(profile_ref, fallback_name=profile.name),
     ]
+    command.extend(["--hours-ahead", str(profile.hours_ahead)])
     if profile.run_secs is not None:
         command.extend(["--run-secs", str(profile.run_secs)])
 
@@ -190,6 +200,7 @@ def _run_profile(
         "finished_at": finished_at.isoformat(),
         "duration_secs": round((finished_at - started_at).total_seconds(), 3),
         "exit_code": completed.returncode,
+        "hours_ahead": profile.hours_ahead,
         "run_secs": profile.run_secs,
         "sandbox": profile.sandbox,
         "run_dir": str(run_dir),

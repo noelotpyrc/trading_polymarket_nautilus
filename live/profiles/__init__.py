@@ -52,6 +52,11 @@ class RunnerProfile:
             raise ProfileError("Profile run_secs override must be a positive integer")
         return replace(self, run_secs=run_secs)
 
+    def with_hours_ahead(self, hours_ahead: int) -> "RunnerProfile":
+        if hours_ahead <= 0:
+            raise ProfileError("Profile hours_ahead override must be a positive integer")
+        return replace(self, hours_ahead=hours_ahead)
+
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
 

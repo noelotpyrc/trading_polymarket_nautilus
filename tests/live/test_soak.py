@@ -32,6 +32,7 @@ class TestPrepareProfile:
             soak._prepare_profile(
                 _profile(mode="live", run_secs=300),
                 run_secs=None,
+                hours_ahead=None,
                 allow_live=False,
                 allow_unbounded=False,
             )
@@ -41,6 +42,7 @@ class TestPrepareProfile:
             soak._prepare_profile(
                 _profile(run_secs=None),
                 run_secs=None,
+                hours_ahead=None,
                 allow_live=False,
                 allow_unbounded=False,
             )
@@ -49,11 +51,23 @@ class TestPrepareProfile:
         prepared = soak._prepare_profile(
             _profile(run_secs=180),
             run_secs=3600,
+            hours_ahead=None,
             allow_live=False,
             allow_unbounded=False,
         )
 
         assert prepared.run_secs == 3600
+
+    def test_hours_ahead_override_is_applied(self):
+        prepared = soak._prepare_profile(
+            _profile(run_secs=180),
+            run_secs=None,
+            hours_ahead=8,
+            allow_live=False,
+            allow_unbounded=False,
+        )
+
+        assert prepared.hours_ahead == 8
 
 
 class TestRunSoakBatch:
@@ -79,6 +93,7 @@ class TestRunSoakBatch:
         batch = soak.run_soak_batch(
             profile_refs=["random_signal_15m_sandbox"],
             run_secs=600,
+            hours_ahead=8,
             output_root=tmp_path,
             label="stage7",
             keep_going=False,
@@ -95,7 +110,10 @@ class TestRunSoakBatch:
         assert (run_dir / "profile.json").exists()
         assert (run_dir / "summary.json").exists()
         assert (batch_dir / "summary.json").exists()
+        assert batch["hours_ahead_override"] == 8
         assert batch["results"][0]["run_secs"] == 600
+        assert batch["results"][0]["hours_ahead"] == 8
+        assert "--hours-ahead 8" in (run_dir / "command.txt").read_text(encoding="utf-8")
 
     def test_batch_stops_after_first_failure_without_keep_going(self, tmp_path, monkeypatch):
         profiles = {
@@ -124,6 +142,7 @@ class TestRunSoakBatch:
         batch = soak.run_soak_batch(
             profile_refs=["first", "second"],
             run_secs=None,
+            hours_ahead=None,
             output_root=tmp_path,
             label=None,
             keep_going=False,
@@ -163,6 +182,7 @@ class TestRunSoakBatch:
         batch = soak.run_soak_batch(
             profile_refs=["first", "second"],
             run_secs=None,
+            hours_ahead=None,
             output_root=tmp_path,
             label=None,
             keep_going=True,

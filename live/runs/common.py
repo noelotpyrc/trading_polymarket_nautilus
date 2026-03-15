@@ -4,6 +4,8 @@ import os
 
 from live.market_metadata import WindowMetadataRegistry
 from live.node import build_node, prepare_run_metadata, schedule_stop
+from live.order_truth import ProdOrderTruthProvider
+from live.sandbox_order import SandboxOrderStore, SandboxOrderTruthProvider
 from live.sandbox_wallet import SandboxWalletStore, SandboxWalletTruthProvider
 from live.strategies.btc_updown import BtcUpDownConfig, BtcUpDownStrategy
 from live.strategies.random_signal import RandomSignalConfig, RandomSignalStrategy
@@ -108,6 +110,7 @@ def run_strategy(
         sandbox_wallet_state_path=sandbox_wallet_state_path,
         sandbox_starting_usdc=sandbox_starting_usdc,
     )
+    _attach_order_truth(strategy, sandbox=sandbox)
     strategy.set_process_stop_callback(node.stop)
     node.trader.add_strategy(strategy)
     node.build()
@@ -162,4 +165,19 @@ def _attach_wallet_truth(
             balance_client=balance_client,
             registry=registry,
         )
+    )
+
+
+def _attach_order_truth(strategy, *, sandbox: bool) -> None:
+    if sandbox:
+        order_store = SandboxOrderStore()
+        strategy.set_sandbox_order_store(order_store)
+        strategy.set_order_truth_provider(
+            SandboxOrderTruthProvider(order_store=order_store)
+        )
+        return
+
+    clob_client, _ = make_polymarket_balance_client(sandbox=False)
+    strategy.set_order_truth_provider(
+        ProdOrderTruthProvider(clob_client=clob_client)
     )

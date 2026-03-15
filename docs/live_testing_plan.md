@@ -318,6 +318,21 @@ Detailed design and implementation plan:
   - reconcile locally if externally proven dead
   - stop on mismatch
 
+**Implementation status**
+- Implemented locally in:
+  - [live/order_truth.py](/Users/noel/projects/trading_polymarket_nautilus/live/order_truth.py)
+  - [live/sandbox_order.py](/Users/noel/projects/trading_polymarket_nautilus/live/sandbox_order.py)
+  - [live/strategies/windowed.py](/Users/noel/projects/trading_polymarket_nautilus/live/strategies/windowed.py)
+  - [live/runs/common.py](/Users/noel/projects/trading_polymarket_nautilus/live/runs/common.py)
+- Local automated validation is green:
+  - `.venv/bin/python -m pytest tests/live`
+  - `171 passed`
+- Deterministic sandbox runtime validation is now green:
+  - `python live/soak.py random_signal_15m_order_reconciliation_sandbox --with-resolution-worker --label stage9_order_truth_smoke_rerun`
+  - stale IOC remainders were terminalized, purged from Nautilus cache, and no old residual-order shutdown warning remained
+- Remaining proof is live-only:
+  - tiny live cancel rehearsal
+
 **Success criteria**
 - No ambiguous `Residual MarketOrder(...)` shutdown warnings remain for IOC remainders that PM order truth proves are dead
 - Entry-order remainders cannot remain live on PM without the node knowing

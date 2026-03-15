@@ -23,6 +23,28 @@ This plan does **not** replace:
 - the external resolution worker
 - Nautilus-owned active order submission / cancel flow
 
+## Current Implementation Status
+
+Local Stage 9 code is now in place:
+
+- shared `OrderTruthStatus` / `OrderTruthRecord` / `OrderTruthProvider`
+- production `ProdOrderTruthProvider` backed by Polymarket CLOB order reads
+- synthetic `SandboxOrderStore` / `SandboxOrderTruthProvider`
+- node-side order-truth polling in `WindowedPolymarketStrategy`
+- stop-gate integration so shutdown waits for suspicious IOC remainders to reconcile
+
+Current local validation:
+
+- `.venv/bin/python -m pytest tests/live`
+- result: `171 passed`
+
+What still remains:
+
+- deterministic sandbox runtime validation passed:
+  - `python live/soak.py random_signal_15m_order_reconciliation_sandbox --with-resolution-worker --label stage9_order_truth_smoke_rerun`
+  - stale IOC remainders were terminalized and purged before shutdown
+- later, a tiny live rehearsal to prove the real PM cancel path
+
 ## Why This Stage Exists
 
 Stage 8 closed `P1b`:
@@ -108,7 +130,12 @@ Suggested shape:
 
 ```python
 class OrderTruthProvider(Protocol):
-    def order_status(self, client_order_id: str) -> OrderTruthStatus: ...
+    def order_status(
+        self,
+        *,
+        client_order_id: str | None,
+        venue_order_id: str | None,
+    ) -> OrderTruthRecord: ...
 ```
 
 Suggested normalized statuses:
@@ -217,6 +244,10 @@ Success criteria:
 
 - production and sandbox providers share one normalized interface
 
+Status:
+
+- implemented locally
+
 ### Phase 2: Sandbox Order Truth
 
 Implement:
@@ -233,6 +264,10 @@ Success criteria:
 
 - node reconciliation logic can be tested without PM network calls
 
+Status:
+
+- implemented locally
+
 ### Phase 3: Production PM Order Truth Provider
 
 Implement:
@@ -243,6 +278,10 @@ Implement:
 Success criteria:
 
 - provider can tell whether a client/venue order is still open on PM
+
+Status:
+
+- implemented locally
 
 ### Phase 4: Node Reconciliation Hook
 
@@ -260,6 +299,11 @@ Success criteria:
   - canceled for real
   - locally reconciled with external proof
   - or escalated to stop
+
+Status:
+
+- implemented locally
+- runtime validation still pending
 
 ### Phase 5: Validation
 

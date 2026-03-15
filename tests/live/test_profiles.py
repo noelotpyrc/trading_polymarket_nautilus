@@ -12,6 +12,7 @@ from live.runs.profiles import btc_updown_15m_live as btc_updown_15m_live_run
 from live.runs.profiles import btc_updown_15m_live_no as btc_updown_15m_live_no_run
 from live.runs.profiles import btc_updown_15m_sandbox as btc_updown_15m_sandbox_run
 from live.runs.profiles import btc_updown_15m_sandbox_no as btc_updown_15m_sandbox_no_run
+from live.runs.profiles import random_signal_15m_order_reconciliation_sandbox as random_signal_15m_order_reconciliation_sandbox_run
 from live.runs.profiles import random_signal_15m_resolution_sandbox as random_signal_15m_resolution_sandbox_run
 from live.runs.profiles import random_signal_15m_sandbox as random_signal_15m_sandbox_run
 from live.runs.profiles import random_signal_15m_sandbox_no as random_signal_15m_sandbox_no_run
@@ -24,6 +25,7 @@ class TestRunnerProfiles:
             "btc_updown_15m_live_no",
             "btc_updown_15m_sandbox",
             "btc_updown_15m_sandbox_no",
+            "random_signal_15m_order_reconciliation_sandbox",
             "random_signal_15m_resolution_sandbox",
             "random_signal_15m_sandbox",
             "random_signal_15m_sandbox_no",
@@ -81,6 +83,22 @@ class TestRunnerProfiles:
         assert profile.strategy == "random_signal"
         assert profile.strategy_config == {
             "trade_amount_usdc": 5.0,
+            "entry_threshold": 0.0,
+            "exit_threshold": 0.7,
+            "disable_signal_exit": True,
+            "carry_window_end_position": True,
+        }
+
+    def test_loads_checked_in_order_reconciliation_sandbox_profile(self):
+        profile = load_profile("random_signal_15m_order_reconciliation_sandbox")
+
+        assert profile.mode == "sandbox"
+        assert profile.binance_feed == "global"
+        assert profile.run_secs == 3600
+        assert profile.sandbox_starting_usdc == 2500.0
+        assert profile.strategy == "random_signal"
+        assert profile.strategy_config == {
+            "trade_amount_usdc": 2000.0,
             "entry_threshold": 0.0,
             "exit_threshold": 0.7,
             "disable_signal_exit": True,
@@ -219,6 +237,12 @@ class TestSharedStrategyLauncher:
                 self.stop_callback = None
                 self.requested_stop_reasons = []
 
+            def set_sandbox_order_store(self, order_store):
+                self.order_store = order_store
+
+            def set_order_truth_provider(self, provider):
+                self.order_truth_provider = provider
+
             def set_process_stop_callback(self, callback):
                 self.stop_callback = callback
 
@@ -310,8 +334,14 @@ class TestSharedStrategyLauncher:
             def set_sandbox_wallet_store(self, wallet_store):
                 self.wallet_store = wallet_store
 
+            def set_sandbox_order_store(self, order_store):
+                self.order_store = order_store
+
             def set_wallet_truth_provider(self, provider):
                 self.wallet_truth_provider = provider
+
+            def set_order_truth_provider(self, provider):
+                self.order_truth_provider = provider
 
             def request_process_stop(self, reason):
                 self.reason = reason
@@ -584,6 +614,7 @@ class TestProfileRunner:
             (btc_updown_15m_live_no_run, "btc_updown_15m_live_no"),
             (btc_updown_15m_sandbox_run, "btc_updown_15m_sandbox"),
             (btc_updown_15m_sandbox_no_run, "btc_updown_15m_sandbox_no"),
+            (random_signal_15m_order_reconciliation_sandbox_run, "random_signal_15m_order_reconciliation_sandbox"),
             (random_signal_15m_resolution_sandbox_run, "random_signal_15m_resolution_sandbox"),
             (random_signal_15m_sandbox_run, "random_signal_15m_sandbox"),
             (random_signal_15m_sandbox_no_run, "random_signal_15m_sandbox_no"),

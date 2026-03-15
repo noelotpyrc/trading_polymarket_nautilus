@@ -8,13 +8,16 @@ from nautilus_trader.adapters.polymarket.common.symbol import (
     get_polymarket_token_id,
 )
 from nautilus_trader.core.uuid import UUID4
-from nautilus_trader.model.enums import OrderSide, PositionAdjustmentType, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderStatus, PositionAdjustmentType, TimeInForce
+from nautilus_trader.model.events.order import OrderCanceled, OrderExpired
 from nautilus_trader.model.events.position import PositionAdjusted
 from nautilus_trader.model.identifiers import InstrumentId
 from nautilus_trader.model.objects import AccountBalance, Money, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
+from live.order_truth import OrderTruthProvider, OrderTruthStatus
 from live.resolution import fetch_market_resolution
+from live.sandbox_order import SandboxOrderStore
 from live.sandbox_wallet import SandboxWalletStore
 from live.wallet_truth import WalletSettlement, WalletTruthProvider, WalletTruthSnapshot
 
@@ -35,6 +38,8 @@ class WindowedPolymarketStrategy(Strategy):
     _POSITION_CLEANUP_TIMEOUT_NS = 60_000_000_000
     _RESOLUTION_POLL_INTERVAL_NS = 30_000_000_000
     _WALLET_TRUTH_POLL_INTERVAL_NS = 30_000_000_000
+    _ORDER_TRUTH_POLL_INTERVAL_NS = 30_000_000_000
+    _ORDER_TRUTH_CANCEL_RETRY_INTERVAL_NS = 30_000_000_000
     _BALANCE_GUARD_INTERVAL_NS = 30_000_000_000
     _ENTRY_FEE_BUFFER_RATE = 0.10
 
@@ -79,9 +84,12 @@ class WindowedPolymarketStrategy(Strategy):
         self._resolution_pending_instruments: dict[InstrumentId, str] = {}
         self._resolution_settled_instruments: set[InstrumentId] = set()
         self._sandbox_wallet_store: SandboxWalletStore | None = None
+        self._sandbox_order_store: SandboxOrderStore | None = None
         self._wallet_truth_provider: WalletTruthProvider | None = None
         self._wallet_truth_snapshot: WalletTruthSnapshot | None = None
         self._wallet_truth_seen_settlement_token_ids: set[str] = set()
+        self._order_truth_provider: OrderTruthProvider | None = None
+        self._order_truth_cancel_attempt_ns: dict[object, int] = {}
         self._process_stop_callback: Callable[[], None] | None = None
         self._process_stop_requested = False
         self._process_stop_dispatched = False
@@ -95,8 +103,14 @@ class WindowedPolymarketStrategy(Strategy):
     def set_sandbox_wallet_store(self, wallet_store: SandboxWalletStore) -> None:
         self._sandbox_wallet_store = wallet_store
 
+    def set_sandbox_order_store(self, order_store: SandboxOrderStore) -> None:
+        self._sandbox_order_store = order_store
+
     def set_wallet_truth_provider(self, provider: WalletTruthProvider) -> None:
         self._wallet_truth_provider = provider
+
+    def set_order_truth_provider(self, provider: OrderTruthProvider) -> None:
+        self._order_truth_provider = provider
 
     @property
     def wallet_truth_snapshot(self) -> WalletTruthSnapshot | None:
@@ -164,8 +178,29 @@ class WindowedPolymarketStrategy(Strategy):
             return
         self.clock.cancel_timer("wallet_truth")
 
+    def _start_order_truth_polling(self) -> None:
+        if self._order_truth_provider is None:
+            return
+
+        self._refresh_order_truth(log_initial=True)
+        self.clock.set_timer_ns(
+            "order_truth",
+            self._ORDER_TRUTH_POLL_INTERVAL_NS,
+            0,
+            0,
+            self._on_order_truth_timer,
+        )
+
+    def _stop_order_truth_polling(self) -> None:
+        if self._order_truth_provider is None:
+            return
+        self.clock.cancel_timer("order_truth")
+
     def _on_wallet_truth_timer(self, event) -> None:
         self._refresh_wallet_truth()
+
+    def _on_order_truth_timer(self, event) -> None:
+        self._refresh_order_truth()
 
     def _on_balance_guard_timer(self, event) -> None:
         self._check_operating_balance()
@@ -200,6 +235,21 @@ class WindowedPolymarketStrategy(Strategy):
                 f"| positions={len(snapshot.positions)} "
                 f"| settlements={len(snapshot.settlements)}"
             )
+
+    def _refresh_order_truth(self, *, log_initial: bool = False) -> None:
+        if self._order_truth_provider is None:
+            return
+
+        suspicious_orders = self._ioc_orders_requiring_reconciliation()
+        if log_initial:
+            self.log.info(
+                f"Order truth initialized | suspicious_ioc_orders={len(suspicious_orders)}"
+            )
+        if not suspicious_orders:
+            return
+
+        for order in suspicious_orders:
+            self._reconcile_suspicious_ioc_order(order)
 
     def _portfolio_account_for_pm_venue(self):
         portfolio = getattr(self, "portfolio", None)
@@ -449,6 +499,228 @@ class WindowedPolymarketStrategy(Strategy):
             f"{shortfall_reason} — stopping"
         )
 
+    def _ioc_orders_requiring_reconciliation(self) -> list[object]:
+        try:
+            orders = self.cache.orders(venue=self._pm_instrument_id.venue)
+        except Exception:
+            return []
+        return [
+            order
+            for order in orders
+            if self._order_requires_truth_reconciliation(order)
+        ]
+
+    def _order_requires_truth_reconciliation(self, order) -> bool:
+        if getattr(order, "time_in_force", None) != TimeInForce.IOC:
+            return False
+        status = getattr(order, "status", None)
+        if status == OrderStatus.PARTIALLY_FILLED:
+            return not self._is_order_closed(order)
+        if status != OrderStatus.PENDING_CANCEL:
+            return False
+        filled_qty = getattr(order, "filled_qty", None)
+        try:
+            return filled_qty is not None and float(filled_qty) > 0 and not self._is_order_closed(order)
+        except (TypeError, ValueError):
+            return False
+
+    def _reconcile_suspicious_ioc_order(self, order) -> None:
+        client_order_id = getattr(order, "client_order_id", None)
+        venue_order_id = getattr(order, "venue_order_id", None)
+        client_order_ref = None if client_order_id is None else self._client_order_ref(client_order_id)
+        venue_order_ref = None if venue_order_id is None else str(venue_order_id)
+
+        truth = self._order_truth_provider.order_status(
+            client_order_id=client_order_ref,
+            venue_order_id=venue_order_ref,
+        )
+        if truth.status is OrderTruthStatus.OPEN:
+            self._cancel_open_ioc_remainder(order)
+            return
+        if truth.status.is_terminal:
+            self._purge_reconciled_ioc_order(order, truth.status)
+            return
+
+        self.log.warning(
+            f"Order truth unavailable for stale IOC remainder {client_order_ref} "
+            f"(venue={venue_order_ref}, reason={truth.reason or 'unknown'})"
+        )
+
+    def _cancel_open_ioc_remainder(self, order) -> None:
+        client_order_id = getattr(order, "client_order_id", None)
+        if client_order_id is None:
+            return
+
+        now_ns = self._now_ns()
+        last_attempt_ns = self._order_truth_cancel_attempt_ns.get(client_order_id)
+        if (
+            last_attempt_ns is not None
+            and now_ns - last_attempt_ns < self._ORDER_TRUTH_CANCEL_RETRY_INTERVAL_NS
+        ):
+            return
+
+        self._order_truth_cancel_attempt_ns[client_order_id] = now_ns
+        self._cancel_order_for_reconciliation(
+            order,
+            reason=(
+                "order truth still reports partially filled IOC remainder as open"
+            ),
+        )
+
+    def _purge_reconciled_ioc_order(self, order, truth_status: OrderTruthStatus) -> None:
+        client_order_id = getattr(order, "client_order_id", None)
+        if client_order_id is None:
+            return
+
+        client_order_ref = self._client_order_ref(client_order_id)
+        self._order_truth_cancel_attempt_ns.pop(client_order_id, None)
+        self._forget_entry_order_tracking(client_order_id)
+        if not self._terminalize_ioc_order_from_truth(order, truth_status):
+            self.log.error(
+                f"Order truth proved IOC remainder {client_order_ref} is {truth_status.value}, "
+                "but local Nautilus order state could not be terminalized"
+            )
+            return
+        purged = self._purge_order_from_cache(order)
+        outcome = "purged local cache record" if purged else "left closed local cache record"
+        self.log.warning(
+            f"Order truth reconciled stale IOC remainder {client_order_ref} "
+            f"as {truth_status.value}; {outcome}"
+        )
+        self._maybe_finalize_process_stop()
+
+    def _forget_entry_order_tracking(self, client_order_id) -> None:
+        self._clear_active_entry_order(client_order_id)
+        self._entry_order_instruments.pop(client_order_id, None)
+        self._entry_orders_by_id.pop(client_order_id, None)
+        self._entry_orders_flatten_on_fill.discard(client_order_id)
+        self._cancel_entry_order_timeouts(client_order_id)
+
+    def _terminalize_ioc_order_from_truth(self, order, truth_status: OrderTruthStatus) -> bool:
+        if self._is_order_closed(order):
+            return True
+
+        if not hasattr(order, "apply"):
+            status = (
+                OrderStatus.EXPIRED
+                if truth_status is OrderTruthStatus.EXPIRED
+                else OrderStatus.CANCELED
+            )
+            try:
+                order.status = status
+                order.is_closed = True
+            except Exception:
+                return False
+            return True
+
+        client_order_id = getattr(order, "client_order_id", None)
+        instrument_id = getattr(order, "instrument_id", None)
+        trader_id = getattr(order, "trader_id", None)
+        strategy_id = getattr(order, "strategy_id", None)
+        if (
+            client_order_id is None
+            or instrument_id is None
+            or trader_id is None
+            or strategy_id is None
+        ):
+            return False
+
+        now_ns = self._now_ns()
+        event_cls = OrderExpired if truth_status is OrderTruthStatus.EXPIRED else OrderCanceled
+        try:
+            event = event_cls(
+                trader_id=trader_id,
+                strategy_id=strategy_id,
+                instrument_id=instrument_id,
+                client_order_id=client_order_id,
+                venue_order_id=getattr(order, "venue_order_id", None),
+                account_id=getattr(order, "account_id", None),
+                event_id=UUID4(),
+                ts_event=now_ns,
+                ts_init=now_ns,
+                reconciliation=True,
+            )
+            order.apply(event)
+            self.cache.update_order(order)
+            portfolio = getattr(self, "portfolio", None)
+            if portfolio is not None and hasattr(portfolio, "update_order"):
+                portfolio.update_order(event)
+        except Exception:
+            return False
+
+        return self._is_order_closed(order)
+
+    def _purge_order_from_cache(self, order) -> bool:
+        try:
+            self.cache.purge_order(order.client_order_id)
+        except Exception:
+            return False
+        try:
+            return self.cache.order(order.client_order_id) is None
+        except Exception:
+            return False
+
+    def _cancel_order_for_reconciliation(self, order, *, reason: str) -> None:
+        self.cancel_order(order)
+        self._record_order_cancel_in_sandbox_truth(order)
+        self.log.warning(
+            f"Canceling stale IOC remainder ({reason}): "
+            f"{self._client_order_ref(order.client_order_id)}"
+        )
+
+    def _sync_order_in_sandbox_truth(self, order) -> None:
+        if self._sandbox_order_store is None or order is None:
+            return
+
+        client_order_id = getattr(order, "client_order_id", None)
+        if client_order_id is None:
+            return
+        if getattr(order, "time_in_force", None) != TimeInForce.IOC:
+            return
+
+        venue_order_id = getattr(order, "venue_order_id", None)
+        instrument_id = str(getattr(order, "instrument_id", "")) or None
+        status = getattr(order, "status", None)
+        remaining_qty = _order_remaining_qty(order)
+
+        if status == OrderStatus.PARTIALLY_FILLED:
+            # Simulate venue truth for IOC: once partially filled, the remainder is
+            # no longer resting on the venue even if Nautilus keeps the order object open.
+            truth_status = OrderTruthStatus.NOT_FOUND
+        elif status == OrderStatus.FILLED:
+            truth_status = OrderTruthStatus.CLOSED
+        elif status == OrderStatus.CANCELED:
+            truth_status = OrderTruthStatus.CANCELED
+        elif status == OrderStatus.EXPIRED:
+            truth_status = OrderTruthStatus.EXPIRED
+        else:
+            truth_status = OrderTruthStatus.OPEN
+
+        self._sandbox_order_store.set_order_status(
+            client_order_id=self._client_order_ref(client_order_id),
+            venue_order_id=None if venue_order_id is None else str(venue_order_id),
+            instrument_id=instrument_id,
+            status=truth_status,
+            remaining_qty=remaining_qty,
+        )
+
+    def _record_order_cancel_in_sandbox_truth(self, order) -> None:
+        if self._sandbox_order_store is None or order is None:
+            return
+
+        client_order_id = getattr(order, "client_order_id", None)
+        if client_order_id is None:
+            return
+        self._sandbox_order_store.set_order_status(
+            client_order_id=self._client_order_ref(client_order_id),
+            venue_order_id=None
+            if getattr(order, "venue_order_id", None) is None
+            else str(order.venue_order_id),
+            instrument_id=str(getattr(order, "instrument_id", "")) or None,
+            status=OrderTruthStatus.CANCELED,
+            remaining_qty=0.0,
+        )
+
     def on_quote_tick(self, tick) -> None:
         if tick.instrument_id == self._pm_instrument_id:
             self._pm_bid = float(tick.bid_price)
@@ -533,6 +805,7 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_order_client_id = order.client_order_id
         self._entry_order_instruments[order.client_order_id] = self._pm_instrument_id
         self._entry_orders_by_id[order.client_order_id] = order
+        self._sync_order_in_sandbox_truth(order)
         self._schedule_entry_order_timeouts(order.client_order_id)
         self.submit_order(order)
 
@@ -544,8 +817,10 @@ class WindowedPolymarketStrategy(Strategy):
             return
 
         self._entry_orders_flatten_on_fill.add(self._entry_order_client_id)
-        self.cancel_order(self._entry_order)
-        self.log.warning(f"Canceling pending entry order ({reason}): {self._entry_order_client_id}")
+        self._cancel_order_for_reconciliation(
+            self._entry_order,
+            reason=reason,
+        )
 
     def _open_positions_for_instrument(self, instrument_id: InstrumentId):
         return list(self.cache.positions_open(instrument_id=instrument_id))
@@ -681,10 +956,7 @@ class WindowedPolymarketStrategy(Strategy):
                 continue
 
             self._entry_orders_flatten_on_fill.add(client_order_id)
-            self.cancel_order(order)
-            self.log.warning(
-                f"Canceling residual entry order ({reason}): {client_order_id}"
-            )
+            self._cancel_order_for_reconciliation(order, reason=reason)
 
     def _client_order_ref(self, client_order_id) -> str:
         if hasattr(client_order_id, "to_str"):
@@ -750,10 +1022,12 @@ class WindowedPolymarketStrategy(Strategy):
             return
 
         self._entry_orders_flatten_on_fill.add(client_order_id)
-        self.cancel_order(self._entry_order)
-        self.log.warning(
-            f"Entry order pending too long ({self._ENTRY_ORDER_CANCEL_AFTER_NS // 1_000_000_000}s) "
-            f"— canceling {client_order_id}"
+        self._cancel_order_for_reconciliation(
+            self._entry_order,
+            reason=(
+                f"entry order pending too long "
+                f"({self._ENTRY_ORDER_CANCEL_AFTER_NS // 1_000_000_000}s)"
+            ),
         )
 
     def _handle_entry_order_escalation_timeout_for(self, client_order_id) -> None:
@@ -988,6 +1262,8 @@ class WindowedPolymarketStrategy(Strategy):
             return
         if self._resolution_pending_instruments:
             return
+        if self._ioc_orders_requiring_reconciliation():
+            return
 
         for instrument_id_str, _ in self._windows:
             instrument_id = InstrumentId.from_str(instrument_id_str)
@@ -1065,9 +1341,16 @@ class WindowedPolymarketStrategy(Strategy):
     def _handle_entry_order_terminal(self, client_order_id, message: str) -> None:
         if client_order_id not in self._entry_order_instruments and client_order_id != self._entry_order_client_id:
             return
+        tracked_order = self._entry_orders_by_id.get(client_order_id)
         self._mark_entry_order_inactive(client_order_id)
         self._entry_orders_by_id.pop(client_order_id, None)
+        self._record_order_terminal_in_sandbox_truth(
+            client_order_id,
+            order=tracked_order,
+            message=message,
+        )
         self.log.warning(message)
+        self._maybe_finalize_process_stop()
 
     def on_order_denied(self, event) -> None:
         self._handle_entry_order_terminal(
@@ -1095,6 +1378,7 @@ class WindowedPolymarketStrategy(Strategy):
 
     def on_order_filled(self, event) -> None:
         self._record_fill_in_sandbox_wallet(event)
+        self._record_fill_in_sandbox_order_truth(event)
         tracked_instrument_id = self._entry_order_instruments.get(event.client_order_id)
         is_late_fill = (
             tracked_instrument_id is not None
@@ -1166,6 +1450,54 @@ class WindowedPolymarketStrategy(Strategy):
             self._cancel_position_cleanup(event.instrument_id)
             self._maybe_finalize_process_stop()
 
+    def _record_fill_in_sandbox_order_truth(self, event) -> None:
+        if self._sandbox_order_store is None:
+            return
+
+        order = None
+        try:
+            order = self.cache.order(event.client_order_id)
+        except Exception:
+            order = None
+
+        if order is None:
+            order = self._entry_orders_by_id.get(event.client_order_id)
+        self._sync_order_in_sandbox_truth(order)
+
+    def _record_order_terminal_in_sandbox_truth(self, client_order_id, *, order, message: str) -> None:
+        if self._sandbox_order_store is None:
+            return
+
+        normalized = message.lower()
+        if "expired" in normalized:
+            status = OrderTruthStatus.EXPIRED
+        elif "canceled" in normalized:
+            status = OrderTruthStatus.CANCELED
+        elif "rejected" in normalized or "denied" in normalized:
+            status = OrderTruthStatus.NOT_FOUND
+        else:
+            status = OrderTruthStatus.CLOSED
+
+        self._sandbox_order_store.set_order_status(
+            client_order_id=self._client_order_ref(client_order_id),
+            venue_order_id=None
+            if order is None or getattr(order, "venue_order_id", None) is None
+            else str(order.venue_order_id),
+            instrument_id=None if order is None else str(getattr(order, "instrument_id", "")) or None,
+            status=status,
+            remaining_qty=0.0,
+        )
+
 
 def _fmt_ns(ts_ns: int) -> str:
     return datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).strftime("%H:%M:%S")
+
+
+def _order_remaining_qty(order) -> float | None:
+    leaves_qty = getattr(order, "leaves_qty", None)
+    if leaves_qty is None:
+        return None
+    try:
+        return float(leaves_qty)
+    except (TypeError, ValueError):
+        return None

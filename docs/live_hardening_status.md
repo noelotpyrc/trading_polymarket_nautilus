@@ -8,15 +8,15 @@ This exists because the roadmap in [docs/live_testing_plan.md](/Users/noel/proje
 
 ## Current Snapshot
 
-- Last committed relevant baseline on `master`: `688e7b2` (`Plan wallet resolution before live rehearsals`)
-- Latest committed live-process hardening commit on `master`: `7c6fecd` (`Harden live lifecycle and soak tooling`)
-- There is a local-only Stage 8 implementation batch after that commit
+- Latest committed Stage 8 baseline on `master`: `b84de57` (`Add wallet truth and resolution worker flow`)
+- There is a new local Stage 9 implementation + validation batch after that commit
 - Current local automated validation:
   - `.venv/bin/python -m pytest tests/live`
-  - result: `161 passed`
-- Still not fully proven after the Stage 8 implementation batch:
+  - result: `171 passed`
+- Still not fully proven after the current local batch:
   - live dry-run resolution scan against real resolved-wallet state
   - live redemption rehearsal
+  - tiny live PM cancel rehearsal for Stage 9
 
 ---
 
@@ -230,7 +230,7 @@ Validation:
 - tests in [tests/live/test_config.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_config.py)
 - tests in [tests/live/test_windowed_strategy.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_windowed_strategy.py)
 - tests in [tests/live/test_guardrails_e2e.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_guardrails_e2e.py)
-- current full local live suite: `161 passed`
+- current full local live suite: `169 passed`
 
 Remaining proof needed:
 - fresh real sandbox soak to measure the actual warning-volume drop and confirm there is no new long-run regression
@@ -264,7 +264,7 @@ Main files:
 - [live/soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py)
 
 Validation:
-- full live suite: `161 passed`
+- full live suite: `169 passed`
 - focused coverage in:
   - [tests/live/test_wallet_truth.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_wallet_truth.py)
   - [tests/live/test_run_resolution.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_run_resolution.py)
@@ -292,7 +292,7 @@ Runtime validation now completed:
 
 ### Proven locally
 
-- live tests: `.venv/bin/python -m pytest tests/live` -> `161 passed`
+- live tests: `.venv/bin/python -m pytest tests/live` -> `169 passed`
 - runner/profile infrastructure
 - Binance warmup path
 - YES / NO side selection
@@ -329,10 +329,40 @@ Runtime validation now completed:
 
 ---
 
+### 9. Stage 9 PM order reconciliation (`P1a`)
+
+Problem:
+- stale partially-filled IOC order objects can remain in Nautilus cache without authoritative PM order truth
+
+Fix:
+- added shared order-truth models and providers
+- added a synthetic sandbox order-truth store/provider
+- added node-side IOC reconciliation polling
+- stop now waits for suspicious stale IOC orders to reconcile before final shutdown
+
+Main files:
+- [live/order_truth.py](/Users/noel/projects/trading_polymarket_nautilus/live/order_truth.py)
+- [live/sandbox_order.py](/Users/noel/projects/trading_polymarket_nautilus/live/sandbox_order.py)
+- [live/strategies/windowed.py](/Users/noel/projects/trading_polymarket_nautilus/live/strategies/windowed.py)
+- [live/runs/common.py](/Users/noel/projects/trading_polymarket_nautilus/live/runs/common.py)
+
+Validation:
+- [tests/live/test_order_truth.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_order_truth.py)
+- [tests/live/test_windowed_strategy.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_windowed_strategy.py)
+- full live suite: `171 passed`
+
+Runtime proof:
+- deterministic sandbox runtime validation passed:
+  - `python live/soak.py random_signal_15m_order_reconciliation_sandbox --with-resolution-worker --label stage9_order_truth_smoke_rerun`
+  - stale IOC remainders were terminalized and purged before shutdown
+  - the old residual IOC shutdown warning did not reappear
+
+Remaining proof needed:
+- later, a tiny live PM cancel rehearsal
+
 ## Recommended Immediate Next Step
 
-Begin Stage 9 PM order reconciliation (`P1a`):
+Proceed to the next roadmap stage:
 
-- reconcile stale partially-filled IOC order objects against real PM order truth
-- prove entry-order remainders cannot stay live on PM without the node knowing
-- then rerun the longer sandbox soaks against the new order-reconciliation path
+- rerun the longer sandbox soaks against the new order-reconciliation path
+- then perform the tiny live PM cancel rehearsal

@@ -178,6 +178,7 @@ Current behavior:
 - Current catalog:
   - `btc_updown_15m_live`
   - `btc_updown_15m_live_no`
+  - `random_signal_15m_order_reconciliation_sandbox`
   - `random_signal_15m_resolution_sandbox`
   - `random_signal_15m_sandbox`
   - `random_signal_15m_sandbox_no`
@@ -192,6 +193,7 @@ Current behavior:
 python live/runs/profiles/btc_updown_15m_live.py --run-secs 300
 python live/runs/profile.py btc_updown_15m_live --print-profile
 python live/runs/profile.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800
+python live/runs/profile.py random_signal_15m_order_reconciliation_sandbox --print-profile
 python live/runs/profile.py random_signal_15m_resolution_sandbox --hours-ahead 2 --sandbox-wallet-state-path logs/stage8/random_wallet_state.json
 python live/runs/profile.py random_signal_15m_resolution_sandbox --sandbox-starting-usdc 25
 ```
@@ -226,6 +228,9 @@ python live/soak.py random_signal_15m_sandbox btc_updown_15m_sandbox --run-secs 
 
 # One-command Stage 8 deterministic residual + worker validation
 python live/soak.py random_signal_15m_resolution_sandbox --with-resolution-worker --label stage8_resolution_smoke
+
+# One-command Stage 9 stale-IOC reconciliation validation
+python live/soak.py random_signal_15m_order_reconciliation_sandbox --with-resolution-worker --label stage9_order_truth_smoke
 ```
 
 Safety defaults:
@@ -244,19 +249,15 @@ Artifacts:
 
 The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next implementation stages are:
 
-1. PM order reconciliation
-   - Purpose: reconcile stale IOC remainders against real PM order truth.
-   - Design: [docs/order_reconciliation_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/order_reconciliation_plan.md)
-   - Success: stale IOC remainders are either canceled for real, externally proven dead, or escalated.
-2. Longer sandbox soak runs
+1. Longer sandbox soak runs
    - Purpose: prove multi-hour stability.
    - Success: repeated rollovers and long runtimes remain clean.
-3. Live order lifecycle rehearsal
+2. Live order lifecycle rehearsal
    - Purpose: prove live submit/open/cancel behavior with no intended fill.
    - Success: a tiny non-marketable live order opens and cancels cleanly.
-4. Minimum-size live fill rehearsal
+3. Minimum-size live fill rehearsal
    - Purpose: prove the live execution path end-to-end.
    - Success: one minimum-size live round trip reconciles with Polymarket.
-5. Observability tightening
+4. Observability tightening
    - Purpose: make the live system operable at session and multi-node scale.
    - Success: logs and runbook are enough to diagnose failures without code inspection.

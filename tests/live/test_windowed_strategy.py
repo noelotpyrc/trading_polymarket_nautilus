@@ -4,9 +4,11 @@ from types import SimpleNamespace
 import pytest
 
 from nautilus_trader.config import StrategyConfig
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.model.enums import OrderSide, OrderStatus, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 
+from live.order_truth import OrderTruthRecord, OrderTruthStatus
+from live.sandbox_order import SandboxOrderStore, SandboxOrderTruthProvider
 from live.resolution import MarketResolution
 from live.sandbox_wallet import SandboxWalletStore
 from live.wallet_truth import WalletSettlement, WalletTokenPosition, WalletTruthSnapshot
@@ -20,9 +22,26 @@ class HarnessConfig(StrategyConfig, frozen=True):
 
 
 class DummyOrder:
-    def __init__(self, client_order_id, *, is_closed: bool = False):
+    def __init__(
+        self,
+        client_order_id,
+        *,
+        is_closed: bool = False,
+        time_in_force: TimeInForce = TimeInForce.IOC,
+        status: OrderStatus = OrderStatus.SUBMITTED,
+        venue_order_id: str | None = None,
+        instrument_id: InstrumentId | None = None,
+        filled_qty: float = 0.0,
+        leaves_qty: float = 0.0,
+    ):
         self.client_order_id = client_order_id
         self.is_closed = is_closed
+        self.time_in_force = time_in_force
+        self.status = status
+        self.venue_order_id = venue_order_id
+        self.instrument_id = instrument_id
+        self.filled_qty = filled_qty
+        self.leaves_qty = leaves_qty
 
 
 class DummyPosition:
@@ -55,6 +74,9 @@ class LifecycleHarness(WindowedPolymarketStrategy):
         self.entry_order_kwargs = None
         self.wallet_balance_syncs = []
         self.wallet_reconciliations = []
+        self.orders_for_reconciliation = []
+        self.purged_order_ids = []
+        self.order_cache = {}
 
     def cancel_order(self, order, *args, **kwargs):
         self.canceled_orders.append(order.client_order_id)
@@ -125,6 +147,16 @@ class LifecycleHarness(WindowedPolymarketStrategy):
             return current
         return response
 
+    def _ioc_orders_requiring_reconciliation(self):
+        return list(self.orders_for_reconciliation)
+
+    def _purge_order_from_cache(self, order) -> None:
+        if not self._is_order_closed(order):
+            return False
+        self.purged_order_ids.append(order.client_order_id)
+        self.order_cache.pop(order.client_order_id, None)
+        return True
+
     def _on_window_end(self, event) -> None:
         raise NotImplementedError
 
@@ -143,6 +175,30 @@ class LifecycleHarness(WindowedPolymarketStrategy):
             }
         )
         return True
+
+    @property
+    def cache(self):
+        return SimpleNamespace(
+            order=lambda client_order_id: self.order_cache.get(client_order_id),
+        )
+
+
+class FakeWalletTruthProvider:
+    def __init__(self, *snapshots: WalletTruthSnapshot):
+        self._snapshots = list(snapshots)
+
+    def snapshot(self) -> WalletTruthSnapshot:
+        if len(self._snapshots) == 1:
+            return self._snapshots[0]
+        return self._snapshots.pop(0)
+
+
+class FakeOrderTruthProvider:
+    def __init__(self, statuses: dict[tuple[str | None, str | None], OrderTruthRecord]):
+        self._statuses = statuses
+
+    def order_status(self, *, client_order_id: str | None, venue_order_id: str | None) -> OrderTruthRecord:
+        return self._statuses[(client_order_id, venue_order_id)]
 
 
 def _strategy() -> LifecycleHarness:
@@ -293,6 +349,93 @@ class TestWindowedPolymarketStrategy:
 
         assert store.collateral_balance == pytest.approx(18.6)
         assert store.positions()["yes1"] == pytest.approx(3.0)
+
+    def test_fill_updates_attached_sandbox_order_store(self):
+        strategy = _strategy()
+        store = SandboxOrderStore()
+        strategy.set_sandbox_order_store(store)
+        order = DummyOrder(
+            "O-1",
+            status=OrderStatus.PARTIALLY_FILLED,
+            venue_order_id="V-1",
+            instrument_id=InstrumentId.from_str("cond1-yes1.POLYMARKET"),
+            filled_qty=5.0,
+            leaves_qty=3.0,
+        )
+        strategy.order_cache["O-1"] = order
+
+        strategy.on_order_filled(
+            SimpleNamespace(
+                client_order_id="O-1",
+                instrument_id=InstrumentId.from_str("cond1-yes1.POLYMARKET"),
+                order_side=OrderSide.BUY,
+                last_px="0.60",
+                last_qty="5",
+            )
+        )
+
+        provider = SandboxOrderTruthProvider(order_store=store)
+        truth = provider.order_status(client_order_id="O-1", venue_order_id="V-1")
+
+        assert truth.status is OrderTruthStatus.NOT_FOUND
+        assert truth.remaining_qty == pytest.approx(3.0)
+
+    def test_order_truth_cancels_open_stale_ioc_remainder(self):
+        strategy = _strategy()
+        order = DummyOrder(
+            "O-1",
+            status=OrderStatus.PARTIALLY_FILLED,
+            venue_order_id="V-1",
+            instrument_id=strategy._pm_instrument_id,
+            filled_qty=2.0,
+            leaves_qty=3.0,
+        )
+        strategy.orders_for_reconciliation = [order]
+        strategy.set_order_truth_provider(
+            FakeOrderTruthProvider({
+                ("O-1", "V-1"): OrderTruthRecord(
+                    client_order_id="O-1",
+                    venue_order_id="V-1",
+                    status=OrderTruthStatus.OPEN,
+                )
+            })
+        )
+
+        strategy._refresh_order_truth(log_initial=True)
+
+        assert strategy.canceled_orders == ["O-1"]
+        assert strategy.purged_order_ids == []
+
+    def test_order_truth_purges_terminal_stale_ioc_remainder_and_clears_tracking(self):
+        strategy = _strategy()
+        order = DummyOrder(
+            "O-1",
+            status=OrderStatus.PARTIALLY_FILLED,
+            venue_order_id="V-1",
+            instrument_id=strategy._pm_instrument_id,
+            filled_qty=2.0,
+            leaves_qty=3.0,
+        )
+        strategy.orders_for_reconciliation = [order]
+        strategy._entry_order_instruments["O-1"] = strategy._pm_instrument_id
+        strategy._entry_orders_by_id["O-1"] = order
+        strategy.set_order_truth_provider(
+            FakeOrderTruthProvider({
+                ("O-1", "V-1"): OrderTruthRecord(
+                    client_order_id="O-1",
+                    venue_order_id="V-1",
+                    status=OrderTruthStatus.NOT_FOUND,
+                )
+            })
+        )
+
+        strategy._refresh_order_truth(log_initial=True)
+
+        assert strategy.purged_order_ids == ["O-1"]
+        assert order.status == OrderStatus.CANCELED
+        assert order.is_closed is True
+        assert "O-1" not in strategy._entry_order_instruments
+        assert "O-1" not in strategy._entry_orders_by_id
 
     def test_refresh_wallet_truth_stores_snapshot(self):
         strategy = _strategy()
@@ -731,6 +874,44 @@ class TestWindowedPolymarketStrategy:
 
         strategy._refresh_wallet_truth()
 
+        assert callbacks == ["stop"]
+        assert strategy.stop_called is False
+
+    def test_process_stop_waits_for_stale_ioc_order_truth_reconciliation(self):
+        strategy = _strategy()
+        order = DummyOrder(
+            "O-1",
+            status=OrderStatus.PARTIALLY_FILLED,
+            venue_order_id="V-1",
+            instrument_id=strategy._pm_instrument_id,
+            filled_qty=2.0,
+            leaves_qty=3.0,
+        )
+        strategy.orders_for_reconciliation = [order]
+        strategy._entry_order_instruments["O-1"] = strategy._pm_instrument_id
+        strategy._entry_orders_by_id["O-1"] = order
+        callbacks = []
+        strategy.set_process_stop_callback(lambda: callbacks.append("stop"))
+        strategy.set_order_truth_provider(
+            FakeOrderTruthProvider({
+                ("O-1", "V-1"): OrderTruthRecord(
+                    client_order_id="O-1",
+                    venue_order_id="V-1",
+                    status=OrderTruthStatus.NOT_FOUND,
+                )
+            })
+        )
+
+        strategy.request_process_stop("test stop")
+
+        assert callbacks == []
+
+        strategy._refresh_order_truth()
+        strategy.orders_for_reconciliation = []
+        strategy._maybe_finalize_process_stop()
+
+        assert strategy.purged_order_ids == ["O-1"]
+        assert order.status == OrderStatus.CANCELED
         assert callbacks == ["stop"]
         assert strategy.stop_called is False
 

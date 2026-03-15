@@ -44,6 +44,7 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
         self._start_window_lifecycle()
         self._start_balance_guard()
         self._start_wallet_truth_polling()
+        self._start_order_truth_polling()
         self.log.info(
             f"Started | PM={self._pm_instrument_id} | "
             f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
@@ -54,6 +55,7 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
         )
 
     def on_stop(self):
+        self._stop_order_truth_polling()
         self._stop_wallet_truth_polling()
         self._stop_balance_guard()
         self._stop_window_lifecycle()

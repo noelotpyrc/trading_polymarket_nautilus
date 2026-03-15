@@ -16,7 +16,13 @@ Execution is routed through a Polymarket CLOB exec client (live) or a `SandboxEx
 live/
 ├── node.py                  # Shared infrastructure for live nodes
 ├── config.py                # TradingNodeConfig builders (live / sandbox)
+├── market_metadata.py       # Shared YES/NO token metadata registry
 ├── resolution.py            # Polymarket market-resolution polling helpers
+├── wallet_truth.py          # Production wallet-truth snapshot/provider
+├── sandbox_wallet.py        # Synthetic sandbox wallet state and provider
+├── resolution_worker.py     # External wallet-based resolution worker logic
+├── redemption.py            # Production redemption backend
+├── run_resolution.py        # External resolution worker CLI
 ├── soak.py                  # Sequential bounded soak runner with durable logs
 ├── profiles/
 │   └── catalog/             # Checked-in runner profile TOML files
@@ -46,6 +52,7 @@ Run scripts are the entry points. `node.py` exposes shared infrastructure that t
 | `python live/runs/profiles/btc_updown_15m_live_no.py` | Fixed live BTC momentum NO-outcome profile |
 | `python live/runs/profiles/btc_updown_15m_sandbox.py` | Fixed warmup sandbox profile |
 | `python live/runs/profiles/btc_updown_15m_sandbox_no.py` | Fixed warmup sandbox NO-outcome profile |
+| `python live/runs/profiles/random_signal_15m_resolution_sandbox.py` | Fixed deterministic residual-carry sandbox profile |
 | `python live/runs/profiles/random_signal_15m_sandbox.py` | Fixed fast sandbox profile |
 | `python live/runs/profiles/random_signal_15m_sandbox_no.py` | Fixed fast sandbox NO-outcome profile |
 | `python live/runs/btc_updown.py --slug-pattern btc-updown-15m --outcome-side yes` | BTC momentum, live orders |
@@ -61,9 +68,11 @@ Common flags:
 | `--run-secs N` | Auto-stop after N seconds for bounded sandbox/manual runs |
 | `--outcome-side {yes,no}` | Select the first or second Polymarket outcome token |
 | `--sandbox` | Simulated execution — no real orders |
+| `--sandbox-wallet-state-path PATH` | Share a synthetic wallet-state file with the external resolution worker |
+| `--sandbox-starting-usdc N` | Override the sandbox starting USDC.e balance |
 | `--binance-us` | Use Binance US endpoint (for US IPs) |
 
-Fixed per-profile entrypoints intentionally do not expose the full ad hoc flag surface. The checked-in TOML file is the source of truth for market/feed/risk settings, with `--run-secs` as the only supported runtime override.
+Fixed per-profile entrypoints intentionally keep the checked-in TOML file as the source of truth for market/feed/risk settings, while the generic profile runner handles bounded runtime and sandbox-balance overrides.
 
 ---
 
@@ -125,6 +134,17 @@ Both ad hoc runners and profile-driven runners use this path.
 ### `prepare_run(...)`
 
 Shared runner preflight. Validates mode-specific env vars, resolves windows, rejects duplicates/non-monotonic schedules, prints startup summary, and warns when the first window is close to expiry.
+
+### `prepare_run_metadata(...)`
+
+Shared preflight variant that returns rich window metadata, including:
+- condition id
+- YES token id
+- NO token id
+- selected outcome label
+- selected instrument id
+
+This metadata is now reused by both the trading node and the external resolution worker.
 
 ### `schedule_stop(stop_target, run_secs)`
 
@@ -237,6 +257,54 @@ If a process stop is requested while carried residuals still exist, final node s
 
 ---
 
+## External Resolution Worker
+
+Stage 8 introduces a separate wallet-based resolution flow outside the Nautilus node.
+
+### Components
+
+- `market_metadata.py`
+  - builds the allowlisted YES/NO token universe from preloaded windows
+- `wallet_truth.py`
+  - production wallet-truth snapshot/provider backed by Polymarket APIs
+- `sandbox_wallet.py`
+  - synthetic sandbox wallet state and matching wallet-truth provider
+- `resolution_worker.py`
+  - groups wallet-held positions by condition and settles resolved conditions
+- `redemption.py`
+  - production redemption backend, dry-run by default
+- `run_resolution.py`
+  - operator-facing CLI for one-shot or looped resolution scans
+
+### Flow
+
+1. The runner resolves window metadata and the node loads the selected Polymarket instruments.
+2. In sandbox mode, fills update a shared `wallet_state.json` through `SandboxWalletStore`.
+3. The node polls a wallet-truth provider on a timer, updates its account-state view from wallet truth, and reconciles carried residuals when wallet truth proves they were externally settled.
+4. The external resolution worker loads the same allowlisted metadata and reads wallet truth:
+   - sandbox: `SandboxWalletTruthProvider`
+   - live: `ProdWalletTruthProvider`
+5. For resolved conditions:
+   - sandbox executor applies synthetic settlement to `wallet_state.json`
+   - production executor either reports `ready_to_redeem` or submits `redeemPositions(...)`
+6. The next node wallet-truth poll sees the updated balance/held-token state.
+
+### Current Scope
+
+- implemented:
+  - shared metadata registry
+  - production wallet-truth provider
+  - sandbox wallet store + provider
+  - external worker CLI
+  - production redemption backend behind the worker interface
+  - node-side carried-residual reconciliation from wallet truth
+  - internal resolution downgraded to advisory-only status
+- not yet implemented:
+  - full Nautilus account-state reconciliation from externally redeemed balance
+  - end-to-end live redemption rehearsal
+
+---
+
 ## Config (`config.py`)
 
 | Builder | Credentials | Exec client |
@@ -258,12 +326,15 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
    - `python tests/live/explore_nautilus_ws.py --phase-secs 20`
 2. Run the fast bounded sandbox check:
    - `python live/runs/profiles/random_signal_15m_sandbox.py`
-3. Run the NO-outcome fast sandbox check when validating side selection:
+3. Run the deterministic residual-carry sandbox check when validating the external resolution worker:
+   - `python live/runs/profiles/random_signal_15m_resolution_sandbox.py`
+4. Run the NO-outcome fast sandbox check when validating side selection:
    - `python live/runs/profiles/random_signal_15m_sandbox_no.py`
-4. Run the slower warmup-based sandbox check:
+5. Run the slower warmup-based sandbox check:
    - `python live/runs/profiles/btc_updown_15m_sandbox.py`
-5. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
-6. Daily restart is acceptable even if the first window after restart is missed.
+6. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
+7. Daily restart is acceptable even if the first window after restart is missed.
+8. Low free collateral should block new entries, but should not stop the node while an open position, cleanup, or carried residual still exists.
 
 ### Soak Harness
 
@@ -283,10 +354,10 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 
 The live-process hardening roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next work after the current sandbox gate is:
 
-1. External settlement / redemption automation
-   - Purpose: handle post-resolution reconciliation outside Nautilus.
-   - Design: [docs/wallet_resolution_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/wallet_resolution_plan.md)
-   - Success: resolved residuals can be reconciled and redeemed by a separate process.
+1. PM order reconciliation
+   - Purpose: reconcile stale IOC remainders against real PM order truth.
+   - Design: [docs/order_reconciliation_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/order_reconciliation_plan.md)
+   - Success: stale IOC remainders are either canceled for real, externally proven dead, or escalated.
 2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability instead of startup correctness only.
    - Success: repeated rollovers and long runtimes finish cleanly.

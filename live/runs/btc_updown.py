@@ -15,15 +15,19 @@ load_dotenv()
 
 
 def run(args) -> None:
-    run_strategy(
-        "btc_updown",
-        slug_pattern=args.slug_pattern,
-        hours_ahead=args.hours_ahead,
-        outcome_side=args.outcome_side,
-        sandbox=args.sandbox,
-        binance_us=args.binance_us,
-        run_secs=args.run_secs,
-    )
+    kwargs = {
+        "slug_pattern": args.slug_pattern,
+        "hours_ahead": args.hours_ahead,
+        "outcome_side": args.outcome_side,
+        "sandbox": args.sandbox,
+        "binance_us": args.binance_us,
+        "run_secs": args.run_secs,
+        "sandbox_starting_usdc": args.sandbox_starting_usdc,
+    }
+    sandbox_wallet_state_path = getattr(args, "sandbox_wallet_state_path", None)
+    if sandbox_wallet_state_path is not None:
+        kwargs["sandbox_wallet_state_path"] = sandbox_wallet_state_path
+    run_strategy("btc_updown", **kwargs)
 
 
 def main(argv: list[str] | None = None) -> None:

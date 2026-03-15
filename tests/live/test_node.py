@@ -4,10 +4,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from live.market_metadata import ResolvedWindowMetadata
 from live.node import (
     _parse_interval_secs,
     build_node,
     prepare_run,
+    resolve_upcoming_window_metadata,
     resolve_upcoming_windows,
     schedule_stop,
 )
@@ -37,6 +39,19 @@ def _clear_env(monkeypatch):
         "WALLET_ADDRESS",
     ):
         monkeypatch.delenv(key, raising=False)
+
+
+def _window_metadata(condition_id: str, token_id: str, window_end_ns: int) -> ResolvedWindowMetadata:
+    return ResolvedWindowMetadata(
+        slug=f"window-{window_end_ns}",
+        condition_id=condition_id,
+        window_end_ns=window_end_ns,
+        yes_token_id=token_id,
+        no_token_id=f"{token_id}-no",
+        yes_outcome_label="Up",
+        no_outcome_label="Down",
+        selected_outcome_side="yes",
+    )
 
 
 class TestParseIntervalSecs:
@@ -167,6 +182,24 @@ class TestResolveUpcomingWindows:
 
         assert windows == []
 
+    @patch("live.node.requests.get")
+    def test_metadata_includes_both_outcome_tokens(self, mock_get):
+        mock_get.return_value = self._mock_response(
+            [self._make_market("cid", "yes-token", no_token_id="no-token", outcomes=["Up", "Down"])]
+        )
+
+        windows = resolve_upcoming_window_metadata("btc-updown-15m", hours_ahead=0, outcome_side="no")
+
+        assert len(windows) == 1
+        window = windows[0]
+        assert window.condition_id == "cid"
+        assert window.yes_token_id == "yes-token"
+        assert window.no_token_id == "no-token"
+        assert window.yes_outcome_label == "Up"
+        assert window.no_outcome_label == "Down"
+        assert window.selected_outcome_side == "no"
+        assert window.instrument_id == "cid-no-token.POLYMARKET"
+
 
 class TestPrepareRun:
     def test_rejects_missing_sandbox_env_vars(self, monkeypatch):
@@ -224,10 +257,10 @@ class TestPrepareRun:
     def test_rejects_duplicate_windows(self, monkeypatch):
         _set_sandbox_env(monkeypatch)
         monkeypatch.setattr(
-            "live.node.resolve_upcoming_windows",
+            "live.node.resolve_upcoming_window_metadata",
             lambda slug_pattern, hours_ahead, outcome_side: [
-                ("a.POLYMARKET", 1),
-                ("a.POLYMARKET", 2),
+                _window_metadata("cond-a", "token-a", 1),
+                _window_metadata("cond-a", "token-a", 2),
             ],
         )
 
@@ -244,10 +277,10 @@ class TestPrepareRun:
     def test_rejects_non_monotonic_windows(self, monkeypatch):
         _set_sandbox_env(monkeypatch)
         monkeypatch.setattr(
-            "live.node.resolve_upcoming_windows",
+            "live.node.resolve_upcoming_window_metadata",
             lambda slug_pattern, hours_ahead, outcome_side: [
-                ("a.POLYMARKET", 10),
-                ("b.POLYMARKET", 5),
+                _window_metadata("cond-a", "token-a", 10),
+                _window_metadata("cond-b", "token-b", 5),
             ],
         )
 
@@ -264,8 +297,19 @@ class TestPrepareRun:
     def test_warns_when_first_window_near_expiry(self, monkeypatch, capsys):
         _set_sandbox_env(monkeypatch)
         monkeypatch.setattr(
-            "live.node.resolve_upcoming_windows",
-            lambda slug_pattern, hours_ahead, outcome_side: [("a.POLYMARKET", 60_000_000_000)],
+            "live.node.resolve_upcoming_window_metadata",
+            lambda slug_pattern, hours_ahead, outcome_side: [
+                ResolvedWindowMetadata(
+                    slug="btc-updown-15m-1000",
+                    condition_id="cond-a",
+                    window_end_ns=60_000_000_000,
+                    yes_token_id="token-yes",
+                    no_token_id="token-no",
+                    yes_outcome_label="Up",
+                    no_outcome_label="Down",
+                    selected_outcome_side="no",
+                )
+            ],
         )
         monkeypatch.setattr("live.node.time.time_ns", lambda: 0)
 
@@ -279,7 +323,7 @@ class TestPrepareRun:
         )
 
         out = capsys.readouterr().out
-        assert windows == [("a.POLYMARKET", 60_000_000_000)]
+        assert windows == [("cond-a-token-no.POLYMARKET", 60_000_000_000)]
         assert "outcome=NO" in out
         assert "WARNING: First window ends in 60s" in out
         assert "Auto-stop after   : 180s" in out
@@ -358,6 +402,33 @@ class TestBuildNode:
         assert isinstance(node, FakeTradingNode)
         assert captured["config"].exec_engine.reconciliation is False
         assert captured["config"].exec_engine.convert_quote_qty_to_base is True
+        assert captured["config"].exec_clients["POLYMARKET"].starting_balances == ["500 USDC.e"]
+
+    def test_uses_custom_sandbox_starting_balance(self, monkeypatch):
+        _set_sandbox_env(monkeypatch)
+        captured = {}
+
+        class FakeTradingNode:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def add_data_client_factory(self, *args):
+                pass
+
+            def add_exec_client_factory(self, *args):
+                pass
+
+        monkeypatch.setattr("nautilus_trader.live.node.TradingNode", FakeTradingNode)
+
+        node = build_node(
+            ["foo.POLYMARKET"],
+            sandbox=True,
+            binance_us=False,
+            sandbox_starting_usdc=12.5,
+        )
+
+        assert isinstance(node, FakeTradingNode)
+        assert captured["config"].exec_clients["POLYMARKET"].starting_balances == ["12.5 USDC.e"]
 
     def test_preserves_quote_quantity_orders_for_live(self, monkeypatch):
         monkeypatch.setenv("PRIVATE_KEY", "pk")

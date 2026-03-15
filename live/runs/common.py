@@ -1,9 +1,13 @@
 """Shared launcher helpers for live strategy runners."""
 from dataclasses import dataclass
+import os
 
-from live.node import build_node, prepare_run, schedule_stop
+from live.market_metadata import WindowMetadataRegistry
+from live.node import build_node, prepare_run_metadata, schedule_stop
+from live.sandbox_wallet import SandboxWalletStore, SandboxWalletTruthProvider
 from live.strategies.btc_updown import BtcUpDownConfig, BtcUpDownStrategy
 from live.strategies.random_signal import RandomSignalConfig, RandomSignalStrategy
+from live.wallet_truth import ProdWalletTruthProvider, make_polymarket_balance_client
 
 
 @dataclass(frozen=True)
@@ -69,23 +73,40 @@ def run_strategy(
     binance_us: bool,
     run_secs: int | None,
     strategy_config: dict[str, object] | None = None,
+    sandbox_wallet_state_path: str | None = None,
+    sandbox_starting_usdc: float | None = None,
 ) -> None:
-    windows = prepare_run(
+    window_metadata = prepare_run_metadata(
         slug_pattern=slug_pattern,
         hours_ahead=hours_ahead,
         outcome_side=outcome_side,
         sandbox=sandbox,
         binance_us=binance_us,
         run_secs=run_secs,
+        sandbox_starting_usdc=sandbox_starting_usdc,
     )
+    windows = [(window.instrument_id, window.window_end_ns) for window in window_metadata]
     pm_ids = [window[0] for window in windows]
+    registry = WindowMetadataRegistry(window_metadata)
 
-    node = build_node(pm_ids, sandbox=sandbox, binance_us=binance_us)
+    node = build_node(
+        pm_ids,
+        sandbox=sandbox,
+        binance_us=binance_us,
+        sandbox_starting_usdc=sandbox_starting_usdc,
+    )
     strategy = build_strategy(
         strategy_name,
         windows=windows,
         outcome_side=outcome_side,
         strategy_config=strategy_config,
+    )
+    _attach_wallet_truth(
+        strategy,
+        registry=registry,
+        sandbox=sandbox,
+        sandbox_wallet_state_path=sandbox_wallet_state_path,
+        sandbox_starting_usdc=sandbox_starting_usdc,
     )
     strategy.set_process_stop_callback(node.stop)
     node.trader.add_strategy(strategy)
@@ -109,3 +130,36 @@ def _strategy_spec(strategy_name: str) -> StrategySpec:
     except KeyError as exc:
         known = ", ".join(strategy_names())
         raise ValueError(f"Unknown strategy {strategy_name!r}. Known: {known}") from exc
+
+
+def _attach_wallet_truth(
+    strategy,
+    *,
+    registry: WindowMetadataRegistry,
+    sandbox: bool,
+    sandbox_wallet_state_path: str | None,
+    sandbox_starting_usdc: float | None,
+) -> None:
+    if sandbox:
+        if sandbox_wallet_state_path is None:
+            return
+        wallet_address = os.environ["POLYMARKET_TEST_WALLET_ADDRESS"]
+        wallet_store = SandboxWalletStore(
+            wallet_address=wallet_address,
+            collateral_balance=0.0 if sandbox_starting_usdc is None else sandbox_starting_usdc,
+            state_path=sandbox_wallet_state_path,
+        )
+        strategy.set_sandbox_wallet_store(wallet_store)
+        strategy.set_wallet_truth_provider(
+            SandboxWalletTruthProvider(wallet_store=wallet_store, registry=registry)
+        )
+        return
+
+    balance_client, wallet_address = make_polymarket_balance_client(sandbox=False)
+    strategy.set_wallet_truth_provider(
+        ProdWalletTruthProvider(
+            wallet_address=wallet_address,
+            balance_client=balance_client,
+            registry=registry,
+        )
+    )

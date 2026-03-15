@@ -23,6 +23,39 @@ This plan does **not** introduce:
 - external open-order management
 - settlement logic inside the Nautilus strategy/runtime
 
+## First-Pass Implementation Status
+
+The repo now contains the first usable Stage 8 foundation:
+
+- `live/market_metadata.py`
+  - allowlisted YES/NO token registry from preloaded windows
+- `live/wallet_truth.py`
+  - wallet snapshot types
+  - production Polymarket-backed wallet-truth provider
+- `live/sandbox_wallet.py`
+  - file-backed synthetic sandbox wallet store
+  - sandbox wallet-truth provider
+- `live/resolution_worker.py`
+  - external worker core
+- `live/redemption.py`
+  - production redemption backend behind the worker interface
+- `live/run_resolution.py`
+  - operator-facing worker CLI
+
+What still remains after this first pass:
+
+- full live validation of node/account reconciliation from externally redeemed balance
+- multi-process sandbox validation with the node and worker sharing the same synthetic wallet state
+- live dry-run and live redemption rehearsals
+
+Runtime proof now completed in sandbox:
+
+- deterministic `random_signal_15m_resolution_sandbox` rerun demonstrated:
+  - forced residual carry
+  - advisory-only internal market-resolution logging
+  - external worker settlement
+  - node-side wallet-truth reconciliation before final shutdown
+
 ## Design Decisions
 
 ### 1. Preloaded window metadata defines the trading universe
@@ -74,7 +107,22 @@ This protects us against cases like:
 - multiple nodes sharing one wallet over time
 - residual positions that outlive a specific node process
 
-### 4. Sandbox needs a synthetic wallet store
+### 4. Internal node resolution is advisory only
+
+The trading node may still poll market-resolution status for visibility, but
+that signal is informational only. It must not be treated as authoritative
+settlement.
+
+Specifically, internal node resolution must not:
+
+- clear a carried residual
+- reconcile account state
+- unblock shutdown by itself
+
+Authoritative completion happens only after the external resolution path updates
+wallet truth and the node reconciles from that wallet truth.
+
+### 5. Sandbox needs a synthetic wallet store
 
 Production does not need a standalone wallet broadcaster module, but sandbox
 still needs a synthetic wallet-state implementation because there is no real
@@ -338,7 +386,7 @@ Success criteria:
 - partial fill creates carried residual
 - resolution worker sees held position in synthetic wallet
 - winning outcome credits synthetic collateral
-- node sees updated synthetic wallet truth
+- node sees updated synthetic wallet truth and reconciles the carried residual locally
 
 ### Production Read-Only Checks
 
@@ -351,6 +399,7 @@ Success criteria:
 - one small carried residual is redeemed by the external resolution worker
 - next wallet-truth poll reflects the updated balance
 - node remains consistent after the external balance change
+- internal node resolution logs may appear, but they must remain advisory-only and never substitute for wallet-truth reconciliation
 
 ## Deferred Work
 

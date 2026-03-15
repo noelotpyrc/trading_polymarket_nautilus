@@ -14,6 +14,7 @@ from nautilus_trader.test_kit.providers import TestInstrumentProvider
 from live.resolution import MarketResolution
 from live.strategies.btc_updown import BtcUpDownConfig, BtcUpDownStrategy
 from live.strategies.windowed import WindowedPolymarketStrategy
+from live.wallet_truth import WalletSettlement, WalletTruthSnapshot
 
 
 BTC = TestInstrumentProvider.btcusdt_perp_binance()
@@ -124,6 +125,7 @@ class GuardrailScenarioStrategy(WindowedPolymarketStrategy):
         self.open_positions = set()
         self.min_quantity_by_instrument = {}
         self.market_resolution_responses = {}
+        self.wallet_reconciliations = []
         self.stop_called = False
 
     def on_start(self):
@@ -215,6 +217,24 @@ class GuardrailScenarioStrategy(WindowedPolymarketStrategy):
 
     def stop(self):
         self.stop_called = True
+
+    def _wallet_token_id_for_instrument(self, instrument_id):
+        return "token-a"
+
+    def _instrument_for_wallet_token(self, token_id: str):
+        if token_id != "token-a":
+            return None
+        return InstrumentId.from_str("a.POLYMARKET")
+
+    def _reconcile_position_from_wallet_settlement(self, position, settlement) -> bool:
+        self.open_positions.discard(position.instrument_id)
+        self.wallet_reconciliations.append(
+            {
+                "instrument_id": position.instrument_id,
+                "settlement_token_id": None if settlement is None else settlement.token_id,
+            }
+        )
+        return True
 
 
 class WarmupScenarioHarness(BtcUpDownStrategy):
@@ -406,7 +426,7 @@ class TestGuardrailFaultInjectionE2E:
         assert strategy._resolution_pending_instruments == {instrument: "signal exit"}
         assert "RESOLUTION-CHECK:a.POLYMARKET" in strategy.guard_alerts
 
-    def test_process_stop_dispatches_after_carried_residual_resolves(self):
+    def test_process_stop_dispatches_after_carried_residual_settles_in_wallet_truth(self):
         strategy = GuardrailScenarioStrategy(ScenarioConfig(
             pm_instrument_ids=("a.POLYMARKET",),
             window_end_times_ns=(1_000_000_000,),
@@ -433,8 +453,36 @@ class TestGuardrailFaultInjectionE2E:
 
         strategy.trigger_guard("RESOLUTION-CHECK:a.POLYMARKET")
 
+        assert callbacks == []
+        assert strategy._resolution_pending_instruments == {instrument: "stop for daily restart"}
+
+        class FakeWalletTruthProvider:
+            def snapshot(self):
+                return WalletTruthSnapshot(
+                    wallet_address="0xabc",
+                    collateral_balance=12.0,
+                    positions=(),
+                    settlements=(
+                        WalletSettlement(
+                            token_id="token-a",
+                            position_size=5.0,
+                            settlement_price=1.0,
+                            collateral_credit=5.0,
+                        ),
+                    ),
+                )
+
+        strategy.set_wallet_truth_provider(FakeWalletTruthProvider())
+        strategy._refresh_wallet_truth()
+
         assert callbacks == ["stop"]
         assert strategy.stop_called is False
+        assert strategy.wallet_reconciliations == [
+            {
+                "instrument_id": instrument,
+                "settlement_token_id": "token-a",
+            }
+        ]
 
     def test_warmup_timeout_stops_from_startup_flow(self):
         strategy = WarmupScenarioHarness(

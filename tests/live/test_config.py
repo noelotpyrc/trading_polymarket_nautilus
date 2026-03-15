@@ -29,3 +29,8 @@ class TestSandboxExecConfig:
 
         assert config.base_currency == "USDC.e"
         assert config.starting_balances == ["500 USDC.e"]
+
+    def test_preserves_decimal_starting_balance(self):
+        config = sandbox_exec_config(starting_usdc=12.5)
+
+        assert config.starting_balances == ["12.5 USDC.e"]

@@ -1,0 +1,196 @@
+"""Tests for the external resolution worker CLI and wiring."""
+from types import SimpleNamespace
+
+import pytest
+
+from live.market_metadata import ResolvedWindowMetadata, WindowMetadataRegistry
+from live.profiles import RunnerProfile
+from live.resolution_worker import ResolutionScanResult
+from live import run_resolution
+
+
+def _profile(*, mode: str = "sandbox") -> RunnerProfile:
+    return RunnerProfile(
+        name=f"btc_updown_15m_{mode}",
+        strategy="btc_updown",
+        slug_pattern="btc-updown-15m",
+        hours_ahead=4,
+        mode=mode,
+        binance_feed="global",
+        outcome_side="yes",
+        run_secs=600 if mode == "sandbox" else None,
+    )
+
+
+def _metadata() -> list[ResolvedWindowMetadata]:
+    return [
+        ResolvedWindowMetadata(
+            slug="btc-updown-15m-1000",
+            condition_id="cond-1",
+            window_end_ns=1_000,
+            yes_token_id="yes-1",
+            no_token_id="no-1",
+            yes_outcome_label="Up",
+            no_outcome_label="Down",
+            selected_outcome_side="yes",
+        )
+    ]
+
+
+def test_main_lists_profiles(monkeypatch, capsys):
+    monkeypatch.setattr(run_resolution, "available_profile_names", lambda: ["one", "two"])
+
+    run_resolution.main(["--list"])
+
+    assert capsys.readouterr().out == "one\ntwo\n"
+
+
+def test_main_once_runs_single_scan(monkeypatch, capsys):
+    class FakeWorker:
+        def scan_once(self):
+            return [
+                ResolutionScanResult(
+                    condition_id="cond-1",
+                    instrument_id="cond-1-yes-1.POLYMARKET",
+                    token_id="yes-1",
+                    position_size=2.5,
+                    resolved=True,
+                    settlement_price=1.0,
+                    token_won=True,
+                    status="settled",
+                )
+            ]
+
+    monkeypatch.setattr(run_resolution, "load_profile", lambda name: _profile(mode="sandbox"))
+    monkeypatch.setattr(
+        run_resolution,
+        "resolve_upcoming_window_metadata",
+        lambda slug_pattern, **kwargs: _metadata(),
+    )
+    monkeypatch.setattr(run_resolution, "_build_worker", lambda **kwargs: FakeWorker())
+
+    run_resolution.main([
+        "btc_updown_15m_sandbox",
+        "--once",
+        "--sandbox-wallet-state-path",
+        "/tmp/wallet.json",
+    ])
+
+    assert "cond-1-yes-1.POLYMARKET size=2.500000 status=settled settled=1.00" in capsys.readouterr().out
+
+
+def test_build_worker_requires_sandbox_state_path():
+    registry = WindowMetadataRegistry(_metadata())
+
+    with pytest.raises(SystemExit, match="--sandbox-wallet-state-path is required"):
+        run_resolution._build_worker(
+            registry=registry,
+            sandbox=True,
+            sandbox_wallet_state_path=None,
+            sandbox_starting_usdc=None,
+            execute_redemptions=False,
+            rpc_url="http://localhost:8545",
+        )
+
+
+def test_build_worker_sandbox_seeds_wallet_store_with_starting_balance(monkeypatch):
+    registry = WindowMetadataRegistry(_metadata())
+    seen = {}
+
+    class FakeWalletStore:
+        def __init__(self, *, wallet_address, collateral_balance, state_path):
+            seen["wallet_address"] = wallet_address
+            seen["collateral_balance"] = collateral_balance
+            seen["state_path"] = state_path
+
+    monkeypatch.setenv("POLYMARKET_TEST_WALLET_ADDRESS", "0xtest")
+    monkeypatch.setattr(run_resolution, "SandboxWalletStore", FakeWalletStore)
+    monkeypatch.setattr(
+        run_resolution,
+        "SandboxWalletTruthProvider",
+        lambda wallet_store, registry: ("provider", wallet_store, registry),
+    )
+    monkeypatch.setattr(
+        run_resolution,
+        "SandboxResolutionExecutor",
+        lambda wallet_store: ("executor", wallet_store),
+    )
+    monkeypatch.setattr(
+        run_resolution,
+        "ResolutionWorker",
+        lambda registry, wallet_truth_provider, executor: ("worker", registry, wallet_truth_provider, executor),
+    )
+
+    worker = run_resolution._build_worker(
+        registry=registry,
+        sandbox=True,
+        sandbox_wallet_state_path="/tmp/wallet.json",
+        sandbox_starting_usdc=10.0,
+        execute_redemptions=False,
+        rpc_url="http://localhost:8545",
+    )
+
+    assert worker[0] == "worker"
+    assert seen == {
+        "wallet_address": "0xtest",
+        "collateral_balance": 10.0,
+        "state_path": "/tmp/wallet.json",
+    }
+
+
+def test_build_worker_live_uses_dry_run_until_execute_requested(monkeypatch):
+    registry = WindowMetadataRegistry(_metadata())
+    calls = {}
+    fake_provider = object()
+    fake_executor = object()
+    fake_worker = object()
+
+    monkeypatch.setattr(
+        run_resolution,
+        "make_polymarket_balance_client",
+        lambda sandbox: (SimpleNamespace(), "0x0000000000000000000000000000000000000001"),
+    )
+    monkeypatch.setenv("PRIVATE_KEY", "0x" + ("11" * 32))
+    monkeypatch.setattr(
+        run_resolution,
+        "ProdWalletTruthProvider",
+        lambda wallet_address, balance_client, registry: _capture_provider(
+            calls, fake_provider, wallet_address, balance_client, registry
+        ),
+    )
+
+    def fake_executor_ctor(**kwargs):
+        calls["executor"] = kwargs
+        return fake_executor
+
+    monkeypatch.setattr(run_resolution, "ProdRedemptionExecutor", fake_executor_ctor)
+    monkeypatch.setattr(
+        run_resolution,
+        "ResolutionWorker",
+        lambda registry, wallet_truth_provider, executor: _capture_worker(
+            calls, fake_worker, registry, wallet_truth_provider, executor
+        ),
+    )
+
+    worker = run_resolution._build_worker(
+        registry=registry,
+        sandbox=False,
+        sandbox_wallet_state_path=None,
+        sandbox_starting_usdc=None,
+        execute_redemptions=False,
+        rpc_url="http://localhost:8545",
+    )
+
+    assert calls["executor"]["dry_run"] is True
+    assert calls["executor"]["wallet_address"] == "0x0000000000000000000000000000000000000001"
+    assert worker is fake_worker
+
+
+def _capture_provider(calls, fake_provider, wallet_address, balance_client, registry):
+    calls["provider"] = (wallet_address, balance_client, registry)
+    return fake_provider
+
+
+def _capture_worker(calls, fake_worker, registry, wallet_truth_provider, executor):
+    calls["worker_args"] = (registry, wallet_truth_provider, executor)
+    return fake_worker

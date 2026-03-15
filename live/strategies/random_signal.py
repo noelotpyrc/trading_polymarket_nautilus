@@ -24,6 +24,8 @@ class RandomSignalConfig(StrategyConfig, frozen=True):
     entry_threshold: float = 0.5
     exit_threshold: float = 0.7
     trade_amount_usdc: float = 5.0
+    disable_signal_exit: bool = False
+    carry_window_end_position: bool = False
     outcome_side: str = "yes"
 
 
@@ -34,25 +36,33 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
         self._trade_amount = config.trade_amount_usdc
         self._entry_threshold = config.entry_threshold
         self._exit_threshold = config.exit_threshold
+        self._disable_signal_exit = config.disable_signal_exit
+        self._carry_window_end_position = config.carry_window_end_position
 
     def on_start(self):
         self.subscribe_bars(self._btc_bar_type)
         self._start_window_lifecycle()
+        self._start_balance_guard()
+        self._start_wallet_truth_polling()
         self.log.info(
             f"Started | PM={self._pm_instrument_id} | "
             f"window_end={_fmt_ns(self._window_end_ns)} UTC | "
             f"outcome={self._selected_outcome_label()} | "
-            f"entry_threshold={self._entry_threshold} | exit_threshold={self._exit_threshold}"
+            f"entry_threshold={self._entry_threshold} | exit_threshold={self._exit_threshold} | "
+            f"disable_signal_exit={self._disable_signal_exit} | "
+            f"carry_window_end_position={self._carry_window_end_position}"
         )
 
     def on_stop(self):
+        self._stop_wallet_truth_polling()
+        self._stop_balance_guard()
         self._stop_window_lifecycle()
         self.log.info(f"Stopped | total fills: {self._trade_count}")
 
     def on_bar(self, bar: Bar):
         value = random.random()
         quote_str = self._quote_state_str(bar.ts_event)
-        positions = self.cache.positions_open(instrument_id=self._pm_instrument_id)
+        positions = self._open_positions_for_instrument(self._pm_instrument_id)
         stale_reason = self._signal_bar_stale_reason(bar.ts_event)
 
         if stale_reason is not None:
@@ -63,6 +73,12 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
             return
 
         if positions and value > self._exit_threshold:
+            if self._disable_signal_exit:
+                self.log.info(
+                    f"BTC={bar.close} rand={value:.3f} > {self._exit_threshold} "
+                    f"→ EXIT skipped (disabled for sandbox resolution test) | {quote_str}"
+                )
+                return
             reason = self._exit_guard_reason(bar.ts_event)
             if reason is not None:
                 self.log.info(
@@ -105,6 +121,23 @@ class RandomSignalStrategy(WindowedPolymarketStrategy):
             )
 
     def _on_window_end(self, event) -> None:
+        if self._carry_window_end_position:
+            self.log.info(
+                f"Window ending ({_fmt_ns(self._window_end_ns)} UTC) — rolling over with forced residual carry"
+            )
+            self._cancel_pending_entry_order("window rollover")
+            if self._open_positions_for_instrument(self._pm_instrument_id):
+                self._carry_positions_to_resolution(
+                    self._pm_instrument_id,
+                    "window end (forced sandbox residual)",
+                )
+            self._advance_to_next_window(
+                exhausted_message=(
+                    "No more pre-loaded windows — stopping. "
+                    "Restart the node for the next session."
+                ),
+            )
+            return
         self._roll_to_next_window(
             exhausted_message=(
                 "No more pre-loaded windows — stopping. "

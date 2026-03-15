@@ -7,12 +7,16 @@ from nautilus_trader.adapters.polymarket.common.symbol import (
     get_polymarket_condition_id,
     get_polymarket_token_id,
 )
-from nautilus_trader.model.enums import OrderSide, TimeInForce
+from nautilus_trader.core.uuid import UUID4
+from nautilus_trader.model.enums import OrderSide, PositionAdjustmentType, TimeInForce
+from nautilus_trader.model.events.position import PositionAdjusted
 from nautilus_trader.model.identifiers import InstrumentId
-from nautilus_trader.model.objects import Quantity
+from nautilus_trader.model.objects import AccountBalance, Money, Quantity
 from nautilus_trader.trading.strategy import Strategy
 
 from live.resolution import fetch_market_resolution
+from live.sandbox_wallet import SandboxWalletStore
+from live.wallet_truth import WalletSettlement, WalletTruthProvider, WalletTruthSnapshot
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,9 @@ class WindowedPolymarketStrategy(Strategy):
     _POSITION_CLEANUP_RETRY_INTERVAL_NS = 5_000_000_000
     _POSITION_CLEANUP_TIMEOUT_NS = 60_000_000_000
     _RESOLUTION_POLL_INTERVAL_NS = 30_000_000_000
+    _WALLET_TRUTH_POLL_INTERVAL_NS = 30_000_000_000
+    _BALANCE_GUARD_INTERVAL_NS = 30_000_000_000
+    _ENTRY_FEE_BUFFER_RATE = 0.10
 
     def __init__(self, config):
         super().__init__(config)
@@ -71,6 +78,10 @@ class WindowedPolymarketStrategy(Strategy):
         self._resolution_timer_instruments: dict[str, InstrumentId] = {}
         self._resolution_pending_instruments: dict[InstrumentId, str] = {}
         self._resolution_settled_instruments: set[InstrumentId] = set()
+        self._sandbox_wallet_store: SandboxWalletStore | None = None
+        self._wallet_truth_provider: WalletTruthProvider | None = None
+        self._wallet_truth_snapshot: WalletTruthSnapshot | None = None
+        self._wallet_truth_seen_settlement_token_ids: set[str] = set()
         self._process_stop_callback: Callable[[], None] | None = None
         self._process_stop_requested = False
         self._process_stop_dispatched = False
@@ -80,6 +91,16 @@ class WindowedPolymarketStrategy(Strategy):
 
     def set_process_stop_callback(self, callback: Callable[[], None]) -> None:
         self._process_stop_callback = callback
+
+    def set_sandbox_wallet_store(self, wallet_store: SandboxWalletStore) -> None:
+        self._sandbox_wallet_store = wallet_store
+
+    def set_wallet_truth_provider(self, provider: WalletTruthProvider) -> None:
+        self._wallet_truth_provider = provider
+
+    @property
+    def wallet_truth_snapshot(self) -> WalletTruthSnapshot | None:
+        return self._wallet_truth_snapshot
 
     def request_process_stop(self, reason: str) -> None:
         if self._process_stop_requested:
@@ -105,11 +126,327 @@ class WindowedPolymarketStrategy(Strategy):
         self._cancel_all_resolution_tracking()
         self._close_positions_for_all_windows(reason="strategy stop", monitor_cleanup=False)
 
+    def _start_balance_guard(self) -> None:
+        self._check_operating_balance()
+        self.clock.set_timer_ns(
+            "balance_guard",
+            self._BALANCE_GUARD_INTERVAL_NS,
+            0,
+            0,
+            self._on_balance_guard_timer,
+        )
+
+    def _stop_balance_guard(self) -> None:
+        self._cancel_guard_timer("balance_guard")
+
     def _set_next_window_alert(self) -> None:
         self.clock.set_time_alert_ns(
             name=self._window_alert_name(),
             alert_time_ns=self._window_end_ns,
             callback=self._on_window_end,
+        )
+
+    def _start_wallet_truth_polling(self) -> None:
+        if self._wallet_truth_provider is None:
+            return
+
+        self._refresh_wallet_truth(log_initial=True)
+        self.clock.set_timer_ns(
+            "wallet_truth",
+            self._WALLET_TRUTH_POLL_INTERVAL_NS,
+            0,
+            0,
+            self._on_wallet_truth_timer,
+        )
+
+    def _stop_wallet_truth_polling(self) -> None:
+        if self._wallet_truth_provider is None:
+            return
+        self.clock.cancel_timer("wallet_truth")
+
+    def _on_wallet_truth_timer(self, event) -> None:
+        self._refresh_wallet_truth()
+
+    def _on_balance_guard_timer(self, event) -> None:
+        self._check_operating_balance()
+
+    def _refresh_wallet_truth(self, *, log_initial: bool = False) -> None:
+        if self._wallet_truth_provider is None:
+            return
+
+        snapshot = self._wallet_truth_provider.snapshot()
+        previous = self._wallet_truth_snapshot
+        self._wallet_truth_snapshot = snapshot
+        self._sync_account_balance_from_wallet_truth(snapshot)
+        self._reconcile_wallet_truth_settlements(snapshot)
+        self._reconcile_absent_carried_wallet_positions(snapshot)
+
+        if previous is None:
+            if log_initial:
+                self.log.info(
+                    f"Wallet truth initialized | collateral={snapshot.collateral_balance:.6f} "
+                    f"| positions={len(snapshot.positions)} "
+                    f"| settlements={len(snapshot.settlements)}"
+                )
+            return
+
+        if (
+            previous.collateral_balance != snapshot.collateral_balance
+            or previous.positions != snapshot.positions
+            or previous.settlements != snapshot.settlements
+        ):
+            self.log.info(
+                f"Wallet truth updated | collateral={snapshot.collateral_balance:.6f} "
+                f"| positions={len(snapshot.positions)} "
+                f"| settlements={len(snapshot.settlements)}"
+            )
+
+    def _portfolio_account_for_pm_venue(self):
+        portfolio = getattr(self, "portfolio", None)
+        if portfolio is None:
+            return None
+
+        try:
+            return portfolio.account(venue=self._pm_instrument_id.venue)
+        except Exception:
+            return None
+
+    def _sync_account_balance_from_wallet_truth(self, snapshot: WalletTruthSnapshot) -> None:
+        account = self._portfolio_account_for_pm_venue()
+        if account is None:
+            return
+
+        try:
+            current_balance = account.balance()
+        except Exception:
+            current_balance = None
+
+        if current_balance is None:
+            currency = getattr(account, "base_currency", None)
+            if currency is None:
+                return
+        else:
+            currency = current_balance.currency
+            if (
+                float(current_balance.total) == snapshot.collateral_balance
+                and float(current_balance.locked) == 0.0
+                and float(current_balance.free) == snapshot.collateral_balance
+            ):
+                return
+
+        balance = Money(snapshot.collateral_balance, currency)
+        account.update_balances(
+            [
+                AccountBalance(
+                    total=balance,
+                    locked=Money(0, currency),
+                    free=balance,
+                )
+            ]
+        )
+
+    def _reconcile_wallet_truth_settlements(self, snapshot: WalletTruthSnapshot) -> None:
+        for settlement in snapshot.settlements:
+            token_id = str(settlement.token_id)
+            if token_id in self._wallet_truth_seen_settlement_token_ids:
+                continue
+            if self._reconcile_wallet_settlement(settlement):
+                self._wallet_truth_seen_settlement_token_ids.add(token_id)
+
+    def _reconcile_absent_carried_wallet_positions(self, snapshot: WalletTruthSnapshot) -> None:
+        carried_instruments = (
+            set(self._resolution_pending_instruments) | self._resolution_settled_instruments
+        )
+        for instrument_id in list(carried_instruments):
+            token_id = self._wallet_token_id_for_instrument(instrument_id)
+            if token_id is None or snapshot.position_for_token(token_id) is not None:
+                continue
+            self._reconcile_carried_instrument_from_wallet_truth(instrument_id, settlement=None)
+
+    def _reconcile_wallet_settlement(self, settlement: WalletSettlement) -> bool:
+        instrument_id = self._instrument_for_wallet_token(settlement.token_id)
+        if instrument_id is None:
+            return True
+        return self._reconcile_carried_instrument_from_wallet_truth(
+            instrument_id,
+            settlement=settlement,
+        )
+
+    def _instrument_for_wallet_token(self, token_id: str) -> InstrumentId | None:
+        token_id = str(token_id)
+        for instrument_id_str, _ in self._windows:
+            instrument_id = InstrumentId.from_str(instrument_id_str)
+            try:
+                instrument_token_id = str(get_polymarket_token_id(instrument_id))
+            except Exception:
+                continue
+            if instrument_token_id == token_id:
+                return instrument_id
+        return None
+
+    def _wallet_token_id_for_instrument(self, instrument_id: InstrumentId) -> str | None:
+        try:
+            return str(get_polymarket_token_id(instrument_id))
+        except Exception:
+            return None
+
+    def _reconcile_carried_instrument_from_wallet_truth(
+        self,
+        instrument_id: InstrumentId,
+        *,
+        settlement: WalletSettlement | None,
+    ) -> bool:
+        is_carried = (
+            instrument_id in self._resolution_pending_instruments
+            or instrument_id in self._resolution_settled_instruments
+        )
+        positions = list(self._open_positions_for_instrument(instrument_id))
+        if not is_carried and not positions:
+            return True
+
+        if positions:
+            reconciled_count = 0
+            for position in positions:
+                if self._reconcile_position_from_wallet_settlement(position, settlement):
+                    reconciled_count += 1
+            if reconciled_count != len(positions):
+                self.log.error(
+                    f"Wallet truth could not reconcile all carried positions on {instrument_id} "
+                    f"({reconciled_count}/{len(positions)})"
+                )
+                return False
+        else:
+            reconciled_count = 0
+
+        self._cancel_position_cleanup(instrument_id)
+        self._cancel_resolution_tracking(instrument_id)
+        self._resolution_settled_instruments.discard(instrument_id)
+
+        if settlement is None:
+            self.log.warning(
+                f"Wallet truth no longer reports carried residual on {instrument_id} "
+                f"— reconciling local state"
+            )
+        else:
+            self.log.warning(
+                f"Wallet settlement reconciled carried residual on {instrument_id} "
+                f"(settlement={settlement.settlement_price:.2f}, "
+                f"credit={settlement.collateral_credit:.6f}, "
+                f"positions={reconciled_count})"
+            )
+
+        self._maybe_finalize_process_stop()
+        return True
+
+    def _reconcile_position_from_wallet_settlement(
+        self,
+        position,
+        settlement: WalletSettlement | None,
+    ) -> bool:
+        signed_qty = float(getattr(position, "signed_qty", float(position.quantity)))
+        if signed_qty == 0.0:
+            return True
+
+        adjustment = PositionAdjusted(
+            trader_id=position.trader_id,
+            strategy_id=position.strategy_id,
+            instrument_id=position.instrument_id,
+            position_id=position.id,
+            account_id=position.account_id,
+            adjustment_type=PositionAdjustmentType.FUNDING,
+            quantity_change=-signed_qty,
+            pnl_change=None,
+            reason=(
+                "wallet settlement reconciliation"
+                if settlement is None
+                else f"wallet settlement reconciliation ({settlement.token_id})"
+            ),
+            event_id=UUID4(),
+            ts_event=self._now_ns(),
+            ts_init=self._now_ns(),
+        )
+        position.apply_adjustment(adjustment)
+        self.cache.update_position(position)
+        self.cache.purge_position(position.id)
+        return True
+
+    def _minimum_operating_balance(self) -> float | None:
+        trade_amount = getattr(self, "_trade_amount", None)
+        if trade_amount is None:
+            return None
+
+        trade_amount = float(trade_amount)
+        if trade_amount <= 0:
+            return None
+        return trade_amount + self._entry_fee_buffer(trade_amount)
+
+    def _entry_fee_buffer(self, trade_amount: float) -> float:
+        return max(0.0, trade_amount * self._ENTRY_FEE_BUFFER_RATE)
+
+    def _free_collateral_balance(self) -> float | None:
+        account = self._portfolio_account_for_pm_venue()
+        if account is None:
+            return None
+
+        try:
+            balance = account.balance_free()
+        except Exception:
+            return None
+
+        if balance is None:
+            return None
+
+        return float(balance)
+
+    def _operating_balance_shortfall_reason(self) -> str | None:
+        minimum_balance = self._minimum_operating_balance()
+        if minimum_balance is None:
+            return None
+
+        free_balance = self._free_collateral_balance()
+        if free_balance is None:
+            return None
+
+        if free_balance + 1e-9 >= minimum_balance:
+            return None
+
+        return f"Free collateral {free_balance:.6f} below required entry cash {minimum_balance:.6f}"
+
+    def _has_any_open_positions(self) -> bool:
+        seen: set[InstrumentId] = set()
+        for instrument_id_str, _ in self._windows:
+            instrument_id = InstrumentId.from_str(instrument_id_str)
+            if instrument_id in seen:
+                continue
+            seen.add(instrument_id)
+            if self._has_open_position_on_instrument(instrument_id):
+                return True
+        return False
+
+    def _is_idle_for_low_balance_stop(self) -> bool:
+        if self._entry_order_pending:
+            return False
+        if self._position_cleanup_states:
+            return False
+        if self._resolution_pending_instruments:
+            return False
+        if self._has_any_open_positions():
+            return False
+        return True
+
+    def _check_operating_balance(self) -> None:
+        if self._process_stop_requested or self._process_stop_dispatched:
+            return
+
+        shortfall_reason = self._operating_balance_shortfall_reason()
+        if shortfall_reason is None:
+            return
+
+        if not self._is_idle_for_low_balance_stop():
+            return
+
+        self.request_process_stop(
+            f"{shortfall_reason} — stopping"
         )
 
     def on_quote_tick(self, tick) -> None:
@@ -125,6 +462,9 @@ class WindowedPolymarketStrategy(Strategy):
             self._pm_mid_ts_ns = tick.ts_event
 
     def _entry_guard_reason(self, signal_ts_ns: int) -> str | None:
+        balance_reason = self._operating_balance_shortfall_reason()
+        if balance_reason is not None:
+            return balance_reason
         if self._entry_order_pending:
             return "entry order still pending"
         return self._quote_guard_reason(signal_ts_ns, require_side="ask")
@@ -492,6 +832,12 @@ class WindowedPolymarketStrategy(Strategy):
             self._cancel_guard_timer(timer_name)
         self._resolution_pending_instruments.pop(instrument_id, None)
 
+    def _cancel_resolution_polling(self, instrument_id: InstrumentId) -> None:
+        timer_name = self._resolution_timer_names.pop(instrument_id, None)
+        if timer_name is not None:
+            self._resolution_timer_instruments.pop(timer_name, None)
+            self._cancel_guard_timer(timer_name)
+
     def _cancel_all_resolution_tracking(self) -> None:
         for instrument_id in list(self._resolution_timer_names):
             self._cancel_resolution_tracking(instrument_id)
@@ -542,13 +888,11 @@ class WindowedPolymarketStrategy(Strategy):
         winner_label = resolution.winning_outcome or "unknown"
         token_label = resolution.target_token_outcome or self._selected_outcome_label()
         self.log.warning(
-            f"Resolved residual on {instrument_id}: {token_label} {result_label} "
+            f"Market resolved for carried residual on {instrument_id}: {token_label} {result_label} "
             f"(winner={winner_label}, settlement={settlement_value}). "
-            "Manual redemption is not automated."
+            "Awaiting external wallet settlement reconciliation."
         )
-        self._cancel_resolution_tracking(instrument_id)
-        self._resolution_settled_instruments.add(instrument_id)
-        self._maybe_finalize_process_stop()
+        self._cancel_resolution_polling(instrument_id)
 
     def _on_resolution_check(self, event) -> None:
         instrument_id = self._resolution_timer_instruments.get(self._guard_event_name(event))
@@ -647,8 +991,6 @@ class WindowedPolymarketStrategy(Strategy):
 
         for instrument_id_str, _ in self._windows:
             instrument_id = InstrumentId.from_str(instrument_id_str)
-            if instrument_id in self._resolution_settled_instruments:
-                continue
             if self._has_open_position_on_instrument(instrument_id):
                 return
 
@@ -667,16 +1009,7 @@ class WindowedPolymarketStrategy(Strategy):
         else:
             self.stop()
 
-    def _roll_to_next_window(self, exhausted_message: str) -> None:
-        self.log.info(f"Window ending ({_fmt_ns(self._window_end_ns)} UTC) — rolling over")
-
-        self._cancel_pending_entry_order("window rollover")
-        self._close_positions_for_instrument(
-            self._pm_instrument_id,
-            reason="window end",
-            allow_resolution_carry=True,
-        )
-
+    def _advance_to_next_window(self, exhausted_message: str) -> None:
         old_instrument_id = self._pm_instrument_id
 
         self._window_idx += 1
@@ -704,6 +1037,17 @@ class WindowedPolymarketStrategy(Strategy):
             f"ends {_fmt_ns(self._window_end_ns)} UTC | "
             f"{remaining} window(s) remaining"
         )
+
+    def _roll_to_next_window(self, exhausted_message: str) -> None:
+        self.log.info(f"Window ending ({_fmt_ns(self._window_end_ns)} UTC) — rolling over")
+
+        self._cancel_pending_entry_order("window rollover")
+        self._close_positions_for_instrument(
+            self._pm_instrument_id,
+            reason="window end",
+            allow_resolution_carry=True,
+        )
+        self._advance_to_next_window(exhausted_message)
 
     def _clear_active_entry_order(self, client_order_id) -> None:
         if client_order_id != self._entry_order_client_id:
@@ -750,6 +1094,7 @@ class WindowedPolymarketStrategy(Strategy):
         )
 
     def on_order_filled(self, event) -> None:
+        self._record_fill_in_sandbox_wallet(event)
         tracked_instrument_id = self._entry_order_instruments.get(event.client_order_id)
         is_late_fill = (
             tracked_instrument_id is not None
@@ -779,6 +1124,24 @@ class WindowedPolymarketStrategy(Strategy):
 
         self._trade_count += 1
         self.log.info(f"Fill #{self._trade_count}: price={event.last_px} qty={event.last_qty}")
+
+    def _record_fill_in_sandbox_wallet(self, event) -> None:
+        if self._sandbox_wallet_store is None:
+            return
+
+        quantity = float(event.last_qty)
+        if event.order_side == OrderSide.BUY:
+            delta_size = quantity
+        elif event.order_side == OrderSide.SELL:
+            delta_size = -quantity
+        else:
+            return
+
+        self._sandbox_wallet_store.apply_trade(
+            token_id=str(get_polymarket_token_id(event.instrument_id)),
+            delta_size=delta_size,
+            price=float(event.last_px),
+        )
 
     def on_position_closed(self, event) -> None:
         self._cancel_tracked_entry_orders_for_instrument(

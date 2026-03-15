@@ -28,6 +28,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if not args.profiles:
         parser.error("at least one profile is required unless --list is used")
+    if args.with_resolution_worker and args.resolution_interval_secs <= 0:
+        parser.error("--resolution-interval-secs must be positive")
 
     try:
         batch = run_soak_batch(
@@ -39,6 +41,10 @@ def main(argv: list[str] | None = None) -> None:
             keep_going=args.keep_going,
             allow_live=args.allow_live,
             allow_unbounded=args.allow_unbounded,
+            sandbox_wallet_state_path=args.sandbox_wallet_state_path,
+            sandbox_starting_usdc=args.sandbox_starting_usdc,
+            with_resolution_worker=args.with_resolution_worker,
+            resolution_interval_secs=args.resolution_interval_secs,
         )
     except (ProfileError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -58,6 +64,10 @@ def run_soak_batch(
     keep_going: bool,
     allow_live: bool,
     allow_unbounded: bool,
+    sandbox_wallet_state_path: str | None = None,
+    sandbox_starting_usdc: float | None = None,
+    with_resolution_worker: bool = False,
+    resolution_interval_secs: int = 30,
 ) -> dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
     batch_dir = _make_batch_dir(output_root, label=label)
@@ -81,9 +91,13 @@ def run_soak_batch(
             profile_ref=profile_ref,
             profile=profile,
             batch_dir=batch_dir,
+            sandbox_wallet_state_path=sandbox_wallet_state_path,
+            sandbox_starting_usdc=sandbox_starting_usdc,
+            with_resolution_worker=with_resolution_worker,
+            resolution_interval_secs=resolution_interval_secs,
         )
         results.append(result)
-        if result["exit_code"] != 0:
+        if result["status"] != "passed":
             status = "failed"
             if not keep_going:
                 break
@@ -98,6 +112,9 @@ def run_soak_batch(
         "profile_count": len(results),
         "hours_ahead_override": hours_ahead,
         "run_secs_override": run_secs,
+        "sandbox_starting_usdc_override": sandbox_starting_usdc,
+        "with_resolution_worker": with_resolution_worker,
+        "resolution_interval_secs": resolution_interval_secs if with_resolution_worker else None,
         "results": results,
     }
     _write_json(batch_dir / "summary.json", batch_summary)
@@ -122,6 +139,14 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="Allow live profiles. Default is sandbox-only for soak safety.")
     parser.add_argument("--allow-unbounded", action="store_true",
                         help="Allow profiles with no effective runtime bound.")
+    parser.add_argument("--sandbox-wallet-state-path", default=None,
+                        help="Optional shared sandbox wallet-state JSON file. Defaults to a per-run file.")
+    parser.add_argument("--sandbox-starting-usdc", type=float, default=None,
+                        help="Override sandbox starting USDC.e balance for simulated execution.")
+    parser.add_argument("--with-resolution-worker", action="store_true",
+                        help="Also run the external resolution worker against the shared sandbox wallet state.")
+    parser.add_argument("--resolution-interval-secs", type=int, default=30,
+                        help="Polling interval for the companion resolution worker (default: 30)")
     return parser
 
 
@@ -158,9 +183,15 @@ def _run_profile(
     profile_ref: str,
     profile: RunnerProfile,
     batch_dir: Path,
+    sandbox_wallet_state_path: str | None,
+    sandbox_starting_usdc: float | None,
+    with_resolution_worker: bool,
+    resolution_interval_secs: int,
 ) -> dict[str, object]:
     run_dir = batch_dir / f"{index:02d}_{_safe_name(profile.name)}"
     run_dir.mkdir(parents=True, exist_ok=False)
+    if with_resolution_worker and not profile.sandbox:
+        raise ProfileError("Resolution worker mode only supports sandbox profiles")
 
     command = [
         sys.executable,
@@ -170,9 +201,29 @@ def _run_profile(
     command.extend(["--hours-ahead", str(profile.hours_ahead)])
     if profile.run_secs is not None:
         command.extend(["--run-secs", str(profile.run_secs)])
+    effective_sandbox_starting_usdc = (
+        profile.sandbox_starting_usdc
+        if sandbox_starting_usdc is None
+        else sandbox_starting_usdc
+    )
+    if effective_sandbox_starting_usdc is not None:
+        command.extend(["--sandbox-starting-usdc", str(effective_sandbox_starting_usdc)])
+    wallet_state_path: Path | None = None
+    if profile.sandbox:
+        wallet_state_path = (
+            Path(sandbox_wallet_state_path)
+            if sandbox_wallet_state_path is not None
+            else run_dir / "wallet_state.json"
+        )
+        command.extend(["--sandbox-wallet-state-path", str(wallet_state_path)])
 
     started_at = _utc_now()
     log_path = run_dir / "runner.log"
+    worker_log_path: Path | None = None
+    worker_command: list[str] | None = None
+    worker_process: subprocess.Popen[str] | None = None
+    worker_exit_code: int | None = None
+    worker_terminated = False
 
     _write_json(run_dir / "profile.json", profile.to_dict())
     (run_dir / "command.txt").write_text(" ".join(command) + "\n", encoding="utf-8")
@@ -182,20 +233,65 @@ def _run_profile(
         handle.write(f"# started_at={started_at.isoformat()}\n")
         handle.write(f"# command={' '.join(command)}\n\n")
         handle.flush()
-        completed = subprocess.run(
-            command,
-            cwd=PROJECT_ROOT,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
+        worker_handle = None
+        try:
+            if with_resolution_worker:
+                assert wallet_state_path is not None
+                worker_log_path = run_dir / "worker.log"
+                worker_command = [
+                    sys.executable,
+                    str(PROJECT_ROOT / "live" / "run_resolution.py"),
+                    _command_profile_ref(profile_ref, fallback_name=profile.name),
+                    "--hours-ahead",
+                    str(profile.hours_ahead),
+                    "--sandbox-wallet-state-path",
+                    str(wallet_state_path),
+                    "--interval-secs",
+                    str(resolution_interval_secs),
+                ]
+                if effective_sandbox_starting_usdc is not None:
+                    worker_command.extend(
+                        ["--sandbox-starting-usdc", str(effective_sandbox_starting_usdc)]
+                    )
+                (run_dir / "worker_command.txt").write_text(
+                    " ".join(worker_command) + "\n",
+                    encoding="utf-8",
+                )
+                worker_handle = worker_log_path.open("w", encoding="utf-8")
+                worker_handle.write(f"# profile={profile.name}\n")
+                worker_handle.write(f"# started_at={started_at.isoformat()}\n")
+                worker_handle.write(f"# command={' '.join(worker_command)}\n\n")
+                worker_handle.flush()
+                worker_process = subprocess.Popen(
+                    worker_command,
+                    cwd=PROJECT_ROOT,
+                    stdout=worker_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+
+            completed = subprocess.run(
+                command,
+                cwd=PROJECT_ROOT,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        finally:
+            if worker_process is not None:
+                worker_exit_code, worker_terminated = _stop_worker(worker_process)
+            if worker_handle is not None:
+                worker_handle.close()
 
     finished_at = _utc_now()
+    status = "passed" if completed.returncode == 0 else "failed"
+    if worker_process is not None and not worker_terminated and worker_exit_code not in {0, None}:
+        status = "failed"
     result = {
         "profile_name": profile.name,
         "profile_ref": profile_ref,
-        "status": "passed" if completed.returncode == 0 else "failed",
+        "status": status,
         "started_at": started_at.isoformat(),
         "finished_at": finished_at.isoformat(),
         "duration_secs": round((finished_at - started_at).total_seconds(), 3),
@@ -203,12 +299,33 @@ def _run_profile(
         "hours_ahead": profile.hours_ahead,
         "run_secs": profile.run_secs,
         "sandbox": profile.sandbox,
+        "sandbox_starting_usdc": effective_sandbox_starting_usdc,
+        "wallet_state_path": None if wallet_state_path is None else str(wallet_state_path),
         "run_dir": str(run_dir),
         "log_path": str(log_path),
         "command": command,
+        "resolution_worker": with_resolution_worker,
+        "worker_log_path": None if worker_log_path is None else str(worker_log_path),
+        "worker_command": worker_command,
+        "worker_exit_code": worker_exit_code,
+        "worker_terminated_by_harness": worker_terminated,
     }
     _write_json(run_dir / "summary.json", result)
     return result
+
+
+def _stop_worker(process: subprocess.Popen[str]) -> tuple[int | None, bool]:
+    exit_code = process.poll()
+    if exit_code is not None:
+        return exit_code, False
+
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+    return process.returncode, True
 
 
 def _command_profile_ref(profile_ref: str, *, fallback_name: str) -> str:
@@ -243,9 +360,12 @@ def _print_batch_summary(batch: dict[str, object]) -> None:
     print(f"Soak batch: {batch['status']}")
     print(f"Artifacts : {batch['batch_dir']}")
     for result in batch["results"]:
+        worker_suffix = ""
+        if result.get("resolution_worker"):
+            worker_suffix = f", worker={result['worker_log_path']}"
         print(
             f"  - {result['profile_name']}: {result['status']} "
-            f"(exit={result['exit_code']}, log={result['log_path']})"
+            f"(exit={result['exit_code']}, log={result['log_path']}{worker_suffix})"
         )
 
 

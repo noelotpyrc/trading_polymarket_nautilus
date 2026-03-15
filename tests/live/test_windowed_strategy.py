@@ -8,6 +8,8 @@ from nautilus_trader.model.enums import OrderSide, TimeInForce
 from nautilus_trader.model.identifiers import InstrumentId
 
 from live.resolution import MarketResolution
+from live.sandbox_wallet import SandboxWalletStore
+from live.wallet_truth import WalletSettlement, WalletTokenPosition, WalletTruthSnapshot
 from live.strategies.windowed import WindowedPolymarketStrategy
 
 
@@ -51,6 +53,8 @@ class LifecycleHarness(WindowedPolymarketStrategy):
         self.stop_called = False
         self.submitted_orders = []
         self.entry_order_kwargs = None
+        self.wallet_balance_syncs = []
+        self.wallet_reconciliations = []
 
     def cancel_order(self, order, *args, **kwargs):
         self.canceled_orders.append(order.client_order_id)
@@ -124,11 +128,36 @@ class LifecycleHarness(WindowedPolymarketStrategy):
     def _on_window_end(self, event) -> None:
         raise NotImplementedError
 
+    def _sync_account_balance_from_wallet_truth(self, snapshot: WalletTruthSnapshot) -> None:
+        self.wallet_balance_syncs.append(snapshot.collateral_balance)
+
+    def _reconcile_position_from_wallet_settlement(self, position, settlement) -> bool:
+        positions = self.positions_by_instrument.get(position.instrument_id, [])
+        self.positions_by_instrument[position.instrument_id] = [
+            candidate for candidate in positions if candidate is not position
+        ]
+        self.wallet_reconciliations.append(
+            {
+                "instrument_id": position.instrument_id,
+                "settlement_token_id": None if settlement is None else settlement.token_id,
+            }
+        )
+        return True
+
 
 def _strategy() -> LifecycleHarness:
     return LifecycleHarness(
         HarnessConfig(
             pm_instrument_ids=("a.POLYMARKET", "b.POLYMARKET"),
+            window_end_times_ns=(1_000, 2_000),
+        )
+    )
+
+
+def _wallet_strategy() -> LifecycleHarness:
+    return LifecycleHarness(
+        HarnessConfig(
+            pm_instrument_ids=("conda-tokena.POLYMARKET", "condb-tokenb.POLYMARKET"),
             window_end_times_ns=(1_000, 2_000),
         )
     )
@@ -171,6 +200,34 @@ class TestWindowedPolymarketStrategy:
 
         assert reason == "PM ask unavailable"
 
+    def test_entry_guard_rejects_when_free_collateral_below_trade_amount_plus_fee_buffer(self):
+        strategy = _strategy()
+        strategy._trade_amount = 5.0
+        strategy._free_collateral_balance = lambda: 5.0
+        strategy._pm_mid_ts_ns = 0
+        strategy._pm_bid = 0.51
+        strategy._pm_bid_size = 100.0
+        strategy._pm_ask = 0.52
+        strategy._pm_ask_size = 100.0
+
+        reason = strategy._entry_guard_reason(30_000_000_000)
+
+        assert reason == "Free collateral 5.000000 below required entry cash 5.500000"
+
+    def test_entry_guard_allows_when_free_collateral_covers_trade_amount_plus_fee_buffer(self):
+        strategy = _strategy()
+        strategy._trade_amount = 5.0
+        strategy._free_collateral_balance = lambda: 5.5
+        strategy._pm_mid_ts_ns = 0
+        strategy._pm_bid = 0.51
+        strategy._pm_bid_size = 100.0
+        strategy._pm_ask = 0.52
+        strategy._pm_ask_size = 100.0
+
+        reason = strategy._entry_guard_reason(30_000_000_000)
+
+        assert reason is None
+
     def test_exit_guard_rejects_quote_without_bid_liquidity(self):
         strategy = _strategy()
         strategy._pm_mid_ts_ns = 0
@@ -209,6 +266,131 @@ class TestWindowedPolymarketStrategy:
         assert strategy._entry_order_pending is False
         assert strategy._entry_order_client_id is None
         assert strategy._entry_guard_reason(30_000_000_000) is None
+
+    def test_fill_updates_attached_sandbox_wallet_store(self):
+        strategy = _strategy()
+        store = SandboxWalletStore(wallet_address="sandbox", collateral_balance=20.0)
+        strategy.set_sandbox_wallet_store(store)
+
+        strategy.on_order_filled(
+            SimpleNamespace(
+                client_order_id="O-1",
+                instrument_id=InstrumentId.from_str("cond1-yes1.POLYMARKET"),
+                order_side=OrderSide.BUY,
+                last_px="0.60",
+                last_qty="5",
+            )
+        )
+        strategy.on_order_filled(
+            SimpleNamespace(
+                client_order_id="O-2",
+                instrument_id=InstrumentId.from_str("cond1-yes1.POLYMARKET"),
+                order_side=OrderSide.SELL,
+                last_px="0.80",
+                last_qty="2",
+            )
+        )
+
+        assert store.collateral_balance == pytest.approx(18.6)
+        assert store.positions()["yes1"] == pytest.approx(3.0)
+
+    def test_refresh_wallet_truth_stores_snapshot(self):
+        strategy = _strategy()
+
+        class FakeWalletTruthProvider:
+            def snapshot(self):
+                return WalletTruthSnapshot(
+                    wallet_address="0xabc",
+                    collateral_balance=12.5,
+                    positions=(
+                        WalletTokenPosition(
+                            condition_id="cond1",
+                            token_id="yes1",
+                            instrument_id="cond1-yes1.POLYMARKET",
+                            outcome_side="yes",
+                            outcome_label="Up",
+                            size=2.0,
+                            redeemable=False,
+                            mergeable=False,
+                            window_slug="slug-1",
+                            window_end_ns=1_000,
+                        ),
+                    ),
+                    settlements=(),
+                )
+
+        strategy.set_wallet_truth_provider(FakeWalletTruthProvider())
+
+        strategy._refresh_wallet_truth(log_initial=True)
+
+        assert strategy.wallet_truth_snapshot.collateral_balance == 12.5
+        assert strategy.wallet_truth_snapshot.positions[0].token_id == "yes1"
+        assert strategy.wallet_balance_syncs == [12.5]
+
+    def test_wallet_truth_absent_carried_position_reconciles_local_state(self):
+        strategy = _wallet_strategy()
+        instrument = InstrumentId.from_str("conda-tokena.POLYMARKET")
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 2.0)]
+        strategy._resolution_pending_instruments[instrument] = "window end"
+
+        class FakeWalletTruthProvider:
+            def snapshot(self):
+                return WalletTruthSnapshot(
+                    wallet_address="0xabc",
+                    collateral_balance=8.0,
+                    positions=(),
+                    settlements=(),
+                )
+
+        strategy.set_wallet_truth_provider(FakeWalletTruthProvider())
+
+        strategy._refresh_wallet_truth(log_initial=True)
+
+        assert strategy.positions_by_instrument[instrument] == []
+        assert strategy._resolution_pending_instruments == {}
+        assert instrument not in strategy._resolution_settled_instruments
+        assert strategy.wallet_reconciliations == [
+            {
+                "instrument_id": instrument,
+                "settlement_token_id": None,
+            }
+        ]
+
+    def test_wallet_truth_settlement_reconciles_settled_residual(self):
+        strategy = _wallet_strategy()
+        instrument = InstrumentId.from_str("conda-tokena.POLYMARKET")
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 2.0)]
+        strategy._resolution_settled_instruments.add(instrument)
+
+        class FakeWalletTruthProvider:
+            def snapshot(self):
+                return WalletTruthSnapshot(
+                    wallet_address="0xabc",
+                    collateral_balance=11.0,
+                    positions=(),
+                    settlements=(
+                        WalletSettlement(
+                            token_id="tokena",
+                            position_size=2.0,
+                            settlement_price=1.0,
+                            collateral_credit=2.0,
+                        ),
+                    ),
+                )
+
+        strategy.set_wallet_truth_provider(FakeWalletTruthProvider())
+
+        strategy._refresh_wallet_truth(log_initial=True)
+        strategy._refresh_wallet_truth()
+
+        assert strategy.positions_by_instrument[instrument] == []
+        assert strategy._resolution_settled_instruments == set()
+        assert strategy.wallet_reconciliations == [
+            {
+                "instrument_id": instrument,
+                "settlement_token_id": "tokena",
+            }
+        ]
 
     @pytest.mark.parametrize(
         "handler_name,event",
@@ -483,11 +665,11 @@ class TestWindowedPolymarketStrategy:
 
         strategy.trigger_guard("RESOLUTION-CHECK:a.POLYMARKET")
 
-        assert instrument not in strategy._resolution_pending_instruments
-        assert instrument in strategy._resolution_settled_instruments
+        assert strategy._resolution_pending_instruments == {instrument: "window end"}
+        assert instrument not in strategy._resolution_settled_instruments
         assert "RESOLUTION-CHECK:a.POLYMARKET" not in strategy.guard_alerts
 
-    def test_process_stop_waits_for_resolution_carried_residual_then_dispatches(self):
+    def test_process_stop_does_not_dispatch_on_internal_resolution_only(self):
         strategy = _strategy()
         instrument = InstrumentId.from_str("a.POLYMARKET")
         strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 0.4)]
@@ -511,5 +693,72 @@ class TestWindowedPolymarketStrategy:
 
         strategy.trigger_guard("RESOLUTION-CHECK:a.POLYMARKET")
 
+        assert callbacks == []
+        assert strategy._resolution_pending_instruments == {instrument: "test stop"}
+        assert "RESOLUTION-CHECK:a.POLYMARKET" not in strategy.guard_alerts
+        assert instrument not in strategy._resolution_settled_instruments
+        assert strategy.stop_called is False
+
+    def test_process_stop_dispatches_after_wallet_truth_reconciles_carried_residual(self):
+        strategy = _wallet_strategy()
+        instrument = InstrumentId.from_str("conda-tokena.POLYMARKET")
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 2.0)]
+        strategy.min_quantity_by_instrument[instrument] = 5.0
+        strategy._resolution_pending_instruments[instrument] = "test stop"
+        callbacks = []
+        strategy.set_process_stop_callback(lambda: callbacks.append("stop"))
+
+        class FakeWalletTruthProvider:
+            def snapshot(self):
+                return WalletTruthSnapshot(
+                    wallet_address="0xabc",
+                    collateral_balance=8.0,
+                    positions=(),
+                    settlements=(
+                        WalletSettlement(
+                            token_id="tokena",
+                            position_size=2.0,
+                            settlement_price=1.0,
+                            collateral_credit=2.0,
+                        ),
+                    ),
+                )
+
+        strategy.set_wallet_truth_provider(FakeWalletTruthProvider())
+
+        strategy.request_process_stop("test stop")
+        assert callbacks == []
+
+        strategy._refresh_wallet_truth()
+
         assert callbacks == ["stop"]
+        assert strategy.stop_called is False
+
+    def test_operating_balance_guard_does_not_stop_when_low_balance_but_position_open(self):
+        strategy = _strategy()
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy._trade_amount = 5.0
+        strategy._free_collateral_balance = lambda: 5.0
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 1.0)]
+
+        strategy._check_operating_balance()
+
+        assert strategy.stop_called is False
+
+    def test_operating_balance_guard_stops_when_low_balance_and_idle(self):
+        strategy = _strategy()
+        strategy._trade_amount = 5.0
+        strategy._free_collateral_balance = lambda: 5.0
+
+        strategy._check_operating_balance()
+
+        assert strategy.stop_called is True
+
+    def test_operating_balance_guard_does_not_stop_when_free_cash_is_sufficient(self):
+        strategy = _strategy()
+        strategy._trade_amount = 5.0
+        strategy._free_collateral_balance = lambda: 5.5
+
+        strategy._check_operating_balance()
+
         assert strategy.stop_called is False

@@ -1,0 +1,16 @@
+strategy = "random_signal"
+slug_pattern = "btc-updown-15m"
+hours_ahead = 2
+mode = "sandbox"
+binance_feed = "global"
+outcome_side = "yes"
+run_secs = 3600
+sandbox_starting_usdc = 10.0
+description = "Deterministic sandbox residual-carry profile for Stage 8 resolution-worker validation."
+
+[strategy_config]
+trade_amount_usdc = 5.0
+entry_threshold = 0.0
+exit_threshold = 0.7
+disable_signal_exit = true
+carry_window_end_position = true

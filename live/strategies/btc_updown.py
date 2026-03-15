@@ -56,6 +56,8 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
         self.subscribe_bars(self._btc_bar_type)
         self._start_btc_warmup()
         self._start_window_lifecycle()
+        self._start_balance_guard()
+        self._start_wallet_truth_polling()
         self.clock.set_timer_ns(
             "status",
             self._STATUS_INTERVAL_NS,
@@ -75,6 +77,8 @@ class BtcUpDownStrategy(WindowedPolymarketStrategy):
     def on_stop(self):
         self.clock.cancel_timer("status")
         self._cancel_guard_timer("btc_warmup_timeout")
+        self._stop_wallet_truth_polling()
+        self._stop_balance_guard()
         self._stop_window_lifecycle()
         self.log.info(f"Stopped | total fills: {self._trade_count}")
 

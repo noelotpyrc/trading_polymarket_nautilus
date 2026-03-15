@@ -3,9 +3,11 @@
 Shared infrastructure for live trading nodes.
 
 Importable helpers for use by any strategy runner:
+  - resolve_upcoming_window_metadata(slug_pattern, hours_ahead, outcome_side)
   - resolve_upcoming_windows(slug_pattern, hours_ahead, outcome_side)
-  - build_node(pm_instrument_ids, sandbox, binance_us)
+  - build_node(pm_instrument_ids, sandbox, binance_us, sandbox_starting_usdc)
   - make_arg_parser(description)
+  - prepare_run_metadata(...)
   - prepare_run(...)
   - schedule_stop(stop_target, run_secs)
 
@@ -22,6 +24,8 @@ from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
+
+from live.market_metadata import ResolvedWindowMetadata
 
 load_dotenv()
 
@@ -56,7 +60,36 @@ def resolve_upcoming_windows(
         f"for '{slug_pattern}' outcome={outcome_side.upper()}..."
     )
 
-    windows: list[tuple[str, int]] = []
+    metadata = resolve_upcoming_window_metadata(
+        slug_pattern,
+        hours_ahead=hours_ahead,
+        outcome_side=outcome_side,
+    )
+    return [(window.instrument_id, window.window_end_ns) for window in metadata]
+
+
+def resolve_upcoming_window_metadata(
+    slug_pattern: str,
+    hours_ahead: int = 4,
+    outcome_side: str = "yes",
+) -> list[ResolvedWindowMetadata]:
+    """
+    Query Gamma API for current + upcoming market windows matching slug_pattern.
+    Returns rich metadata ordered by time.
+    """
+    interval_secs = _parse_interval_secs(slug_pattern)
+    now = int(time.time())
+    window_start = (now // interval_secs) * interval_secs
+    n_windows = (hours_ahead * 3600) // interval_secs + 1
+
+    _validate_outcome_side(outcome_side)
+
+    print(
+        f"Resolving up to {n_windows} windows ({hours_ahead}h ahead) "
+        f"for '{slug_pattern}' outcome={outcome_side.upper()}..."
+    )
+
+    windows: list[ResolvedWindowMetadata] = []
     for i in range(n_windows):
         ts = window_start + i * interval_secs
         slug = f"{slug_pattern}-{ts}"
@@ -72,16 +105,18 @@ def resolve_upcoming_windows(
             print(f"  [{i:2d}] {slug} — not found (market may not exist yet)")
             continue
 
-        condition_id = markets[0].get("conditionId", "")
-        token_id, outcome_label = _select_outcome_token(markets[0], outcome_side)
-        if not condition_id or not token_id:
+        metadata = _window_metadata_from_market(
+            slug=slug,
+            market=markets[0],
+            outcome_side=outcome_side,
+            window_end_ns=(ts + interval_secs) * 1_000_000_000,
+        )
+        if metadata is None:
             print(f"  [{i:2d}] {slug} — missing conditionId or {outcome_side.upper()} token ID")
             continue
 
-        pm_instrument_id = f"{condition_id}-{token_id}.POLYMARKET"
-        window_end_ns = (ts + interval_secs) * 1_000_000_000
-        windows.append((pm_instrument_id, window_end_ns))
-        print(f"  [{i:2d}] {slug} [{outcome_label}] → {pm_instrument_id}")
+        windows.append(metadata)
+        print(f"  [{i:2d}] {slug} [{metadata.selected_outcome_label}] → {metadata.instrument_id}")
 
     return windows
 
@@ -90,6 +125,7 @@ def build_node(
     pm_instrument_ids: list[str],
     sandbox: bool = False,
     binance_us: bool = False,
+    sandbox_starting_usdc: float | None = None,
 ):
     """Build a TradingNode with Binance + Polymarket clients attached."""
     from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory
@@ -119,7 +155,13 @@ def build_node(
             "POLYMARKET": polymarket_data_config(pm_instrument_ids, sandbox=sandbox),
         },
         exec_clients={
-            "POLYMARKET": sandbox_exec_config() if sandbox else polymarket_exec_config(),
+            "POLYMARKET": (
+                sandbox_exec_config(
+                    starting_usdc=500.0 if sandbox_starting_usdc is None else sandbox_starting_usdc,
+                )
+                if sandbox
+                else polymarket_exec_config()
+            ),
         },
     ))
     node.add_data_client_factory("BINANCE", BinanceLiveDataClientFactory)
@@ -144,6 +186,10 @@ def make_arg_parser(description: str) -> argparse.ArgumentParser:
                         help="Select the first (yes) or second (no) Polymarket outcome token")
     parser.add_argument("--sandbox", action="store_true",
                         help="Sandbox mode: real data feeds, simulated execution (no real orders)")
+    parser.add_argument("--sandbox-wallet-state-path", default=None,
+                        help="Optional shared sandbox wallet-state JSON file for resolution tests")
+    parser.add_argument("--sandbox-starting-usdc", type=float, default=None,
+                        help="Override sandbox starting USDC.e balance for simulated execution")
     parser.add_argument("--binance-us", action="store_true",
                         help="Use Binance US endpoint (required if geo-restricted)")
     return parser
@@ -157,17 +203,46 @@ def prepare_run(
     sandbox: bool,
     binance_us: bool,
     run_secs: int | None,
+    sandbox_starting_usdc: float | None = None,
 ) -> list[tuple[str, int]]:
     """Run shared live-runner preflight and return validated windows."""
+    metadata = prepare_run_metadata(
+        slug_pattern=slug_pattern,
+        hours_ahead=hours_ahead,
+        outcome_side=outcome_side,
+        sandbox=sandbox,
+        binance_us=binance_us,
+        run_secs=run_secs,
+        sandbox_starting_usdc=sandbox_starting_usdc,
+    )
+    return [(window.instrument_id, window.window_end_ns) for window in metadata]
+
+
+def prepare_run_metadata(
+    *,
+    slug_pattern: str,
+    hours_ahead: int,
+    outcome_side: str,
+    sandbox: bool,
+    binance_us: bool,
+    run_secs: int | None,
+    sandbox_starting_usdc: float | None = None,
+) -> list[ResolvedWindowMetadata]:
+    """Run shared live-runner preflight and return validated metadata."""
     _validate_run_secs(run_secs)
     _validate_outcome_side(outcome_side)
+    _validate_sandbox_starting_usdc(
+        sandbox=sandbox,
+        sandbox_starting_usdc=sandbox_starting_usdc,
+    )
     _validate_required_env_vars(sandbox=sandbox)
 
-    windows = resolve_upcoming_windows(
+    window_metadata = resolve_upcoming_window_metadata(
         slug_pattern,
         hours_ahead=hours_ahead,
         outcome_side=outcome_side,
     )
+    windows = [(window.instrument_id, window.window_end_ns) for window in window_metadata]
     _validate_resolved_windows(windows)
     _print_run_summary(
         windows=windows,
@@ -176,8 +251,9 @@ def prepare_run(
         sandbox=sandbox,
         binance_us=binance_us,
         run_secs=run_secs,
+        sandbox_starting_usdc=sandbox_starting_usdc,
     )
-    return windows
+    return window_metadata
 
 
 def schedule_stop(stop_target, run_secs: int | None):
@@ -246,6 +322,15 @@ def _validate_required_env_vars(*, sandbox: bool) -> None:
         raise SystemExit(f"Missing required {mode} env vars: {joined}")
 
 
+def _validate_sandbox_starting_usdc(*, sandbox: bool, sandbox_starting_usdc: float | None) -> None:
+    if sandbox_starting_usdc is None:
+        return
+    if not sandbox:
+        raise SystemExit("--sandbox-starting-usdc is only valid in sandbox mode")
+    if sandbox_starting_usdc <= 0:
+        raise SystemExit("--sandbox-starting-usdc must be a positive number")
+
+
 def _validate_resolved_windows(windows: list[tuple[str, int]]) -> None:
     if not windows:
         raise SystemExit("No windows resolved. Check slug pattern or Gamma API connectivity.")
@@ -259,6 +344,34 @@ def _validate_resolved_windows(windows: list[tuple[str, int]]) -> None:
         raise SystemExit("Resolved windows are not strictly increasing by end time; aborting startup.")
 
 
+def _window_metadata_from_market(
+    *,
+    slug: str,
+    market: dict,
+    outcome_side: str,
+    window_end_ns: int,
+) -> ResolvedWindowMetadata | None:
+    condition_id = str(market.get("conditionId", "") or "")
+    if not condition_id:
+        return None
+
+    yes_token_id, yes_label = _select_outcome_token(market, "yes")
+    no_token_id, no_label = _select_outcome_token(market, "no")
+    if not yes_token_id or not no_token_id:
+        return None
+
+    return ResolvedWindowMetadata(
+        slug=slug,
+        condition_id=condition_id,
+        window_end_ns=window_end_ns,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        yes_outcome_label=yes_label,
+        no_outcome_label=no_label,
+        selected_outcome_side=outcome_side,
+    )
+
+
 def _print_run_summary(
     *,
     windows: list[tuple[str, int]],
@@ -267,6 +380,7 @@ def _print_run_summary(
     sandbox: bool,
     binance_us: bool,
     run_secs: int | None,
+    sandbox_starting_usdc: float | None,
 ) -> None:
     mode = "SANDBOX" if sandbox else "LIVE"
     binance_label = "Binance USDT futures (US)" if binance_us else "Binance USDT futures"
@@ -281,6 +395,8 @@ def _print_run_summary(
     print(f"Resolved {len(windows)} window(s)")
     print(f"First window ends : {_fmt_abs_ns(first_end_ns)} UTC")
     print(f"Last window ends  : {_fmt_abs_ns(last_end_ns)} UTC")
+    if sandbox and sandbox_starting_usdc is not None:
+        print(f"Sandbox balance   : {sandbox_starting_usdc:.6f} USDC.e")
     if run_secs is not None:
         print(f"Auto-stop after   : {run_secs}s")
 

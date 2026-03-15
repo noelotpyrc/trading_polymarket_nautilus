@@ -8,14 +8,15 @@ This exists because the roadmap in [docs/live_testing_plan.md](/Users/noel/proje
 
 ## Current Snapshot
 
-- Last committed live hardening commit on `master`: `8b0a93d` (`Add live process guardrails and E2E tests`)
-- There is a larger local-only live hardening batch after that commit
+- Last committed relevant baseline on `master`: `688e7b2` (`Plan wallet resolution before live rehearsals`)
+- Latest committed live-process hardening commit on `master`: `7c6fecd` (`Harden live lifecycle and soak tooling`)
+- There is a local-only Stage 8 implementation batch after that commit
 - Current local automated validation:
   - `.venv/bin/python -m pytest tests/live`
-  - result: `119 passed`
-- Still not re-proven after the very latest local quote-handling changes:
-  - fresh multi-hour sandbox soak results
-  - measured log-volume reduction on real live-data sessions
+  - result: `161 passed`
+- Still not fully proven after the Stage 8 implementation batch:
+  - live dry-run resolution scan against real resolved-wallet state
+  - live redemption rehearsal
 
 ---
 
@@ -78,11 +79,26 @@ Fixed / added:
 Validated by:
 - full live suite at that point
 
+### `7c6fecd` — Harden live lifecycle and soak tooling
+
+Fixed / added:
+- strategy-managed node stop after last preloaded window
+- live-compatible exit handling
+- carried residual resolution tracking inside the trading node
+- timer callback compatibility fix
+- soak harness
+- residual entry-order cleanup
+- side-aware Polymarket quote handling
+
+Validated by:
+- full live suite at that point
+- sandbox soak reruns that removed the old dropped-quote storm and exhaustion-stop issues
+
 ---
 
 ## Local-Only Hardening Batch
 
-Everything in this section exists locally after `8b0a93d`, but is not committed yet.
+Everything in this section exists locally after `688e7b2`, but is not committed yet.
 
 ### 1. Process stop after the last preloaded window
 
@@ -214,10 +230,61 @@ Validation:
 - tests in [tests/live/test_config.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_config.py)
 - tests in [tests/live/test_windowed_strategy.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_windowed_strategy.py)
 - tests in [tests/live/test_guardrails_e2e.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_guardrails_e2e.py)
-- current full local live suite: `119 passed`
+- current full local live suite: `161 passed`
 
 Remaining proof needed:
 - fresh real sandbox soak to measure the actual warning-volume drop and confirm there is no new long-run regression
+
+### 8. Stage 8 external resolution foundations
+
+Problem:
+- the live node could track carried residuals to resolution, but there was no external wallet-based process to inspect held YES/NO balances, settle sandbox state, or prepare production redemption
+
+Fix:
+- added a shared allowlisted market metadata registry
+- added wallet-truth snapshot types and a production Polymarket-backed provider
+- added a file-backed sandbox wallet store plus sandbox provider
+- added an external resolution worker abstraction and operator CLI
+- added a production redemption backend behind the worker interface, dry-run by default
+- added node hooks to poll wallet truth, reconcile carried residuals from wallet truth, and update the sandbox wallet store from fills
+- soak/profile runners can now share a synthetic `wallet_state.json` with the external worker
+- added sandbox starting-balance overrides for deterministic validation
+- added a one-command Stage 8 validation path through `live/soak.py --with-resolution-worker`
+- downgraded internal market-resolution polling to an informational-only signal
+- changed the low-balance guard so it blocks new entries immediately but only stops the node once it is flat/idle
+
+Main files:
+- [live/market_metadata.py](/Users/noel/projects/trading_polymarket_nautilus/live/market_metadata.py)
+- [live/wallet_truth.py](/Users/noel/projects/trading_polymarket_nautilus/live/wallet_truth.py)
+- [live/sandbox_wallet.py](/Users/noel/projects/trading_polymarket_nautilus/live/sandbox_wallet.py)
+- [live/resolution_worker.py](/Users/noel/projects/trading_polymarket_nautilus/live/resolution_worker.py)
+- [live/redemption.py](/Users/noel/projects/trading_polymarket_nautilus/live/redemption.py)
+- [live/run_resolution.py](/Users/noel/projects/trading_polymarket_nautilus/live/run_resolution.py)
+- [live/runs/common.py](/Users/noel/projects/trading_polymarket_nautilus/live/runs/common.py)
+- [live/soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py)
+
+Validation:
+- full live suite: `161 passed`
+- focused coverage in:
+  - [tests/live/test_wallet_truth.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_wallet_truth.py)
+  - [tests/live/test_run_resolution.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_run_resolution.py)
+  - [tests/live/test_profiles.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_profiles.py)
+  - [tests/live/test_soak.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_soak.py)
+  - [tests/live/test_windowed_strategy.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_windowed_strategy.py)
+  - [tests/live/test_guardrails_e2e.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_guardrails_e2e.py)
+
+Remaining proof needed:
+- live dry-run resolution scan against a wallet holding allowlisted resolved positions
+- live redemption rehearsal
+
+Runtime validation now completed:
+- [stage8_p1b_rerun5 batch summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260315T153937Z_stage8_p1b_rerun5/summary.json)
+- key proof points:
+  - carried residual created at [runner.log](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260315T153937Z_stage8_p1b_rerun5/01_random_signal_15m_resolution_sandbox/runner.log#L266)
+  - internal resolution remained advisory at [runner.log](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260315T153937Z_stage8_p1b_rerun5/01_random_signal_15m_resolution_sandbox/runner.log#L278)
+  - wallet settlement reconciled the carried residual at [runner.log](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260315T153937Z_stage8_p1b_rerun5/01_random_signal_15m_resolution_sandbox/runner.log#L280)
+  - final carried residual was reconciled before shutdown at [runner.log](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260315T153937Z_stage8_p1b_rerun5/01_random_signal_15m_resolution_sandbox/runner.log#L555)
+  - final wallet state ended flat with settlement records at [wallet_state.json](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260315T153937Z_stage8_p1b_rerun5/01_random_signal_15m_resolution_sandbox/wallet_state.json)
 
 ---
 
@@ -225,7 +292,7 @@ Remaining proof needed:
 
 ### Proven locally
 
-- live tests: `.venv/bin/python -m pytest tests/live` -> `119 passed`
+- live tests: `.venv/bin/python -m pytest tests/live` -> `161 passed`
 - runner/profile infrastructure
 - Binance warmup path
 - YES / NO side selection
@@ -234,18 +301,26 @@ Remaining proof needed:
 - residual position carry-to-resolution logic
 - residual entry-order cleanup logic
 - side-aware quote handling at unit / integration / E2E level
+- external resolution worker foundations
+- sandbox wallet-state plumbing
+- production redemption backend dry-run path
+- node-side carried-residual reconciliation from wallet truth
+- informational-only internal resolution semantics
+- low-balance entry gating with idle-only stop behavior
 
 ### Not yet reproven on fresh long real sandbox runs
 
 - multi-hour soak behavior after:
   - residual entry-order cleanup
   - side-aware quote handling
+  - shared sandbox wallet-state plumbing
 
 ### Not yet proven live
 
 - real submit / open / cancel behavior on Polymarket
 - real fill / reconciliation behavior
-- live closed-market resolution polling
+- live closed-market resolution polling in the external worker
+- real redemption execution and wallet-state reconciliation
 
 ### Explicitly deferred
 
@@ -256,15 +331,8 @@ Remaining proof needed:
 
 ## Recommended Immediate Next Step
 
-Before any live order rehearsal, rerun the multi-hour sandbox soaks against the current local batch:
+Begin Stage 9 PM order reconciliation (`P1a`):
 
-- `python live/soak.py random_signal_15m_sandbox --run-secs 14400 --label stage8_random_4h`
-- `python live/soak.py btc_updown_15m_sandbox --run-secs 14400 --label stage8_btc_4h`
-
-Review for:
-- prompt node stop after exhaustion
-- no residual partially-filled entry-order warning at shutdown
-- lower one-sided-book warning volume
-- no new regressions in rollover or cleanup
-
-If those are clean, this whole local-only batch is ready to commit together.
+- reconcile stale partially-filled IOC order objects against real PM order truth
+- prove entry-order remainders cannot stay live on PM without the node knowing
+- then rerun the longer sandbox soaks against the new order-reconciliation path

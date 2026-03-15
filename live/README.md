@@ -74,7 +74,13 @@ Both are handled automatically by `py-clob-client`.
 ```
 node.py              # Shared TradingNode helpers (window resolution + client wiring)
 config.py            # Client config builders (Binance + Polymarket data/exec clients)
+market_metadata.py   # Shared allowlisted YES/NO token metadata for trading + resolution
 resolution.py        # Polymarket market-resolution polling helpers
+wallet_truth.py      # Production wallet-truth snapshot/provider helpers
+sandbox_wallet.py    # Synthetic sandbox wallet store + wallet-truth provider
+resolution_worker.py # External wallet-based resolution worker primitives
+redemption.py        # Production redemption backend (dry-run or execute)
+run_resolution.py    # External resolution-worker CLI
 profiles/
   catalog/           # Checked-in runner profile TOML files
 runs/
@@ -108,6 +114,9 @@ python live/runs/profiles/random_signal_15m_sandbox.py
 # Fast sandbox validation on the NO outcome
 python live/runs/profiles/random_signal_15m_sandbox_no.py
 
+# Deterministic sandbox residual-carry validation for the external resolution worker
+python live/runs/profiles/random_signal_15m_resolution_sandbox.py
+
 # Slower sandbox validation — exercises the 14-day Binance warmup path
 python live/runs/profiles/btc_updown_15m_sandbox.py
 
@@ -140,6 +149,28 @@ The live Polymarket feed now keeps one-sided books visible by allowing synthetic
 - active-window SELL / flatten decisions require a fresh bid with positive size
 - midpoint pricing is only used when both sides have positive size
 
+## External Resolution Worker
+
+Stage 8 now has a first-pass external worker surface for wallet-based resolution handling:
+
+```bash
+# Dry-run one sandbox scan against a shared synthetic wallet-state file
+python live/run_resolution.py btc_updown_15m_sandbox --hours-ahead 8 --once --sandbox-wallet-state-path logs/soak/.../wallet_state.json
+
+# Dry-run one live scan against the production wallet allowlist
+python live/run_resolution.py btc_updown_15m_live --once
+
+# In live mode, actual redemption remains opt-in
+python live/run_resolution.py btc_updown_15m_live --once --execute-redemptions
+```
+
+Current behavior:
+- sandbox mode reads/writes a shared `wallet_state.json`
+- live mode reads wallet truth from Polymarket APIs
+- live redemptions default to dry-run summaries unless `--execute-redemptions` is passed
+- internal node resolution remains advisory only; wallet truth is the authoritative settlement signal
+- open-order truth still stays inside the Nautilus node
+
 ## Runner Profiles
 
 - Profile files live in [live/profiles/catalog](/Users/noel/projects/trading_polymarket_nautilus/live/profiles/catalog).
@@ -147,6 +178,7 @@ The live Polymarket feed now keeps one-sided books visible by allowing synthetic
 - Current catalog:
   - `btc_updown_15m_live`
   - `btc_updown_15m_live_no`
+  - `random_signal_15m_resolution_sandbox`
   - `random_signal_15m_sandbox`
   - `random_signal_15m_sandbox_no`
   - `btc_updown_15m_sandbox`
@@ -160,6 +192,8 @@ The live Polymarket feed now keeps one-sided books visible by allowing synthetic
 python live/runs/profiles/btc_updown_15m_live.py --run-secs 300
 python live/runs/profile.py btc_updown_15m_live --print-profile
 python live/runs/profile.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800
+python live/runs/profile.py random_signal_15m_resolution_sandbox --hours-ahead 2 --sandbox-wallet-state-path logs/stage8/random_wallet_state.json
+python live/runs/profile.py random_signal_15m_resolution_sandbox --sandbox-starting-usdc 25
 ```
 
 ## Operator Notes
@@ -170,7 +204,9 @@ python live/runs/profile.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28
 - The node will stop cleanly when it runs out of pre-loaded windows and will log that a restart is required.
 - Daily restart is the intended operating model for this phase. There is no automatic cross-day market extension yet.
 - If an ended-window residual cannot be flattened because liquidity disappears or the remaining size is below minimum order size, the node carries it to resolution and logs the outcome once Polymarket resolves the market.
+- Low free collateral now blocks new entries immediately, but the node only stops for low balance once it is flat and otherwise idle.
 - A requested process stop waits for any carried residuals to resolve before final node shutdown.
+- External wallet-truth reconciliation, not the node’s internal resolution poll, is what clears carried residuals authoritatively.
 - Run the sandbox validation sequence in `docs/live_testing_plan.md` before considering any real-order rehearsal.
 - The detailed health-guard policy lives in [docs/live_health_guard_policy.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_health_guard_policy.md).
 
@@ -187,6 +223,9 @@ python live/soak.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800 --la
 
 # 8h soak on two profiles, continue even if the first fails
 python live/soak.py random_signal_15m_sandbox btc_updown_15m_sandbox --run-secs 28800 --label stage7_8h --keep-going
+
+# One-command Stage 8 deterministic residual + worker validation
+python live/soak.py random_signal_15m_resolution_sandbox --with-resolution-worker --label stage8_resolution_smoke
 ```
 
 Safety defaults:
@@ -195,18 +234,20 @@ Safety defaults:
 
 Artifacts:
 - `runner.log` — combined stdout/stderr for the profile run
+- `worker.log` — companion resolution-worker output when `--with-resolution-worker` is used
 - `profile.json` — resolved profile settings used for the run
 - `summary.json` — exit code, duration, log path, and status
+- `wallet_state.json` — synthetic sandbox wallet truth for Stage 8 resolution tests
 - batch-level `summary.json` — overall batch status across all profiles
 
 ## Next Steps
 
 The detailed roadmap lives in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md). The next implementation stages are:
 
-1. External settlement / redemption automation
-   - Purpose: handle post-resolution reconciliation outside Nautilus.
-   - Design: [docs/wallet_resolution_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/wallet_resolution_plan.md)
-   - Success: resolved residuals can be reconciled and redeemed by a separate process.
+1. PM order reconciliation
+   - Purpose: reconcile stale IOC remainders against real PM order truth.
+   - Design: [docs/order_reconciliation_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/order_reconciliation_plan.md)
+   - Success: stale IOC remainders are either canceled for real, externally proven dead, or escalated.
 2. Longer sandbox soak runs
    - Purpose: prove multi-hour stability.
    - Success: repeated rollovers and long runtimes remain clean.

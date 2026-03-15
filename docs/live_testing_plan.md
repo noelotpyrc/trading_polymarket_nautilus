@@ -22,6 +22,12 @@ The current repo is through the sandbox gate:
 - Polymarket market-entry orders now use IOC, and known residual entry-order remainders are canceled when the related position is cleaned up
 - Stage 7 side-aware Polymarket quote handling is implemented for the live strategies and data config
 - Ended-window residual positions now carry to Polymarket resolution instead of forcing an immediate stop
+- Stage 8 external resolution foundations are implemented:
+  - allowlisted window metadata registry
+  - production wallet-truth provider
+  - sandbox wallet store/provider
+  - external resolution worker CLI
+  - production redemption backend behind the worker interface
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
@@ -30,7 +36,9 @@ What is **not** proven yet:
 - Multi-hour stability under production-style supervision
 - Log-volume reduction from one-sided Polymarket books under a fresh multi-hour soak run
 - Resolution polling against live closed-market data
-- Automated post-resolution settlement / redemption handling, which is intentionally deferred to a separate external process
+- Full end-to-end wallet reconciliation from external redemption back into Nautilus account state
+- A real live redemption rehearsal
+- PM order-status reconciliation for stale IOC remainders
 
 ---
 
@@ -245,19 +253,79 @@ Detailed design and implementation plan:
 - Handle Polymarket resolution/redemption with a workflow that can inspect wallet-held YES/NO positions and collateral directly
 - Avoid forcing the live trading node to own long-tail redemption logic
 
-**What we will implement**
-- A separate process, not built on Nautilus strategy/runtime primitives
-- Resolution-state polling plus a node-facing wallet-truth interface
-- Automated or operator-assisted redemption workflow for resolved YES/NO positions
+**Implementation status**
+- Implemented first pass:
+  - allowlisted YES/NO token metadata registry
+  - node-facing wallet-truth interface + polling hook
+  - production Polymarket-backed wallet-truth provider
+  - sandbox synthetic wallet store + provider
+  - external worker CLI in `live/run_resolution.py`
+  - production redemption backend in `live/redemption.py` behind the worker interface
+  - deterministic `random_signal_15m_resolution_sandbox` profile for forcing carried residuals in sandbox validation
+  - one-command sandbox validation path via `live/soak.py --with-resolution-worker`
+  - node-side wallet-truth reconciliation for carried residual positions
+  - internal market-resolution polling downgraded to advisory-only status
+  - low-balance guard updated to block new entries first and only stop once the node is flat / idle
+  - deterministic sandbox runtime proof completed via `stage8_p1b_rerun5`
+- Still pending:
+  - live dry-run validation against real resolved-wallet state
+  - feeding externally redeemed balance back into Nautilus account-state reconciliation
+
+Recommended validation command:
+
+```bash
+python live/soak.py random_signal_15m_resolution_sandbox --with-resolution-worker --label stage8_resolution_smoke
+```
 
 **Success criteria**
 - Resolved carried positions can be reconciled and redeemed without manual log spelunking
 - The external process can confirm final wallet state after redemption
 - The live trading node can stay focused on trading-window execution and residual tracking only
+- Internal node resolution is informative only; wallet truth remains the authoritative settlement signal
+- Already-settled carried residual positions no longer remain as ambiguous Nautilus cache residue at shutdown
+
+Latest sandbox validation:
+- `python live/soak.py random_signal_15m_resolution_sandbox --with-resolution-worker --label stage8_p1b_rerun5`
+- result:
+  - carried residuals were settled by the worker
+  - the node reconciled them from wallet truth before shutdown
+  - final wallet state ended flat with settlement records
+  - remaining shutdown residue was limited to stale IOC order objects (`P1a`)
 
 ---
 
-## Stage 9 — Longer Sandbox Soak Runs
+## Stage 9 — PM Order Reconciliation
+
+Add explicit Polymarket order-status reconciliation for stale IOC remainders.
+
+Detailed design and implementation plan:
+- [docs/order_reconciliation_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/order_reconciliation_plan.md)
+
+**Purpose**
+- Fix `P1a` correctly by checking whether suspicious IOC remainders are still live on PM
+- Prevent entry-order remainders from silently reserving cash or filling later
+- Reconcile Nautilus stale order cache against external PM order truth instead of local heuristics alone
+
+**Stage gate**
+- Stage 8 `P1b` is now closed
+- Externally settled carried positions reconcile back into node-operational state cleanly
+
+**What we will implement**
+- Node-facing PM order-truth provider for production
+- Synthetic sandbox order-truth provider for deterministic tests
+- Node-side reconciliation hook for suspicious IOC remainders:
+  - cancel if still open on PM
+  - reconcile locally if externally proven dead
+  - stop on mismatch
+
+**Success criteria**
+- No ambiguous `Residual MarketOrder(...)` shutdown warnings remain for IOC remainders that PM order truth proves are dead
+- Entry-order remainders cannot remain live on PM without the node knowing
+- Sandbox and production use the same normalized order-reconciliation interface
+
+---
+
+## Stage 10 — Longer Sandbox Soak Runs
 
 Run the live process for hours, not minutes.
 
@@ -279,7 +347,7 @@ Run the live process for hours, not minutes.
 
 ---
 
-## Stage 10 — Live Order Lifecycle Rehearsal (No Intended Fill)
+## Stage 11 — Live Order Lifecycle Rehearsal (No Intended Fill)
 
 Submit a tiny live order that is intended to rest, then cancel it.
 
@@ -304,7 +372,7 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 ---
 
-## Stage 11 — Minimum-Size Live Fill Rehearsal
+## Stage 12 — Minimum-Size Live Fill Rehearsal
 
 Execute the smallest practical live position, then flatten it.
 
@@ -331,7 +399,7 @@ Execute the smallest practical live position, then flatten it.
 
 ---
 
-## Stage 12 — Observability Tightening
+## Stage 13 — Observability Tightening
 
 Make the system operable once multiple long-running nodes exist.
 
@@ -379,12 +447,14 @@ Stage 7
 Stage 8
   -> build external wallet-truth + resolution/redemption flow before live trading
 Stage 9
-  -> run multi-hour sandbox soak sessions on the production profiles
+  -> add PM order-status reconciliation after Stage 8 closes carried-position reconciliation
 Stage 10
-  -> submit a tiny non-marketable live limit order and cancel it
+  -> run multi-hour sandbox soak sessions on the production profiles
 Stage 11
-  -> execute one minimum-size live fill-and-flatten rehearsal
+  -> submit a tiny non-marketable live limit order and cancel it
 Stage 12
+  -> execute one minimum-size live fill-and-flatten rehearsal
+Stage 13
   -> tighten log retention and operator-facing observability
 ```
 

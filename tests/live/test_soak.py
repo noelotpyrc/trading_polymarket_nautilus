@@ -99,6 +99,7 @@ class TestRunSoakBatch:
             keep_going=False,
             allow_live=False,
             allow_unbounded=False,
+            sandbox_wallet_state_path=None,
         )
 
         batch_dir = Path(batch["batch_dir"])
@@ -114,6 +115,10 @@ class TestRunSoakBatch:
         assert batch["results"][0]["run_secs"] == 600
         assert batch["results"][0]["hours_ahead"] == 8
         assert "--hours-ahead 8" in (run_dir / "command.txt").read_text(encoding="utf-8")
+        assert batch["results"][0]["wallet_state_path"] == str(run_dir / "wallet_state.json")
+        command_text = (run_dir / "command.txt").read_text(encoding="utf-8")
+        assert "--sandbox-wallet-state-path" in command_text
+        assert str(run_dir / "wallet_state.json") in command_text
 
     def test_batch_stops_after_first_failure_without_keep_going(self, tmp_path, monkeypatch):
         profiles = {
@@ -148,6 +153,7 @@ class TestRunSoakBatch:
             keep_going=False,
             allow_live=False,
             allow_unbounded=False,
+            sandbox_wallet_state_path=None,
         )
 
         assert batch["status"] == "failed"
@@ -188,10 +194,115 @@ class TestRunSoakBatch:
             keep_going=True,
             allow_live=False,
             allow_unbounded=False,
+            sandbox_wallet_state_path=None,
         )
 
         assert batch["status"] == "failed"
         assert [result["exit_code"] for result in batch["results"]] == [3, 0]
+
+    def test_batch_uses_explicit_sandbox_wallet_state_path(self, tmp_path, monkeypatch):
+        profile = _profile()
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        monkeypatch.setattr(
+            soak.subprocess,
+            "run",
+            lambda command, cwd, stdout, stderr, text, check: SimpleNamespace(returncode=0),
+        )
+
+        wallet_state_path = tmp_path / "shared_wallet.json"
+        batch = soak.run_soak_batch(
+            profile_refs=["random_signal_15m_sandbox"],
+            run_secs=600,
+            hours_ahead=None,
+            output_root=tmp_path,
+            label=None,
+            keep_going=False,
+            allow_live=False,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=str(wallet_state_path),
+        )
+
+        result = batch["results"][0]
+        assert result["wallet_state_path"] == str(wallet_state_path)
+
+    def test_batch_can_run_companion_resolution_worker(self, tmp_path, monkeypatch):
+        profile = _profile(name="random_signal_15m_resolution_sandbox", run_secs=600)
+        profile = profile.with_sandbox_starting_usdc(10.0)
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+
+        def fake_run(command, cwd, stdout, stderr, text, check):
+            stdout.write("runner output\n")
+            return SimpleNamespace(returncode=0)
+
+        class FakeWorkerProcess:
+            def __init__(self, command, cwd, stdout, stderr, text):
+                self.command = command
+                self.cwd = cwd
+                self.stdout = stdout
+                self.stderr = stderr
+                self.text = text
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(soak.subprocess, "run", fake_run)
+        monkeypatch.setattr(soak.subprocess, "Popen", FakeWorkerProcess)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["random_signal_15m_resolution_sandbox"],
+            run_secs=None,
+            hours_ahead=None,
+            output_root=tmp_path,
+            label="stage8",
+            keep_going=False,
+            allow_live=False,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            sandbox_starting_usdc=None,
+            with_resolution_worker=True,
+            resolution_interval_secs=15,
+        )
+
+        run_dir = Path(batch["batch_dir"]) / "01_random_signal_15m_resolution_sandbox"
+        result = batch["results"][0]
+
+        assert batch["status"] == "passed"
+        assert result["resolution_worker"] is True
+        assert result["worker_terminated_by_harness"] is True
+        assert result["worker_log_path"] == str(run_dir / "worker.log")
+        assert "--sandbox-starting-usdc 10.0" in (run_dir / "command.txt").read_text(encoding="utf-8")
+        assert "--interval-secs 15" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
+        assert "--sandbox-starting-usdc 10.0" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
 
 
 class TestMain:

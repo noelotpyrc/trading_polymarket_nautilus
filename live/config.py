@@ -78,9 +78,10 @@ def polymarket_exec_config() -> PolymarketExecClientConfig:
 
 def sandbox_exec_config(starting_usdc: float = 500.0) -> SandboxExecutionClientConfig:
     """Simulated execution — no real orders, starts with synthetic USDC.e balance."""
+    formatted_balance = f"{starting_usdc:.6f}".rstrip("0").rstrip(".")
     return SandboxExecutionClientConfig(
         venue="POLYMARKET",
         account_type="CASH",
         base_currency="USDC.e",
-        starting_balances=[f"{starting_usdc:.0f} USDC.e"],
+        starting_balances=[f"{formatted_balance} USDC.e"],
     )

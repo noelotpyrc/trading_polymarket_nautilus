@@ -18,6 +18,7 @@ _ALLOWED_TOP_LEVEL_KEYS = {
     "binance_feed",
     "outcome_side",
     "run_secs",
+    "sandbox_starting_usdc",
     "description",
     "strategy_config",
 }
@@ -36,6 +37,7 @@ class RunnerProfile:
     binance_feed: str
     outcome_side: str = "yes"
     run_secs: int | None = None
+    sandbox_starting_usdc: float | None = None
     description: str | None = None
     strategy_config: dict[str, object] = field(default_factory=dict)
 
@@ -56,6 +58,13 @@ class RunnerProfile:
         if hours_ahead <= 0:
             raise ProfileError("Profile hours_ahead override must be a positive integer")
         return replace(self, hours_ahead=hours_ahead)
+
+    def with_sandbox_starting_usdc(self, sandbox_starting_usdc: float | None) -> "RunnerProfile":
+        if sandbox_starting_usdc is not None and sandbox_starting_usdc <= 0:
+            raise ProfileError("Profile sandbox_starting_usdc override must be positive")
+        if sandbox_starting_usdc is not None and not self.sandbox:
+            raise ProfileError("Profile sandbox_starting_usdc override is only valid in sandbox mode")
+        return replace(self, sandbox_starting_usdc=sandbox_starting_usdc)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -110,6 +119,7 @@ def _parse_profile(*, name: str, data: dict[str, object]) -> RunnerProfile:
     hours_ahead = _required_positive_int(data, "hours_ahead", name)
     outcome_side = _optional_str(data, "outcome_side", name) or "yes"
     run_secs = _optional_positive_int(data, "run_secs", name)
+    sandbox_starting_usdc = _optional_positive_number(data, "sandbox_starting_usdc", name)
     description = _optional_str(data, "description", name)
     strategy_config = data.get("strategy_config", {})
 
@@ -122,6 +132,8 @@ def _parse_profile(*, name: str, data: dict[str, object]) -> RunnerProfile:
     if outcome_side not in _ALLOWED_OUTCOME_SIDES:
         allowed = ", ".join(sorted(_ALLOWED_OUTCOME_SIDES))
         raise ProfileError(f"Profile {name!r} outcome_side must be one of: {allowed}")
+    if sandbox_starting_usdc is not None and mode != "sandbox":
+        raise ProfileError(f"Profile {name!r} sandbox_starting_usdc is only valid in sandbox mode")
     if not isinstance(strategy_config, dict):
         raise ProfileError(f"Profile {name!r} strategy_config must be a TOML table")
 
@@ -134,6 +146,7 @@ def _parse_profile(*, name: str, data: dict[str, object]) -> RunnerProfile:
         binance_feed=binance_feed,
         outcome_side=outcome_side,
         run_secs=run_secs,
+        sandbox_starting_usdc=sandbox_starting_usdc,
         description=description,
         strategy_config=dict(strategy_config),
     )
@@ -169,3 +182,12 @@ def _optional_positive_int(data: dict[str, object], key: str, name: str) -> int 
     if not isinstance(value, int) or value <= 0:
         raise ProfileError(f"Profile {name!r} {key!r} must be a positive integer when set")
     return value
+
+
+def _optional_positive_number(data: dict[str, object], key: str, name: str) -> float | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or value <= 0:
+        raise ProfileError(f"Profile {name!r} {key!r} must be a positive number when set")
+    return float(value)

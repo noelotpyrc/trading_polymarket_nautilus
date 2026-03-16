@@ -211,6 +211,14 @@ python live/runs/profile.py random_signal_15m_resolution_sandbox --sandbox-start
 - External wallet-truth reconciliation, not the node’s internal resolution poll, is what clears carried residuals authoritatively.
 - Run the sandbox validation sequence in `docs/live_testing_plan.md` before considering any real-order rehearsal.
 - The detailed health-guard policy lives in [docs/live_health_guard_policy.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_health_guard_policy.md).
+- The recurring `convert_quote_qty_to_base` warning is currently sandbox-only.
+  It comes from Nautilus converting quote-denominated Polymarket market BUY
+  notional into base shares for the sandbox matching engine. Live Polymarket
+  behavior is unchanged and still uses quote-denominated market BUYs.
+- The recurring `Instrument tick size changed` warning is currently treated as
+  a Polymarket metadata-change notification surfaced by the Nautilus adapter.
+  In the current market-order setup it is mostly log noise unless it begins to
+  coincide with price-precision rejects or quote/book reconstruction failures.
 
 ## Soak Runs
 

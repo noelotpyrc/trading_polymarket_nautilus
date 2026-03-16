@@ -360,6 +360,12 @@ Run the live process for hours, not minutes.
 - No stuck pending-entry state, runaway log storm, or degraded process behavior
 - Shutdown remains clean after long runtimes
 
+**Policy note**
+- The earlier `btc_updown` "repeated sandbox fill errors before residual carry" item is now treated as a post-window cleanup policy choice, not a correctness bug.
+- Current default remains `flatten first, then carry to resolution`.
+- Real production setups may later choose a different policy, such as `flatten only if executable`, `single bounded probe then carry`, or `carry immediately after window close`.
+- The recurring `Instrument tick size changed` warning is currently treated as PM-side metadata churn surfaced by the Nautilus Polymarket adapter. For the current market-order strategies, the main practical effect is possible transient skipped entries while the local book/quote precision is rebuilt.
+
 ---
 
 ## Stage 11 — Live Order Lifecycle Rehearsal (No Intended Fill)

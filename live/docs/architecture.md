@@ -74,6 +74,15 @@ Common flags:
 
 Fixed per-profile entrypoints intentionally keep the checked-in TOML file as the source of truth for market/feed/risk settings, while the generic profile runner handles bounded runtime and sandbox-balance overrides.
 
+Note on quantity semantics:
+- live Polymarket market BUYs remain quote-denominated
+- sandbox execution still relies on Nautilus converting quote notional into base quantity before matching
+- that conversion currently uses Nautilus's deprecated `convert_quote_qty_to_base` bridge and is treated as a sandbox-only modeling limitation, not a live adapter bug
+
+Note on tick-size updates:
+- the Nautilus Polymarket data adapter also listens for PM tick-size-change messages and rebuilds the local instrument/book precision when they arrive
+- for the current market-order strategies, this is mainly a data-plane churn event; the most likely impact is a transient skipped trade while quotes are rebuilt, not a mispriced order submission
+
 ---
 
 ## Runner Profiles
@@ -316,6 +325,12 @@ Stage 8 introduces a separate wallet-based resolution flow outside the Nautilus 
 
 Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False)`) to avoid a startup crash from the sandbox exec client returning empty account reports.
 
+Sandbox mode also keeps `convert_quote_qty_to_base=True` so quote-denominated
+Polymarket market BUYs can still execute through the Nautilus sandbox matching
+engine. This is a known sandbox approximation. If we ever remove it, the
+replacement should be a project-owned sandbox-only quote-to-base conversion
+path, not a change to live Polymarket order semantics.
+
 ---
 
 ## Operator Runbook
@@ -335,6 +350,7 @@ Sandbox mode disables reconciliation (`LiveExecEngineConfig(reconciliation=False
 6. Treat window exhaustion as a normal stop condition for this phase. Restart the node for the next session or next day.
 7. Daily restart is acceptable even if the first window after restart is missed.
 8. Low free collateral should block new entries, but should not stop the node while an open position, cleanup, or carried residual still exists.
+9. Post-window cleanup is currently `try IOC flatten, then carry if cleanup cannot finish`; that is a policy default, and production strategies may later choose alternatives such as `flatten only if executable` or `carry immediately`.
 
 ### Soak Harness
 

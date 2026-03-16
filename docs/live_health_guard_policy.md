@@ -161,6 +161,25 @@ When a Polymarket window has ended and the remaining YES/NO exposure is known, t
 
 Manual redemption is still out of scope for the current implementation.
 
+### Post-window cleanup policy
+
+The current default implementation is:
+- when a window ends, try to flatten the old-window position with IOC cleanup orders
+- if cleanup cannot finish normally, carry the known residual to resolution
+
+This is a policy default, not a correctness requirement.
+
+Different production setups may reasonably choose different post-window behavior, for example:
+- flatten first, then carry
+- flatten only if the last known book is still executable
+- allow one bounded cleanup probe, then carry
+- carry immediately after window close
+
+The important distinction is:
+- `known residual` remains a valid state
+- choosing how aggressively to attempt post-window flattening is a strategy / portfolio policy decision
+- unknown order or exposure state is still a stop-worthy condition
+
 ---
 
 ## Stage 5 v1 Implementation Scope

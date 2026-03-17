@@ -11,14 +11,19 @@ This exists because the roadmap in [docs/live_testing_plan.md](/Users/noel/proje
 - Latest committed hardening status on `master`: `f33571d` (`Document remaining sandbox policy notes`)
 - Current automated validation:
   - `.venv/bin/python -m pytest tests/live`
-  - result: `171 passed`
+  - result: `183 passed`
 - Multi-hour sandbox stability is now reproven after Stage 8/9 with:
   - [stage10_btc_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170352Z_stage10_btc_8h_rerun2/summary.json)
   - [stage10_random_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170400Z_stage10_random_8h_rerun2/summary.json)
 - Still not fully proven:
   - live dry-run resolution scan against real resolved-wallet state
   - live redemption rehearsal
-  - tiny live PM cancel rehearsal
+  - Nautilus-managed live order lifecycle rehearsal
+  - minimum-size live fill rehearsal
+
+- Stage 11 live PM control-plane rehearsal is now proven:
+  - submit -> open -> cancel -> canceled -> zero conditional balance
+  - validated on March 17, 2026 against `bitcoin-up-or-down-on-march-18-2026`
 
 ---
 
@@ -366,11 +371,11 @@ Runtime proof:
   - the old residual IOC shutdown warning did not reappear
 
 Remaining proof needed:
-- later, a tiny live PM cancel rehearsal
+- a Nautilus-managed live order lifecycle rehearsal
 
 ## Recommended Immediate Next Step
 
 Proceed to the next roadmap stage:
 
-- perform the tiny live PM cancel rehearsal
+- perform a tiny Nautilus-managed live order lifecycle rehearsal
 - then, if clean, move to the minimum-size live fill rehearsal

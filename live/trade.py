@@ -20,7 +20,6 @@ import sys
 from pathlib import Path
 
 import requests
-from dotenv import load_dotenv
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds,
@@ -32,24 +31,30 @@ from py_clob_client.clob_types import (
     TradeParams,
 )
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
+
+_BOOTSTRAP_ARGV = bootstrap_env_file()
+load_project_env()
 
 HOST = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 CHAIN_ID = 137
 
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-API_KEY = os.getenv("POLYMARKET_API_KEY")
-API_SECRET = os.getenv("POLYMARKET_API_SECRET")
-API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE")
-
 
 def make_client() -> ClobClient:
-    client = ClobClient(host=HOST, key=PRIVATE_KEY, chain_id=CHAIN_ID, signature_type=0)
+    client = ClobClient(
+        host=HOST,
+        key=os.environ["PRIVATE_KEY"],
+        chain_id=CHAIN_ID,
+        signature_type=0,
+    )
     client.set_api_creds(ApiCreds(
-        api_key=API_KEY,
-        api_secret=API_SECRET,
-        api_passphrase=API_PASSPHRASE,
+        api_key=os.environ["POLYMARKET_API_KEY"],
+        api_secret=os.environ["POLYMARKET_API_SECRET"],
+        api_passphrase=os.getenv("POLYMARKET_PASSPHRASE") or os.environ["POLYMARKET_API_PASSPHRASE"],
     ))
     return client
 
@@ -139,13 +144,15 @@ def place_order(client: ClobClient, token_id: str, side: str, amount: float, tic
         print(f"\n✗ Order failed — {resp}")
 
 
-def main():
+def main(argv: list[str] | None = None):
+    argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
     parser = argparse.ArgumentParser(description="Place a Polymarket market order")
+    add_env_file_arg(parser)
     parser.add_argument("--event", help="Event slug (e.g. bitcoin-above-on-march-1)")
     parser.add_argument("--side", choices=["BUY", "SELL"])
     parser.add_argument("--amount", type=float, help="USDC for BUY, shares for SELL")
     parser.add_argument("--trades", action="store_true", help="Show recent trade history")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     client = make_client()
 

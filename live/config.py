@@ -9,7 +9,6 @@ by picking exactly the clients they need.
 """
 import os
 
-from dotenv import load_dotenv
 from nautilus_trader.adapters.binance.common.enums import BinanceAccountType
 from nautilus_trader.adapters.binance.config import BinanceDataClientConfig
 from nautilus_trader.adapters.polymarket import (
@@ -20,7 +19,9 @@ from nautilus_trader.adapters.polymarket.providers import PolymarketInstrumentPr
 from nautilus_trader.adapters.sandbox.config import SandboxExecutionClientConfig
 from nautilus_trader.config import InstrumentProviderConfig
 
-load_dotenv()
+from live.env import load_project_env
+
+load_project_env()
 
 
 def binance_data_config(us: bool = False) -> BinanceDataClientConfig:

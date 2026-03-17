@@ -10,6 +10,8 @@ Documenting what was discovered getting from zero to a live filled buy and sell 
 - Key libraries: `py-clob-client`, `web3`, `python-dotenv`
 - Wallet: EOA (signature type 0), generated via `eth_account`
 - Network: Polygon mainnet (chain ID 137)
+- Live scripts default to the repo `.env`, but the main setup/trading entrypoints
+  also accept `--env-file /abs/path/live_wallet.env` for a separate funded wallet file
 
 ---
 

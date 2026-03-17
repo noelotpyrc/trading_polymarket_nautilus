@@ -5,15 +5,15 @@ import json
 import os
 import sys
 
-from dotenv import load_dotenv
-
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
 from live.profiles import ProfileError, RunnerProfile, available_profile_names, load_profile
 from live.runs.common import run_strategy, validate_strategy_config
 
-load_dotenv()
+_BOOTSTRAP_ARGV = bootstrap_env_file()
+load_project_env()
 
 
 def run_profile(
@@ -46,6 +46,7 @@ def run_profile(
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
     parser = _make_profile_arg_parser()
     args = parser.parse_args(argv)
 
@@ -61,6 +62,7 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def main_for_profile(profile_name: str, argv: list[str] | None = None) -> None:
+    argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
     parser = _make_fixed_profile_arg_parser(profile_name)
     args = parser.parse_args(argv)
 
@@ -86,6 +88,7 @@ def main_for_profile(profile_name: str, argv: list[str] | None = None) -> None:
 
 def _make_profile_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a checked-in live runner profile")
+    add_env_file_arg(parser)
     parser.add_argument("profile", nargs="?", help="Profile name or path to a TOML file")
     parser.add_argument("--list", action="store_true", help="List available checked-in profiles and exit")
     parser.add_argument("--hours-ahead", type=int, default=None,
@@ -103,6 +106,7 @@ def _make_profile_arg_parser() -> argparse.ArgumentParser:
 
 def _make_fixed_profile_arg_parser(profile_name: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=f"Run live profile {profile_name}")
+    add_env_file_arg(parser)
     parser.add_argument("--hours-ahead", type=int, default=None,
                         help="Override profile window preload horizon in hours")
     parser.add_argument("--run-secs", type=int, default=None,
@@ -118,6 +122,8 @@ def _make_fixed_profile_arg_parser(profile_name: str) -> argparse.ArgumentParser
 
 def _fixed_profile_argv(args) -> list[str]:
     argv: list[str] = []
+    if args.env_file is not None:
+        argv.extend(["--env-file", args.env_file])
     if args.hours_ahead is not None:
         argv.extend(["--hours-ahead", str(args.hours_ahead)])
     if args.run_secs is not None:

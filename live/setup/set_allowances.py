@@ -13,19 +13,23 @@ Usage:
     python live/setup/set_allowances.py
 """
 
+import argparse
 import sys
 from pathlib import Path
 
-from dotenv import dotenv_values
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
 
+from live.env import add_env_file_arg, project_dotenv_values, resolve_env_path
+
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137
 RPC_URL = "https://polygon-bor-rpc.publicnode.com"
-ENV_PATH = Path(__file__).parents[2] / ".env"
 
 # USDC.e on Polygon
 USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
@@ -85,11 +89,11 @@ ERC1155_ABI = [
 MAX_UINT256 = 2**256 - 1
 
 
-def load_env() -> dict:
-    env = dotenv_values(ENV_PATH)
+def load_env(env_file: str | None) -> dict:
+    env = project_dotenv_values(env_file)
     missing = [k for k in ("PRIVATE_KEY", "WALLET_ADDRESS", "POLYMARKET_API_KEY") if not env.get(k)]
     if missing:
-        print(f"ERROR: Missing in .env: {', '.join(missing)}")
+        print(f"ERROR: Missing in {resolve_env_path(env_file)}: {', '.join(missing)}")
         print("  Run generate_wallet.py and init_trading.py first")
         sys.exit(1)
     return env
@@ -160,7 +164,11 @@ def sync_polymarket(client: ClobClient) -> None:
 
 
 def main() -> None:
-    env = load_env()
+    parser = argparse.ArgumentParser()
+    add_env_file_arg(parser)
+    args = parser.parse_args()
+
+    env = load_env(args.env_file)
     wallet = env["WALLET_ADDRESS"]
     print(f"Wallet: {wallet}")
     print()

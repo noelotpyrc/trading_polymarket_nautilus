@@ -304,6 +304,64 @@ class TestRunSoakBatch:
         assert "--interval-secs 15" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
         assert "--sandbox-starting-usdc 10.0" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
 
+    def test_batch_forwards_env_file_to_runner_and_worker(self, tmp_path, monkeypatch):
+        profile = _profile(name="random_signal_15m_resolution_sandbox", run_secs=600)
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+
+        def fake_run(command, cwd, stdout, stderr, text, check):
+            stdout.write("runner output\n")
+            return SimpleNamespace(returncode=0)
+
+        class FakeWorkerProcess:
+            def __init__(self, command, cwd, stdout, stderr, text):
+                self.command = command
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(soak.subprocess, "run", fake_run)
+        monkeypatch.setattr(soak.subprocess, "Popen", FakeWorkerProcess)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["random_signal_15m_resolution_sandbox"],
+            run_secs=600,
+            hours_ahead=None,
+            output_root=tmp_path,
+            label=None,
+            keep_going=False,
+            allow_live=False,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            sandbox_starting_usdc=None,
+            with_resolution_worker=True,
+            resolution_interval_secs=15,
+            env_file="/tmp/live_wallet.env",
+        )
+
+        result = batch["results"][0]
+
+        assert result["command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
+        assert result["worker_command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
+
 
 class TestMain:
     def test_main_lists_profiles(self, monkeypatch, capsys):

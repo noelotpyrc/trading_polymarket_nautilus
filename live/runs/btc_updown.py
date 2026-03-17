@@ -3,15 +3,15 @@
 import os
 import sys
 
-from dotenv import load_dotenv
-
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, PROJECT_ROOT)
 
+from live.env import bootstrap_env_file, load_project_env
 from live.node import make_arg_parser
 from live.runs.common import run_strategy
 
-load_dotenv()
+_BOOTSTRAP_ARGV = bootstrap_env_file()
+load_project_env()
 
 
 def run(args) -> None:
@@ -31,6 +31,7 @@ def run(args) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
     parser = make_arg_parser("BTC up/down momentum strategy")
     args = parser.parse_args(argv)
     run(args)

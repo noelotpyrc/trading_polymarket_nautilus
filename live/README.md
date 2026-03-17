@@ -54,6 +54,26 @@ Approves Polymarket contracts to spend your USDC. One-time on-chain transaction.
 
 After this, `.env` will look like `.env.example` with all fields populated.
 
+### Alternate env files
+
+If you keep a funded live wallet in a separate env file, the main live entrypoints
+now accept `--env-file` so you do not need to shell-source secrets or swap the
+repo `.env` file manually.
+
+Examples:
+
+```bash
+python live/setup/init_trading.py --env-file /abs/path/live_wallet.env
+python live/setup/set_allowances.py --env-file /abs/path/live_wallet.env
+python live/trade.py --env-file /abs/path/live_wallet.env --trades
+python live/run_resolution.py btc_updown_15m_live --env-file /abs/path/live_wallet.env --once
+python live/runs/profile.py btc_updown_15m_live --env-file /abs/path/live_wallet.env
+python live/soak.py btc_updown_15m_live --allow-live --env-file /abs/path/live_wallet.env --run-secs 300
+```
+
+This keeps the selected wallet explicit at the command level instead of relying
+on shell state.
+
 ---
 
 ## Authentication
@@ -81,6 +101,7 @@ sandbox_wallet.py    # Synthetic sandbox wallet store + wallet-truth provider
 resolution_worker.py # External wallet-based resolution worker primitives
 redemption.py        # Production redemption backend (dry-run or execute)
 run_resolution.py    # External resolution-worker CLI
+rehearsal.py         # Stage 11 live order lifecycle rehearsal (resting order -> cancel)
 profiles/
   catalog/           # Checked-in runner profile TOML files
 runs/
@@ -171,10 +192,55 @@ Current behavior:
 - internal node resolution remains advisory only; wallet truth is the authoritative settlement signal
 - open-order truth still stays inside the Nautilus node
 
+## Stage 11 Live Rehearsal
+
+Use [rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/live/rehearsal.py) for the first live control-plane check before any intended fill risk. It submits one tiny post-only resting BUY, confirms it opens, cancels it, then confirms no token balance remains.
+
+```bash
+python live/rehearsal.py \
+  --env-file /abs/path/live_wallet.env \
+  --event bitcoin-above-on-march-1 \
+  --market-index 0
+```
+
+Or search interactively:
+
+```bash
+python live/rehearsal.py \
+  --env-file /abs/path/live_wallet.env \
+  --search "bitcoin above"
+```
+
+Default safety posture:
+- price is pinned to the minimum valid tick, not near the touch
+- the script refuses markets already trading too close to the price floor
+- order type is `GTC` with `post_only=True`
+- rehearsal notional defaults to `5.10` USDC
+- operator confirmation is required unless `--yes` is passed
+
+Usage note:
+- use Stage 11 only on simple binary markets
+- avoid neg-risk / multi-outcome market families for this rehearsal
+- on those complex markets, the event lookup may still be correct while the raw token-level CLOB book the script reads does not line up with the frontend market view
+- if the script shows a degenerate book like `0.01 / 0.99`, treat that market as unsuitable and pick another event/market
+
+Validated result:
+- on March 17, 2026, the rehearsal passed on `bitcoin-up-or-down-on-march-18-2026`
+- observed lifecycle was submit -> `LIVE` -> cancel -> `CANCELED`
+- `size_matched = 0` and conditional balance returned to `0.000000`
+
+The purpose of this stage is only:
+- live auth
+- real PM order submission
+- open-order observation
+- live cancel confirmation
+
+It does not validate the Nautilus live node yet, and it is not a live fill rehearsal.
+
 ## Runner Profiles
 
 - Profile files live in [live/profiles/catalog](/Users/noel/projects/trading_polymarket_nautilus/live/profiles/catalog).
-- Secrets stay in `.env`; profile files only hold checked-in runtime choices.
+- Secrets stay in `.env` by default, or in an explicit alternate file passed via `--env-file`; profile files only hold checked-in runtime choices.
 - Current catalog:
   - `btc_updown_15m_live`
   - `btc_updown_15m_live_no`

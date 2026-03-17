@@ -15,19 +15,23 @@ import argparse
 import sys
 from pathlib import Path
 
-from dotenv import dotenv_values, set_key
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from dotenv import set_key
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 
+from live.env import add_env_file_arg, project_dotenv_values, resolve_env_path
+
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
-ENV_PATH = Path(__file__).parents[2] / ".env"
 
 
-def load_env(private_key_var: str, addr_var: str) -> dict:
-    env = dotenv_values(ENV_PATH)
+def load_env(private_key_var: str, env_file: str | None) -> dict:
+    env = project_dotenv_values(env_file)
     if not env.get(private_key_var):
-        print(f"ERROR: No {private_key_var} found in .env")
+        print(f"ERROR: No {private_key_var} found in {resolve_env_path(env_file)}")
         flag = " --test" if "TEST" in private_key_var else ""
         print(f"  Run: python live/setup/generate_wallet.py{flag} first")
         sys.exit(1)
@@ -54,14 +58,16 @@ def verify_connection(client: ClobClient) -> None:
 
 def derive_and_save_creds(
     client: ClobClient,
+    env_file: str | None,
     key_var: str,
     secret_var: str,
     passphrase_var: str,
 ) -> ApiCreds:
-    env = dotenv_values(ENV_PATH)
+    env_path = resolve_env_path(env_file)
+    env = project_dotenv_values(env_file)
 
     if env.get(key_var):
-        print(f"API credentials already in .env ({key_var}) — skipping derivation")
+        print(f"API credentials already in {env_path} ({key_var}) — skipping derivation")
         return ApiCreds(
             api_key=env[key_var],
             api_secret=env[secret_var],
@@ -70,15 +76,16 @@ def derive_and_save_creds(
 
     print("Deriving API credentials...")
     creds = client.create_or_derive_api_creds()
-    set_key(ENV_PATH, key_var, creds.api_key)
-    set_key(ENV_PATH, secret_var, creds.api_secret)
-    set_key(ENV_PATH, passphrase_var, creds.api_passphrase)
-    print("  Saved to .env")
+    set_key(str(env_path), key_var, creds.api_key)
+    set_key(str(env_path), secret_var, creds.api_secret)
+    set_key(str(env_path), passphrase_var, creds.api_passphrase)
+    print(f"  Saved to {env_path}")
     return creds
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    add_env_file_arg(parser)
     parser.add_argument(
         "--test", action="store_true",
         help="Derive credentials for the test wallet (sandbox mode)"
@@ -100,7 +107,7 @@ def main() -> None:
         api_passphrase_var = "POLYMARKET_API_PASSPHRASE"
         label = "PRODUCTION"
 
-    env = load_env(private_key_var, addr_var)
+    env = load_env(private_key_var, args.env_file)
     print(f"{label} wallet: {env.get(addr_var, '(unknown)')}")
     print()
 
@@ -108,7 +115,13 @@ def main() -> None:
     verify_connection(client)
     print()
 
-    creds = derive_and_save_creds(client, api_key_var, api_secret_var, api_passphrase_var)
+    creds = derive_and_save_creds(
+        client,
+        args.env_file,
+        api_key_var,
+        api_secret_var,
+        api_passphrase_var,
+    )
     client.set_api_creds(creds)
 
     print()

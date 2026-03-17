@@ -12,12 +12,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
 from live.profiles import ProfileError, RunnerProfile, available_profile_names, load_profile
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "logs" / "soak"
+_BOOTSTRAP_ARGV = bootstrap_env_file()
+load_project_env()
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
     parser = _make_arg_parser()
     args = parser.parse_args(argv)
 
@@ -45,6 +49,7 @@ def main(argv: list[str] | None = None) -> None:
             sandbox_starting_usdc=args.sandbox_starting_usdc,
             with_resolution_worker=args.with_resolution_worker,
             resolution_interval_secs=args.resolution_interval_secs,
+            env_file=args.env_file,
         )
     except (ProfileError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -68,6 +73,7 @@ def run_soak_batch(
     sandbox_starting_usdc: float | None = None,
     with_resolution_worker: bool = False,
     resolution_interval_secs: int = 30,
+    env_file: str | None = None,
 ) -> dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
     batch_dir = _make_batch_dir(output_root, label=label)
@@ -95,6 +101,7 @@ def run_soak_batch(
             sandbox_starting_usdc=sandbox_starting_usdc,
             with_resolution_worker=with_resolution_worker,
             resolution_interval_secs=resolution_interval_secs,
+            env_file=env_file,
         )
         results.append(result)
         if result["status"] != "passed":
@@ -115,6 +122,7 @@ def run_soak_batch(
         "sandbox_starting_usdc_override": sandbox_starting_usdc,
         "with_resolution_worker": with_resolution_worker,
         "resolution_interval_secs": resolution_interval_secs if with_resolution_worker else None,
+        "env_file": env_file,
         "results": results,
     }
     _write_json(batch_dir / "summary.json", batch_summary)
@@ -123,6 +131,7 @@ def run_soak_batch(
 
 def _make_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run bounded soak sessions for live profiles")
+    add_env_file_arg(parser)
     parser.add_argument("profiles", nargs="*", help="Profile names or TOML paths to run sequentially")
     parser.add_argument("--list", action="store_true", help="List available checked-in profiles and exit")
     parser.add_argument("--hours-ahead", type=int, default=None,
@@ -187,6 +196,7 @@ def _run_profile(
     sandbox_starting_usdc: float | None,
     with_resolution_worker: bool,
     resolution_interval_secs: int,
+    env_file: str | None,
 ) -> dict[str, object]:
     run_dir = batch_dir / f"{index:02d}_{_safe_name(profile.name)}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -198,6 +208,8 @@ def _run_profile(
         str(PROJECT_ROOT / "live" / "runs" / "profile.py"),
         _command_profile_ref(profile_ref, fallback_name=profile.name),
     ]
+    if env_file is not None:
+        command.extend(["--env-file", env_file])
     command.extend(["--hours-ahead", str(profile.hours_ahead)])
     if profile.run_secs is not None:
         command.extend(["--run-secs", str(profile.run_secs)])
@@ -242,13 +254,17 @@ def _run_profile(
                     sys.executable,
                     str(PROJECT_ROOT / "live" / "run_resolution.py"),
                     _command_profile_ref(profile_ref, fallback_name=profile.name),
+                ]
+                if env_file is not None:
+                    worker_command.extend(["--env-file", env_file])
+                worker_command.extend([
                     "--hours-ahead",
                     str(profile.hours_ahead),
                     "--sandbox-wallet-state-path",
                     str(wallet_state_path),
                     "--interval-secs",
                     str(resolution_interval_secs),
-                ]
+                ])
                 if effective_sandbox_starting_usdc is not None:
                     worker_command.extend(
                         ["--sandbox-starting-usdc", str(effective_sandbox_starting_usdc)]

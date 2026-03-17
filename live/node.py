@@ -23,11 +23,11 @@ import time
 from datetime import datetime, timezone
 
 import requests
-from dotenv import load_dotenv
 
+from live.env import add_env_file_arg, load_project_env
 from live.market_metadata import ResolvedWindowMetadata
 
-load_dotenv()
+load_project_env()
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -176,6 +176,7 @@ def build_node(
 def make_arg_parser(description: str) -> argparse.ArgumentParser:
     """Standard CLI args shared by all strategy runners."""
     parser = argparse.ArgumentParser(description=description)
+    add_env_file_arg(parser)
     parser.add_argument("--slug-pattern", required=True,
                         help="Market slug pattern, e.g. btc-updown-15m")
     parser.add_argument("--hours-ahead", type=int, default=4,

@@ -7,11 +7,10 @@ import os
 import sys
 import time
 
-from dotenv import load_dotenv
-
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(PROJECT_ROOT))
 
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
 from live.market_metadata import WindowMetadataRegistry
 from live.node import resolve_upcoming_window_metadata
 from live.profiles import ProfileError, available_profile_names, load_profile
@@ -20,10 +19,12 @@ from live.resolution_worker import ResolutionWorker, SandboxResolutionExecutor
 from live.sandbox_wallet import SandboxWalletStore, SandboxWalletTruthProvider
 from live.wallet_truth import ProdWalletTruthProvider, make_polymarket_balance_client
 
-load_dotenv()
+_BOOTSTRAP_ARGV = bootstrap_env_file()
+load_project_env()
 
 
 def main(argv: list[str] | None = None) -> None:
+    argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
     parser = _make_arg_parser()
     args = parser.parse_args(argv)
 
@@ -77,6 +78,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def _make_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the external Polymarket resolution worker")
+    add_env_file_arg(parser)
     parser.add_argument("profile", nargs="?", help="Profile name or path to a TOML file")
     parser.add_argument("--list", action="store_true", help="List available checked-in profiles and exit")
     parser.add_argument("--hours-ahead", type=int, default=None,

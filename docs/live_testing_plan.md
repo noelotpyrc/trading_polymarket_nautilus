@@ -384,8 +384,8 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 **Purpose**
 - Prove the live control plane before taking fill risk
-- Validate live auth, order submission, open-order state, cancel, and cleanup
-- Confirm Nautilus state matches venue state for a real live order
+- Validate live auth, PM order submission, open-order state, cancel, and cleanup
+- Confirm the live PM control plane behaves cleanly before any intended fill risk
 
 **What we will implement**
 - Use one supervised live process
@@ -393,13 +393,23 @@ Submit a tiny live order that is intended to rest, then cancel it.
 - Prefer `post_only=True` if supported by the order path
 - Wait for open confirmation, then cancel quickly
 
+**Implementation status**
+- Dedicated rehearsal CLI added in [live/rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/live/rehearsal.py)
+- Uses direct `py-clob-client` control-plane calls instead of the Nautilus trading node
+- Loads funded-wallet secrets via `--env-file`
+- Default posture is a tiny post-only resting BUY at the minimum valid price, with a hard guard that skips markets already trading too close to the floor
+- Stage 11 usage should be limited to simple binary markets
+- Neg-risk / multi-outcome market families are currently excluded in practice because the raw token-level CLOB book used by the rehearsal script may not line up with the frontend market view even when event selection is correct
+- Runtime validation passed on March 17, 2026 against `bitcoin-up-or-down-on-march-18-2026`
+- Observed live lifecycle: submit -> `LIVE` open confirmation -> cancel -> `CANCELED` final state -> zero conditional balance
+
 **Success criteria**
 - The live order is accepted by Polymarket
-- Nautilus sees the order as open
+- Polymarket reports the order as open
 - Cancel succeeds cleanly
 - No fill occurs
 - No residual open order or position remains afterward
-- Venue state matches Nautilus state after cleanup
+- No conditional token balance remains afterward
 
 ---
 

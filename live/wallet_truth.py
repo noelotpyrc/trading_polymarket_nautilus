@@ -5,16 +5,16 @@ from dataclasses import dataclass
 import os
 from typing import Protocol
 
-from dotenv import load_dotenv
 import requests
 from py_clob_client.client import BalanceAllowanceParams
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds
 from py_clob_client.clob_types import AssetType
 
+from live.env import load_project_env
 from live.market_metadata import WindowMetadataRegistry
 
-load_dotenv()
+load_project_env()
 
 HOST = "https://clob.polymarket.com"
 CHAIN_ID = 137

@@ -366,6 +366,16 @@ Run the live process for hours, not minutes.
 - Real production setups may later choose a different policy, such as `flatten only if executable`, `single bounded probe then carry`, or `carry immediately after window close`.
 - The recurring `Instrument tick size changed` warning is currently treated as PM-side metadata churn surfaced by the Nautilus Polymarket adapter. For the current market-order strategies, the main practical effect is possible transient skipped entries while the local book/quote precision is rebuilt.
 
+**Runtime validation completed**
+- `python live/soak.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800 --sandbox-starting-usdc 500 --with-resolution-worker --label stage10_btc_8h_rerun2`
+- `python live/soak.py random_signal_15m_sandbox --hours-ahead 8 --run-secs 28800 --sandbox-starting-usdc 500 --with-resolution-worker --label stage10_random_8h_rerun2`
+- Both 8h sandbox reruns completed cleanly with:
+  - no uncaught exceptions
+  - clean shutdown tails
+  - no reappearance of the old residual-order / residual-position shutdown warnings
+  - carried residual settlement and stale-IOC reconciliation still working under longer runtime
+  - remaining warnings limited to known reconnect/tick-size/conversion noise
+
 ---
 
 ## Stage 11 — Live Order Lifecycle Rehearsal (No Intended Fill)

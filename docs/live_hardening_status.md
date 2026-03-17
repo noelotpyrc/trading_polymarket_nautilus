@@ -8,15 +8,17 @@ This exists because the roadmap in [docs/live_testing_plan.md](/Users/noel/proje
 
 ## Current Snapshot
 
-- Latest committed Stage 8 baseline on `master`: `b84de57` (`Add wallet truth and resolution worker flow`)
-- There is a new local Stage 9 implementation + validation batch after that commit
-- Current local automated validation:
+- Latest committed hardening status on `master`: `f33571d` (`Document remaining sandbox policy notes`)
+- Current automated validation:
   - `.venv/bin/python -m pytest tests/live`
   - result: `171 passed`
-- Still not fully proven after the current local batch:
+- Multi-hour sandbox stability is now reproven after Stage 8/9 with:
+  - [stage10_btc_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170352Z_stage10_btc_8h_rerun2/summary.json)
+  - [stage10_random_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170400Z_stage10_random_8h_rerun2/summary.json)
+- Still not fully proven:
   - live dry-run resolution scan against real resolved-wallet state
   - live redemption rehearsal
-  - tiny live PM cancel rehearsal for Stage 9
+  - tiny live PM cancel rehearsal
 
 ---
 
@@ -308,12 +310,18 @@ Runtime validation now completed:
 - informational-only internal resolution semantics
 - low-balance entry gating with idle-only stop behavior
 
-### Not yet reproven on fresh long real sandbox runs
+### Reproven on fresh long sandbox runs
 
 - multi-hour soak behavior after:
   - residual entry-order cleanup
   - side-aware quote handling
   - shared sandbox wallet-state plumbing
+  - wallet-truth reconciliation for carried residuals
+  - order-truth reconciliation for stale IOC remainders
+- runtime evidence:
+  - [stage10_btc_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170352Z_stage10_btc_8h_rerun2/summary.json)
+  - [stage10_random_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170400Z_stage10_random_8h_rerun2/summary.json)
+  - both runs completed their full 8h bound, ended flat in `wallet_state.json`, and did not reproduce the old shutdown residual warnings
 
 ### Not yet proven live
 
@@ -364,5 +372,5 @@ Remaining proof needed:
 
 Proceed to the next roadmap stage:
 
-- rerun the longer sandbox soaks against the new order-reconciliation path
-- then perform the tiny live PM cancel rehearsal
+- perform the tiny live PM cancel rehearsal
+- then, if clean, move to the minimum-size live fill rehearsal

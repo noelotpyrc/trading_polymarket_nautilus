@@ -102,6 +102,8 @@ resolution_worker.py # External wallet-based resolution worker primitives
 redemption.py        # Production redemption backend (dry-run or execute)
 run_resolution.py    # External resolution-worker CLI
 rehearsal.py         # Stage 11 live order lifecycle rehearsal (resting order -> cancel)
+fill_rehearsal.py    # Stage 12a live limit-fill rehearsal (entry -> limit exit or settlement)
+redeem_oneoff.py     # One-off redemption helper for a resolved live market slug
 profiles/
   catalog/           # Checked-in runner profile TOML files
 runs/
@@ -236,6 +238,61 @@ The purpose of this stage is only:
 - live cancel confirmation
 
 It does not validate the Nautilus live node yet, and it is not a live fill rehearsal.
+
+## Stage 12a Live Fill Rehearsal
+
+Use [fill_rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/live/fill_rehearsal.py) for the first live filled-order rehearsal before attempting a Nautilus-managed live fill.
+
+It uses direct PM client calls on `btc-updown-15m` windows and persists per-run artifacts under `logs/fill_rehearsal/`.
+
+Default policy:
+- watches upcoming `btc-updown-15m` windows but trades only the current active one
+- enters only in the last `60s`
+- requires chosen-side best bid `> 0.90`
+- uses passive best-bid limit entry with bounded `10s` reprices
+- if any entry attempt partially fills, entry is latched complete for that window and no further BUYs are submitted
+- first tries a profitable passive live limit exit
+- falls back to settlement if profitable live exit is impossible or if the remaining token balance is below PM `min_order_size`
+- optional in-process settlement waiting and redemption
+
+Example `limit_exit`-capable run:
+
+```bash
+python live/fill_rehearsal.py \
+  --env-file /abs/path/live_wallet.env \
+  --outcome-side yes \
+  --hours-ahead 2 \
+  --label stage12a_debug4
+```
+
+Example settlement-targeted run:
+
+```bash
+python live/fill_rehearsal.py \
+  --env-file /abs/path/live_wallet.env \
+  --outcome-side yes \
+  --hours-ahead 2 \
+  --profit-buffer-usd 0.10 \
+  --wait-for-settlement \
+  --redeem-on-settlement \
+  --label stage12a_settlement2
+```
+
+Validated results:
+- `limit_exit` branch passed on March 19, 2026:
+  - [stage12a_debug4 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/fill_rehearsal/20260318T235609Z_stage12a_debug4/summary.json)
+- `settlement + redeem` branch passed on March 19, 2026:
+  - [stage12a_settlement2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/fill_rehearsal/20260319T182233Z_stage12a_settlement2/summary.json)
+
+If you need to redeem a specific resolved market manually, use [redeem_oneoff.py](/Users/noel/projects/trading_polymarket_nautilus/live/redeem_oneoff.py):
+
+```bash
+python live/redeem_oneoff.py \
+  --env-file /abs/path/live_wallet.env \
+  --market-slug btc-updown-15m-1773869400 \
+  --execute \
+  --yes
+```
 
 ## Runner Profiles
 

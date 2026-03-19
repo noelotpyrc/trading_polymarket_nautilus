@@ -7,23 +7,29 @@ This exists because the roadmap in [docs/live_testing_plan.md](/Users/noel/proje
 ---
 
 ## Current Snapshot
-
-- Latest committed hardening status on `master`: `f33571d` (`Document remaining sandbox policy notes`)
 - Current automated validation:
   - `.venv/bin/python -m pytest tests/live`
-  - result: `183 passed`
+  - result: `200 passed`
 - Multi-hour sandbox stability is now reproven after Stage 8/9 with:
   - [stage10_btc_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170352Z_stage10_btc_8h_rerun2/summary.json)
   - [stage10_random_8h_rerun2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/soak/20260316T170400Z_stage10_random_8h_rerun2/summary.json)
 - Still not fully proven:
   - live dry-run resolution scan against real resolved-wallet state
-  - live redemption rehearsal
   - Nautilus-managed live order lifecycle rehearsal
-  - minimum-size live fill rehearsal
+  - Nautilus-managed live settlement / redemption rehearsal
 
 - Stage 11 live PM control-plane rehearsal is now proven:
   - submit -> open -> cancel -> canceled -> zero conditional balance
   - validated on March 17, 2026 against `bitcoin-up-or-down-on-march-18-2026`
+
+- Stage 12a direct PM live fill rehearsal is now proven:
+  - `limit_exit` branch passed on March 19, 2026:
+    - [stage12a_debug4 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/fill_rehearsal/20260318T235609Z_stage12a_debug4/summary.json)
+  - `settlement + redeem` branch passed on March 19, 2026:
+    - [stage12a_settlement2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/fill_rehearsal/20260319T182233Z_stage12a_settlement2/summary.json)
+  - partial-fill-on-reprice handling is now fixed in the Stage 12a script and regression-covered in
+    [tests/live/test_fill_rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_fill_rehearsal.py),
+    but not yet live-observed
 
 ---
 

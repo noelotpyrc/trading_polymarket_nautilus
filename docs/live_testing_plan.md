@@ -31,14 +31,12 @@ The current repo is through the sandbox gate:
 - Daily restart with pre-loaded windows is the accepted operating model for now
 
 What is **not** proven yet:
-- Real Polymarket order submission and cancel behavior
-- Real live fill handling and venue reconciliation
+- Nautilus-managed live fill handling and venue reconciliation
 - Multi-hour stability under production-style supervision
 - Log-volume reduction from one-sided Polymarket books under a fresh multi-hour soak run
 - Resolution polling against live closed-market data
 - Full end-to-end wallet reconciliation from external redemption back into Nautilus account state
-- A real live redemption rehearsal
-- PM order-status reconciliation for stale IOC remainders
+- A Nautilus-managed live fill / settlement lifecycle
 
 ---
 
@@ -413,30 +411,94 @@ Submit a tiny live order that is intended to rest, then cancel it.
 
 ---
 
-## Stage 12 — Minimum-Size Live Fill Rehearsal
+## Stage 12 — Minimum-Size Live Limit Fill Rehearsal
 
-Execute the smallest practical live position, then flatten it.
+Execute the smallest practical live **limit-order** fill, then flatten it.
 
 **Purpose**
-- Prove the live execution path end-to-end, including fills
+- Prove the live filled-order path end-to-end with production-relevant order semantics
 - Validate real account balances, fees, position lifecycle, and flatten behavior
 - Close the gap that sandbox cannot prove
 
 **What we will implement**
-- Hard-cap live size to the minimum practical amount
-- Run one supervised process with one position at a time
-- Enter and exit a live position under strict exposure limits
+- Stage 12a:
+  - use a dedicated direct PM client script, not the Nautilus strategy runner
+  - preload/watch multiple upcoming `btc-updown-15m` windows, same style as the soak setup
+  - only the current active window is tradable at any moment
+  - in the last minute of the active window, submit a tiny passive live limit BUY on the chosen side when the chosen-side price/probability is `> 0.90`
+  - allow multiple bounded passive reprices before cutoff
+  - if the entry fills, first try the normal live limit exit path
+  - if the limit exit does not complete within the bounded exit policy, fall back to settlement
+- Stage 12b:
+  - only after Stage 12a passes, run one tiny Nautilus-managed live lifecycle/fill rehearsal
+  - keep one position at a time and bounded runtime
 
 **Risk controls**
-- Hard cap: minimum practical notional only
+- Hard cap: minimum practical notional only, with a small buffer above the $5 venue minimum
 - Only one live position open at a time
-- Strategy-side max-notional guard before `submit_order`
+- Use simple binary markets only
+- Manual operator confirmation before the entry leg
+- Hard fail if the flatten leg does not complete cleanly
+
+**Implementation notes**
+- This stage should not rely on market orders as the primary validation path
+- Live production trading is expected to use limit orders, so the first fill rehearsal should also use limit-order semantics
+- The direct PM rehearsal should prove venue-side fill and flatten before the Nautilus live node is introduced into the filled-order path
+- Entry policy:
+  - monitoring horizon may include multiple upcoming windows, but trading decisions apply only to the current active window
+  - entry window is the final `60s` before expiry
+  - keep at most one live entry order working at a time
+  - initial entry price is the current best bid on the chosen side
+  - if still unfilled and the best bid moves, cancel and replace to the new best bid
+  - reprice at most once every `10s`
+  - stop new entry attempts at `T-10`
+  - if still unfilled at `T-10`, cancel and skip the trade
+  - if partially filled, cancel the remainder at cutoff and continue with the actual filled size
+- Exit policy:
+  - unified policy is `passive_entry -> try_limit_exit -> fallback_to_settlement`
+  - after entry fill, compute the actual average entry price
+  - define a minimum profitable exit target in absolute cents, not in ticks:
+    - `min_exit_price = entry_avg_fill + profit_buffer_usd`
+    - default `profit_buffer_usd = 0.01`
+  - use the live current tick size only to round that target up to a valid order price increment
+  - keep the exit order at or above that rounded profitable threshold
+  - allow exit-order management for up to `30s` after entry fill
+  - reprice at most once every `10s`
+  - exit reprices may move downward only if they remain at or above the profitable threshold
+  - one short run is only expected to complete whichever branch actually happens
+  - confidence in both branches comes from multiple successful runs, not from forcing both outcomes in one run
+  - if any entry attempt observes `matched_size > 0`, entry is latched complete for that window:
+    - cancel any remaining entry remainder
+    - block all new entry attempts for that window
+    - continue with the actual synced token balance
+  - before any limit exit submit, use the live order-book `min_order_size` as a preflight:
+    - if remaining token balance is below PM minimum order size, skip live exit and fall back directly to settlement
 
 **Success criteria**
 - At least one full round trip completes live
 - Entry, exit, and final position state all reconcile with Polymarket
 - Fees and balances line up with venue history
-- No unexplained divergence remains between Nautilus state and venue state
+- No conditional token balance remains afterward
+- Stage 12a completes cleanly before any Nautilus-managed live fill is attempted
+- No unexplained divergence remains between observed venue state and local reconciliation
+
+**Implementation status**
+- Dedicated direct-PM Stage 12a tooling is implemented in:
+  - [live/fill_rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/live/fill_rehearsal.py)
+  - [live/redeem_oneoff.py](/Users/noel/projects/trading_polymarket_nautilus/live/redeem_oneoff.py)
+- Durable per-run artifacts are written under `logs/fill_rehearsal/`:
+  - `runner.log`
+  - `command.txt`
+  - `summary.json`
+  - `minute_mid_prices.json`
+- Stage 12a live `limit_exit` branch is proven:
+  - [stage12a_debug4 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/fill_rehearsal/20260318T235609Z_stage12a_debug4/summary.json)
+- Stage 12a live `settlement + redeem` branch is proven:
+  - [stage12a_settlement2 summary](/Users/noel/projects/trading_polymarket_nautilus/logs/fill_rehearsal/20260319T182233Z_stage12a_settlement2/summary.json)
+- Partial-fill entry handling is now regression-covered in:
+  - [tests/live/test_fill_rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_fill_rehearsal.py)
+- Remaining proof for Stage 12 is specifically Stage 12b:
+  - one tiny Nautilus-managed live fill / exit-or-settlement rehearsal
 
 ---
 
@@ -494,7 +556,10 @@ Stage 10
 Stage 11
   -> submit a tiny non-marketable live limit order and cancel it
 Stage 12
-  -> execute one minimum-size live fill-and-flatten rehearsal
+  -> execute one minimum-size live limit-entry rehearsal on `btc-updown-15m`
+  -> entry policy: passive best-bid entry in the last minute, bounded reprices, cancel by `T-10` if unfilled
+  -> exit policy: try live limit exit first, then fall back to settlement if needed
+  -> then run one tiny Nautilus-managed live lifecycle/fill rehearsal
 Stage 13
   -> tighten log retention and operator-facing observability
 ```

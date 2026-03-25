@@ -49,6 +49,8 @@ def main(argv: list[str] | None = None) -> None:
             sandbox_starting_usdc=args.sandbox_starting_usdc,
             with_resolution_worker=args.with_resolution_worker,
             resolution_interval_secs=args.resolution_interval_secs,
+            resolution_execute_redemptions=args.resolution_execute_redemptions,
+            resolution_rpc_url=args.resolution_rpc_url,
             env_file=args.env_file,
         )
     except (ProfileError, ValueError) as exc:
@@ -73,6 +75,8 @@ def run_soak_batch(
     sandbox_starting_usdc: float | None = None,
     with_resolution_worker: bool = False,
     resolution_interval_secs: int = 30,
+    resolution_execute_redemptions: bool = False,
+    resolution_rpc_url: str | None = None,
     env_file: str | None = None,
 ) -> dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
@@ -101,6 +105,8 @@ def run_soak_batch(
             sandbox_starting_usdc=sandbox_starting_usdc,
             with_resolution_worker=with_resolution_worker,
             resolution_interval_secs=resolution_interval_secs,
+            resolution_execute_redemptions=resolution_execute_redemptions,
+            resolution_rpc_url=resolution_rpc_url,
             env_file=env_file,
         )
         results.append(result)
@@ -122,6 +128,10 @@ def run_soak_batch(
         "sandbox_starting_usdc_override": sandbox_starting_usdc,
         "with_resolution_worker": with_resolution_worker,
         "resolution_interval_secs": resolution_interval_secs if with_resolution_worker else None,
+        "resolution_execute_redemptions": (
+            resolution_execute_redemptions if with_resolution_worker else None
+        ),
+        "resolution_rpc_url": resolution_rpc_url if with_resolution_worker else None,
         "env_file": env_file,
         "results": results,
     }
@@ -153,9 +163,13 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sandbox-starting-usdc", type=float, default=None,
                         help="Override sandbox starting USDC.e balance for simulated execution.")
     parser.add_argument("--with-resolution-worker", action="store_true",
-                        help="Also run the external resolution worker against the shared sandbox wallet state.")
+                        help="Also run the external resolution worker alongside the node run.")
     parser.add_argument("--resolution-interval-secs", type=int, default=30,
                         help="Polling interval for the companion resolution worker (default: 30)")
+    parser.add_argument("--resolution-execute-redemptions", action="store_true",
+                        help="In live mode, have the companion resolution worker submit redemption transactions. Default is dry-run summaries only.")
+    parser.add_argument("--resolution-rpc-url", default=None,
+                        help="Optional Polygon RPC URL override for the companion resolution worker.")
     return parser
 
 
@@ -196,12 +210,12 @@ def _run_profile(
     sandbox_starting_usdc: float | None,
     with_resolution_worker: bool,
     resolution_interval_secs: int,
+    resolution_execute_redemptions: bool,
+    resolution_rpc_url: str | None,
     env_file: str | None,
 ) -> dict[str, object]:
     run_dir = batch_dir / f"{index:02d}_{_safe_name(profile.name)}"
     run_dir.mkdir(parents=True, exist_ok=False)
-    if with_resolution_worker and not profile.sandbox:
-        raise ProfileError("Resolution worker mode only supports sandbox profiles")
 
     command = [
         sys.executable,
@@ -228,6 +242,8 @@ def _run_profile(
             else run_dir / "wallet_state.json"
         )
         command.extend(["--sandbox-wallet-state-path", str(wallet_state_path)])
+    events_path = run_dir / "events.jsonl"
+    command.extend(["--events-path", str(events_path)])
 
     started_at = _utc_now()
     log_path = run_dir / "runner.log"
@@ -248,27 +264,31 @@ def _run_profile(
         worker_handle = None
         try:
             if with_resolution_worker:
-                assert wallet_state_path is not None
                 worker_log_path = run_dir / "worker.log"
                 worker_command = [
                     sys.executable,
+                    "-u",
                     str(PROJECT_ROOT / "live" / "run_resolution.py"),
                     _command_profile_ref(profile_ref, fallback_name=profile.name),
                 ]
                 if env_file is not None:
                     worker_command.extend(["--env-file", env_file])
-                worker_command.extend([
-                    "--hours-ahead",
-                    str(profile.hours_ahead),
-                    "--sandbox-wallet-state-path",
-                    str(wallet_state_path),
-                    "--interval-secs",
-                    str(resolution_interval_secs),
-                ])
-                if effective_sandbox_starting_usdc is not None:
-                    worker_command.extend(
-                        ["--sandbox-starting-usdc", str(effective_sandbox_starting_usdc)]
-                    )
+                worker_command.extend(["--hours-ahead", str(profile.hours_ahead)])
+                if profile.sandbox:
+                    assert wallet_state_path is not None
+                    worker_command.extend([
+                        "--sandbox-wallet-state-path",
+                        str(wallet_state_path),
+                    ])
+                    if effective_sandbox_starting_usdc is not None:
+                        worker_command.extend(
+                            ["--sandbox-starting-usdc", str(effective_sandbox_starting_usdc)]
+                        )
+                elif resolution_execute_redemptions:
+                    worker_command.append("--execute-redemptions")
+                if resolution_rpc_url is not None:
+                    worker_command.extend(["--rpc-url", resolution_rpc_url])
+                worker_command.extend(["--interval-secs", str(resolution_interval_secs)])
                 (run_dir / "worker_command.txt").write_text(
                     " ".join(worker_command) + "\n",
                     encoding="utf-8",
@@ -319,12 +339,15 @@ def _run_profile(
         "wallet_state_path": None if wallet_state_path is None else str(wallet_state_path),
         "run_dir": str(run_dir),
         "log_path": str(log_path),
+        "events_path": str(events_path),
         "command": command,
         "resolution_worker": with_resolution_worker,
         "worker_log_path": None if worker_log_path is None else str(worker_log_path),
         "worker_command": worker_command,
         "worker_exit_code": worker_exit_code,
         "worker_terminated_by_harness": worker_terminated,
+        "worker_execute_redemptions": resolution_execute_redemptions if with_resolution_worker else None,
+        "worker_rpc_url": resolution_rpc_url if with_resolution_worker else None,
     }
     _write_json(run_dir / "summary.json", result)
     return result

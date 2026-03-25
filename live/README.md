@@ -188,8 +188,8 @@ python live/run_resolution.py btc_updown_15m_live --once --execute-redemptions
 ```
 
 Current behavior:
-- sandbox mode reads/writes a shared `wallet_state.json`
-- live mode reads wallet truth from Polymarket APIs
+- sandbox mode reads/writes a shared `wallet_state.json`, and the startup window registry is authoritative for sandbox position lookup
+- live mode reads wallet truth from Polymarket APIs, and the startup window scan is reference metadata only
 - live redemptions default to dry-run summaries unless `--execute-redemptions` is passed
 - internal node resolution remains advisory only; wallet truth is the authoritative settlement signal
 - open-order truth still stays inside the Nautilus node

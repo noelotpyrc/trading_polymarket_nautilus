@@ -4,6 +4,9 @@ Single reference for what has been fixed in the live Nautilus process, what is a
 
 This exists because the roadmap in [docs/live_testing_plan.md](/Users/noel/projects/trading_polymarket_nautilus/docs/live_testing_plan.md) is about planned stages, while this file is about the actual fix inventory and current state of the codebase.
 
+For recurring bug families and the fix patterns we want to keep reusing, see
+[docs/bug_fix_log.md](/Users/noel/projects/trading_polymarket_nautilus/docs/bug_fix_log.md).
+
 ---
 
 ## Current Snapshot

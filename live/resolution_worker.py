@@ -79,11 +79,13 @@ class ResolutionWorker:
         registry: WindowMetadataRegistry,
         wallet_truth_provider: WalletTruthProvider,
         executor: ResolutionExecutor,
+        restrict_to_registry: bool = True,
         resolution_fetcher=fetch_market_resolution,
     ) -> None:
         self._registry = registry
         self._wallet_truth_provider = wallet_truth_provider
         self._executor = executor
+        self._restrict_to_registry = restrict_to_registry
         self._resolution_fetcher = resolution_fetcher
 
     def scan_once(self) -> list[ResolutionScanResult]:
@@ -92,7 +94,7 @@ class ResolutionWorker:
         for position in snapshot.positions:
             if position.size <= 0:
                 continue
-            if not self._registry.contains(
+            if self._restrict_to_registry and not self._registry.contains(
                 condition_id=position.condition_id,
                 token_id=position.token_id,
             ):

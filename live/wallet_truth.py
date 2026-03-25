@@ -85,6 +85,7 @@ class ProdWalletTruthProvider:
         wallet_address: str,
         balance_client: BalanceAllowanceClient,
         registry: WindowMetadataRegistry,
+        restrict_to_registry: bool = True,
         positions_host: str = POSITIONS_HOST,
         signature_type: int = 0,
         timeout_secs: float = 10.0,
@@ -92,6 +93,7 @@ class ProdWalletTruthProvider:
         self._wallet_address = wallet_address
         self._balance_client = balance_client
         self._registry = registry
+        self._restrict_to_registry = restrict_to_registry
         self._positions_host = positions_host.rstrip("/")
         self._signature_type = signature_type
         self._timeout_secs = timeout_secs
@@ -143,25 +145,41 @@ class ProdWalletTruthProvider:
             for position in payload:
                 condition_id = str(position.get("conditionId", ""))
                 token_id = str(position.get("asset", ""))
-                if condition_id not in allowed_condition_ids or token_id not in allowed_token_ids:
-                    continue
-
                 metadata = self._registry.token(token_id)
+                if self._restrict_to_registry:
+                    if condition_id not in allowed_condition_ids or token_id not in allowed_token_ids:
+                        continue
+                    if metadata is None:
+                        continue
+
                 if metadata is None:
+                    instrument_id = f"{condition_id}-{token_id}.POLYMARKET"
+                    outcome_side = "unknown"
+                    outcome_label = None
+                    window_slug = ""
+                    window_end_ns = 0
+                else:
+                    instrument_id = metadata.instrument_id
+                    outcome_side = metadata.outcome_side
+                    outcome_label = metadata.outcome_label
+                    window_slug = metadata.window_slug
+                    window_end_ns = metadata.window_end_ns
+
+                if not condition_id or not token_id:
                     continue
 
                 results.append(
                     WalletTokenPosition(
                         condition_id=condition_id,
                         token_id=token_id,
-                        instrument_id=metadata.instrument_id,
-                        outcome_side=metadata.outcome_side,
-                        outcome_label=metadata.outcome_label,
+                        instrument_id=instrument_id,
+                        outcome_side=outcome_side,
+                        outcome_label=outcome_label,
                         size=float(position.get("size", 0.0) or 0.0),
                         redeemable=bool(position.get("redeemable")),
                         mergeable=bool(position.get("mergeable")),
-                        window_slug=metadata.window_slug,
-                        window_end_ns=metadata.window_end_ns,
+                        window_slug=window_slug,
+                        window_end_ns=window_end_ns,
                     )
                 )
 

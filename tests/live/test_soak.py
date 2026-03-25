@@ -116,8 +116,11 @@ class TestRunSoakBatch:
         assert batch["results"][0]["hours_ahead"] == 8
         assert "--hours-ahead 8" in (run_dir / "command.txt").read_text(encoding="utf-8")
         assert batch["results"][0]["wallet_state_path"] == str(run_dir / "wallet_state.json")
+        assert batch["results"][0]["events_path"] == str(run_dir / "events.jsonl")
         command_text = (run_dir / "command.txt").read_text(encoding="utf-8")
         assert "--sandbox-wallet-state-path" in command_text
+        assert "--events-path" in command_text
+        assert str(run_dir / "events.jsonl") in command_text
         assert str(run_dir / "wallet_state.json") in command_text
 
     def test_batch_stops_after_first_failure_without_keep_going(self, tmp_path, monkeypatch):
@@ -360,7 +363,86 @@ class TestRunSoakBatch:
         result = batch["results"][0]
 
         assert result["command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
-        assert result["worker_command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
+        worker_env_index = result["worker_command"].index("--env-file")
+        assert result["worker_command"][worker_env_index:worker_env_index + 2] == [
+            "--env-file",
+            "/tmp/live_wallet.env",
+        ]
+
+    def test_batch_can_run_live_profile_with_companion_resolution_worker(self, tmp_path, monkeypatch):
+        profile = _profile(name="btc_updown_15m_live_worker", mode="live", run_secs=600)
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+
+        def fake_run(command, cwd, stdout, stderr, text, check):
+            stdout.write("runner output\n")
+            return SimpleNamespace(returncode=0)
+
+        class FakeWorkerProcess:
+            def __init__(self, command, cwd, stdout, stderr, text):
+                self.command = command
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(soak.subprocess, "run", fake_run)
+        monkeypatch.setattr(soak.subprocess, "Popen", FakeWorkerProcess)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["btc_updown_15m_live_worker"],
+            run_secs=600,
+            hours_ahead=2,
+            output_root=tmp_path,
+            label="live_stage",
+            keep_going=False,
+            allow_live=True,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            sandbox_starting_usdc=None,
+            with_resolution_worker=True,
+            resolution_interval_secs=20,
+            resolution_execute_redemptions=True,
+            resolution_rpc_url="https://rpc.example",
+            env_file="/tmp/live_wallet.env",
+        )
+
+        run_dir = Path(batch["batch_dir"]) / "01_btc_updown_15m_live_worker"
+        result = batch["results"][0]
+        worker_command_text = (run_dir / "worker_command.txt").read_text(encoding="utf-8")
+
+        assert batch["status"] == "passed"
+        assert result["sandbox"] is False
+        assert result["wallet_state_path"] is None
+        assert result["resolution_worker"] is True
+        assert result["worker_execute_redemptions"] is True
+        assert result["worker_rpc_url"] == "https://rpc.example"
+        assert "--sandbox-wallet-state-path" not in worker_command_text
+        assert "--execute-redemptions" in worker_command_text
+        assert "--rpc-url https://rpc.example" in worker_command_text
+        assert "--interval-secs 20" in worker_command_text
+        worker_env_index = result["worker_command"].index("--env-file")
+        assert result["worker_command"][worker_env_index:worker_env_index + 2] == [
+            "--env-file",
+            "/tmp/live_wallet.env",
+        ]
 
 
 class TestMain:

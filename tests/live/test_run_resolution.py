@@ -76,7 +76,32 @@ def test_main_once_runs_single_scan(monkeypatch, capsys):
         "/tmp/wallet.json",
     ])
 
-    assert "cond-1-yes-1.POLYMARKET size=2.500000 status=settled settled=1.00" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Sandbox mode: startup window metadata is authoritative." in out
+    assert "cond-1-yes-1.POLYMARKET size=2.500000 status=settled settled=1.00" in out
+
+
+def test_main_once_live_prints_reference_only_note(monkeypatch, capsys):
+    class FakeWorker:
+        def scan_once(self):
+            return []
+
+    monkeypatch.setattr(run_resolution, "load_profile", lambda name: _profile(mode="live"))
+    monkeypatch.setattr(
+        run_resolution,
+        "resolve_upcoming_window_metadata",
+        lambda slug_pattern, **kwargs: _metadata(),
+    )
+    monkeypatch.setattr(run_resolution, "_build_worker", lambda **kwargs: FakeWorker())
+
+    run_resolution.main([
+        "btc_updown_15m_live",
+        "--once",
+    ])
+
+    out = capsys.readouterr().out
+    assert "Live mode: startup window metadata is reference-only." in out
+    assert "No Polymarket wallet positions found." in out
 
 
 def test_build_worker_requires_sandbox_state_path():
@@ -154,8 +179,8 @@ def test_build_worker_live_uses_dry_run_until_execute_requested(monkeypatch):
     monkeypatch.setattr(
         run_resolution,
         "ProdWalletTruthProvider",
-        lambda wallet_address, balance_client, registry: _capture_provider(
-            calls, fake_provider, wallet_address, balance_client, registry
+        lambda wallet_address, balance_client, registry, restrict_to_registry: _capture_provider(
+            calls, fake_provider, wallet_address, balance_client, registry, restrict_to_registry
         ),
     )
 
@@ -167,8 +192,8 @@ def test_build_worker_live_uses_dry_run_until_execute_requested(monkeypatch):
     monkeypatch.setattr(
         run_resolution,
         "ResolutionWorker",
-        lambda registry, wallet_truth_provider, executor: _capture_worker(
-            calls, fake_worker, registry, wallet_truth_provider, executor
+        lambda registry, wallet_truth_provider, executor, restrict_to_registry: _capture_worker(
+            calls, fake_worker, registry, wallet_truth_provider, executor, restrict_to_registry
         ),
     )
 
@@ -183,14 +208,16 @@ def test_build_worker_live_uses_dry_run_until_execute_requested(monkeypatch):
 
     assert calls["executor"]["dry_run"] is True
     assert calls["executor"]["wallet_address"] == "0x0000000000000000000000000000000000000001"
+    assert calls["provider"][3] is False
+    assert calls["worker_args"][3] is False
     assert worker is fake_worker
 
 
-def _capture_provider(calls, fake_provider, wallet_address, balance_client, registry):
-    calls["provider"] = (wallet_address, balance_client, registry)
+def _capture_provider(calls, fake_provider, wallet_address, balance_client, registry, restrict_to_registry):
+    calls["provider"] = (wallet_address, balance_client, registry, restrict_to_registry)
     return fake_provider
 
 
-def _capture_worker(calls, fake_worker, registry, wallet_truth_provider, executor):
-    calls["worker_args"] = (registry, wallet_truth_provider, executor)
+def _capture_worker(calls, fake_worker, registry, wallet_truth_provider, executor, restrict_to_registry):
+    calls["worker_args"] = (registry, wallet_truth_provider, executor, restrict_to_registry)
     return fake_worker

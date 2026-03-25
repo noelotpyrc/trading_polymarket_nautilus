@@ -106,6 +106,57 @@ def test_prod_wallet_truth_provider_filters_positions_to_registry(monkeypatch):
     assert position.size == 2.5
 
 
+def test_prod_wallet_truth_provider_can_include_unregistered_positions(monkeypatch):
+    registry = _registry()
+
+    class FakeBalanceClient:
+        def get_balance_allowance(self, params):
+            return {"balance": "12500000"}
+
+    responses = [
+        [
+            {
+                "conditionId": "cond-1",
+                "asset": "yes-1",
+                "size": "2.5",
+                "redeemable": False,
+                "mergeable": False,
+            },
+            {
+                "conditionId": "foreign",
+                "asset": "other",
+                "size": "99",
+                "redeemable": True,
+                "mergeable": False,
+            },
+        ],
+        [],
+    ]
+
+    monkeypatch.setattr(
+        "live.wallet_truth.requests.get",
+        lambda url, params, timeout: DummyResponse(responses.pop(0)),
+    )
+
+    provider = ProdWalletTruthProvider(
+        wallet_address="0xabc",
+        balance_client=FakeBalanceClient(),
+        registry=registry,
+        restrict_to_registry=False,
+    )
+    snapshot = provider.snapshot()
+
+    assert len(snapshot.positions) == 2
+    foreign = next(position for position in snapshot.positions if position.condition_id == "foreign")
+    assert foreign.token_id == "other"
+    assert foreign.instrument_id == "foreign-other.POLYMARKET"
+    assert foreign.outcome_side == "unknown"
+    assert foreign.outcome_label is None
+    assert foreign.window_slug == ""
+    assert foreign.window_end_ns == 0
+    assert foreign.redeemable is True
+
+
 def test_sandbox_wallet_truth_provider_and_resolution_worker_settle_winner():
     registry = _registry()
     store = SandboxWalletStore(wallet_address="sandbox-wallet", collateral_balance=10.0)
@@ -171,6 +222,73 @@ def test_resolution_worker_leaves_unresolved_position_pending():
     assert results[0].status == "pending"
     assert store.collateral_balance == 10.0
     assert provider.snapshot().position_for_token("yes-2").size == 4.0
+
+
+def test_resolution_worker_can_process_unregistered_positions_when_enabled():
+    class DummyProvider:
+        def snapshot(self):
+            return type(
+                "Snapshot",
+                (),
+                {
+                    "positions": (
+                        WalletTokenPosition(
+                            condition_id="foreign-cond",
+                            token_id="foreign-token",
+                            instrument_id="foreign-cond-foreign-token.POLYMARKET",
+                            outcome_side="unknown",
+                            outcome_label=None,
+                            size=4.0,
+                            redeemable=True,
+                            mergeable=False,
+                            window_slug="",
+                            window_end_ns=0,
+                        ),
+                    )
+                },
+            )()
+
+    class DummyExecutor:
+        def settle(self, *, positions, resolution):
+            return [
+                type(
+                    "Result",
+                    (),
+                    {
+                        "condition_id": positions[0].condition_id,
+                        "instrument_id": positions[0].instrument_id,
+                        "token_id": positions[0].token_id,
+                        "position_size": positions[0].size,
+                        "resolved": True,
+                        "settlement_price": 1.0,
+                        "token_won": True,
+                        "status": "ready_to_redeem",
+                        "transaction_hash": None,
+                    },
+                )()
+            ]
+
+    worker = ResolutionWorker(
+        registry=_registry(),
+        wallet_truth_provider=DummyProvider(),
+        executor=DummyExecutor(),
+        restrict_to_registry=False,
+        resolution_fetcher=lambda condition_id, token_id: MarketResolution(
+            condition_id=condition_id,
+            token_id=token_id,
+            market_closed=True,
+            target_token_outcome="Up",
+            winning_token_id=token_id,
+            winning_outcome="Up",
+        ),
+    )
+
+    results = worker.scan_once()
+
+    assert len(results) == 1
+    assert results[0].condition_id == "foreign-cond"
+    assert results[0].instrument_id == "foreign-cond-foreign-token.POLYMARKET"
+    assert results[0].status == "ready_to_redeem"
 
 
 def test_sandbox_wallet_store_persists_and_provider_reload_reads_new_state(tmp_path):

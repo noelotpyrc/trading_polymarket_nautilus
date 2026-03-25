@@ -22,6 +22,12 @@ from live.wallet_truth import ProdWalletTruthProvider, make_polymarket_balance_c
 _BOOTSTRAP_ARGV = bootstrap_env_file()
 load_project_env()
 
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass
+
 
 def main(argv: list[str] | None = None) -> None:
     argv = _BOOTSTRAP_ARGV if argv is None else bootstrap_env_file(argv)
@@ -30,7 +36,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.list:
         for name in available_profile_names():
-            print(name)
+            print(name, flush=True)
         return
 
     if not args.profile:
@@ -54,6 +60,11 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("No window metadata resolved for the requested profile")
 
     registry = WindowMetadataRegistry(metadata)
+    _print_scope_note(
+        sandbox=profile.sandbox,
+        slug_pattern=profile.slug_pattern,
+        hours_ahead=profile.hours_ahead,
+    )
     effective_sandbox_starting_usdc = (
         profile.sandbox_starting_usdc
         if args.sandbox_starting_usdc is None
@@ -70,7 +81,7 @@ def main(argv: list[str] | None = None) -> None:
 
     while True:
         results = worker.scan_once()
-        _print_scan(results)
+        _print_scan(results, sandbox=profile.sandbox)
         if args.once:
             return
         time.sleep(args.interval_secs)
@@ -128,6 +139,7 @@ def _build_worker(
         wallet_address=wallet_address,
         balance_client=balance_client,
         registry=registry,
+        restrict_to_registry=False,
     )
     executor = ProdRedemptionExecutor(
         private_key=os.environ["PRIVATE_KEY"],
@@ -139,12 +151,34 @@ def _build_worker(
         registry=registry,
         wallet_truth_provider=provider,
         executor=executor,
+        restrict_to_registry=False,
     )
 
 
-def _print_scan(results) -> None:
+def _print_scope_note(*, sandbox: bool, slug_pattern: str, hours_ahead: int) -> None:
+    if sandbox:
+        print(
+            "Sandbox mode: startup window metadata is authoritative. "
+            "Synthetic sandbox wallet positions must map through this registry "
+            f"for '{slug_pattern}' ({hours_ahead}h horizon).",
+            flush=True,
+        )
+        return
+
+    print(
+        "Live mode: startup window metadata is reference-only. "
+        "Resolution scans actual Polymarket wallet positions and market truth, "
+        "not just the preloaded window horizon.",
+        flush=True,
+    )
+
+
+def _print_scan(results, *, sandbox: bool) -> None:
     if not results:
-        print("No allowlisted wallet positions found.")
+        if sandbox:
+            print("No allowlisted wallet positions found.", flush=True)
+        else:
+            print("No Polymarket wallet positions found.", flush=True)
         return
 
     for result in results:
@@ -152,7 +186,8 @@ def _print_scan(results) -> None:
         tx = "" if result.transaction_hash is None else f" tx={result.transaction_hash}"
         print(
             f"{result.instrument_id} size={result.position_size:.6f} "
-            f"status={result.status} settled={settlement}{tx}"
+            f"status={result.status} settled={settlement}{tx}",
+            flush=True,
         )
 
 

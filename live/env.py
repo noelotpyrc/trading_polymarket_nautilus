@@ -44,6 +44,50 @@ def project_dotenv_values(env_file: str | os.PathLike[str] | None = None) -> dic
     return dotenv_values(resolve_env_path(env_file))
 
 
+def validate_required_env_vars(
+    *,
+    sandbox: bool,
+    env_file: str | os.PathLike[str] | None = None,
+) -> None:
+    env = {
+        **project_dotenv_values(env_file),
+        **os.environ,
+    }
+    required = _required_env_var_candidates(sandbox=sandbox)
+
+    missing = []
+    for candidates in required:
+        if any(env.get(name) for name in candidates):
+            continue
+        if len(candidates) == 1:
+            missing.append(candidates[0])
+        else:
+            missing.append(" or ".join(candidates))
+
+    if missing:
+        mode = "sandbox" if sandbox else "live"
+        joined = ", ".join(missing)
+        raise SystemExit(f"Missing required {mode} env vars: {joined}")
+
+
+def _required_env_var_candidates(*, sandbox: bool) -> list[tuple[str, ...]]:
+    if sandbox:
+        return [
+            ("POLYMARKET_TEST_PRIVATE_KEY",),
+            ("POLYMARKET_TEST_API_KEY",),
+            ("POLYMARKET_TEST_API_SECRET",),
+            ("POLYMARKET_TEST_API_PASSPHRASE",),
+            ("POLYMARKET_TEST_WALLET_ADDRESS",),
+        ]
+    return [
+        ("PRIVATE_KEY",),
+        ("POLYMARKET_API_KEY",),
+        ("POLYMARKET_API_SECRET",),
+        ("POLYMARKET_PASSPHRASE", "POLYMARKET_API_PASSPHRASE"),
+        ("POLYMARKET_FUNDER", "WALLET_ADDRESS"),
+    ]
+
+
 def bootstrap_env_file(argv: list[str] | None = None) -> list[str]:
     args = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(add_help=False)

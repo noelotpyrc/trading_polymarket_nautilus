@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from datetime import datetime, timezone
 import os
+from pathlib import Path
 import sys
 import time
 
@@ -16,6 +19,7 @@ from live.node import resolve_upcoming_window_metadata
 from live.profiles import ProfileError, available_profile_names, load_profile
 from live.redemption import DEFAULT_POLYGON_RPC_URL, ProdRedemptionExecutor
 from live.resolution_worker import ResolutionWorker, SandboxResolutionExecutor
+from live.status_artifacts import StatusArtifactWriter
 from live.sandbox_wallet import SandboxWalletStore, SandboxWalletTruthProvider
 from live.wallet_truth import ProdWalletTruthProvider, make_polymarket_balance_client
 
@@ -78,10 +82,22 @@ def main(argv: list[str] | None = None) -> None:
         execute_redemptions=args.execute_redemptions,
         rpc_url=args.rpc_url,
     )
+    status_writer = _build_status_writer(
+        status_path=args.status_path,
+        status_history_path=args.status_history_path,
+    )
 
     while True:
+        scanned_at = datetime.now(tz=timezone.utc)
         results = worker.scan_once()
         _print_scan(results, sandbox=profile.sandbox)
+        _write_status_snapshot(
+            writer=status_writer,
+            profile=profile,
+            scanned_at=scanned_at,
+            execute_redemptions=args.execute_redemptions,
+            results=results,
+        )
         if args.once:
             return
         time.sleep(args.interval_secs)
@@ -106,6 +122,10 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="In live mode, actually submit redemption transactions instead of dry-run summaries")
     parser.add_argument("--rpc-url", default=DEFAULT_POLYGON_RPC_URL,
                         help=f"Polygon RPC URL for live redemptions (default: {DEFAULT_POLYGON_RPC_URL})")
+    parser.add_argument("--status-path", default=None,
+                        help="Optional path for the latest machine-readable worker status JSON")
+    parser.add_argument("--status-history-path", default=None,
+                        help="Optional path for append-only machine-readable worker status history JSONL")
     return parser
 
 
@@ -189,6 +209,67 @@ def _print_scan(results, *, sandbox: bool) -> None:
             f"status={result.status} settled={settlement}{tx}",
             flush=True,
         )
+
+
+def _build_status_writer(
+    *,
+    status_path: str | None,
+    status_history_path: str | None,
+) -> StatusArtifactWriter | None:
+    if status_path is None and status_history_path is None:
+        return None
+    latest_path = (
+        Path(status_path).expanduser().resolve()
+        if status_path is not None
+        else Path(status_history_path).expanduser().resolve().with_suffix(".json")
+    )
+    history_path = (
+        None
+        if status_history_path is None
+        else Path(status_history_path).expanduser().resolve()
+    )
+    return StatusArtifactWriter(latest_path=latest_path, history_path=history_path)
+
+
+def _write_status_snapshot(
+    *,
+    writer: StatusArtifactWriter | None,
+    profile,
+    scanned_at: datetime,
+    execute_redemptions: bool,
+    results: list,
+) -> None:
+    if writer is None:
+        return
+
+    counts = Counter(result.status for result in results)
+    payload = {
+        "recorded_at": scanned_at,
+        "component": "resolution_worker",
+        "mode": "sandbox" if profile.sandbox else "live",
+        "profile_name": profile.name,
+        "slug_pattern": profile.slug_pattern,
+        "hours_ahead": profile.hours_ahead,
+        "execute_redemptions": execute_redemptions,
+        "status": "idle" if not results else "tracking_positions",
+        "position_count": len(results),
+        "status_counts": dict(sorted(counts.items())),
+        "results": [
+            {
+                "condition_id": result.condition_id,
+                "instrument_id": result.instrument_id,
+                "token_id": result.token_id,
+                "position_size": result.position_size,
+                "resolved": result.resolved,
+                "settlement_price": result.settlement_price,
+                "token_won": result.token_won,
+                "status": result.status,
+                "transaction_hash": result.transaction_hash,
+            }
+            for result in results
+        ],
+    }
+    writer.write(payload)
 
 
 if __name__ == "__main__":

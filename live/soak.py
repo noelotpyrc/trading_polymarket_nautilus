@@ -12,7 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env, validate_required_env_vars
 from live.profiles import ProfileError, RunnerProfile, available_profile_names, load_profile
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "logs" / "soak"
@@ -34,6 +34,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("at least one profile is required unless --list is used")
     if args.with_resolution_worker and args.resolution_interval_secs <= 0:
         parser.error("--resolution-interval-secs must be positive")
+    if args.with_alert_monitor and args.alert_monitor_interval_secs <= 0:
+        parser.error("--alert-monitor-interval-secs must be positive")
 
     try:
         batch = run_soak_batch(
@@ -51,6 +53,8 @@ def main(argv: list[str] | None = None) -> None:
             resolution_interval_secs=args.resolution_interval_secs,
             resolution_execute_redemptions=args.resolution_execute_redemptions,
             resolution_rpc_url=args.resolution_rpc_url,
+            with_alert_monitor=args.with_alert_monitor,
+            alert_monitor_interval_secs=args.alert_monitor_interval_secs,
             env_file=args.env_file,
         )
     except (ProfileError, ValueError) as exc:
@@ -77,6 +81,8 @@ def run_soak_batch(
     resolution_interval_secs: int = 30,
     resolution_execute_redemptions: bool = False,
     resolution_rpc_url: str | None = None,
+    with_alert_monitor: bool = False,
+    alert_monitor_interval_secs: int = 15,
     env_file: str | None = None,
 ) -> dict[str, object]:
     output_root.mkdir(parents=True, exist_ok=True)
@@ -107,6 +113,8 @@ def run_soak_batch(
             resolution_interval_secs=resolution_interval_secs,
             resolution_execute_redemptions=resolution_execute_redemptions,
             resolution_rpc_url=resolution_rpc_url,
+            with_alert_monitor=with_alert_monitor,
+            alert_monitor_interval_secs=alert_monitor_interval_secs,
             env_file=env_file,
         )
         results.append(result)
@@ -132,6 +140,8 @@ def run_soak_batch(
             resolution_execute_redemptions if with_resolution_worker else None
         ),
         "resolution_rpc_url": resolution_rpc_url if with_resolution_worker else None,
+        "with_alert_monitor": with_alert_monitor,
+        "alert_monitor_interval_secs": alert_monitor_interval_secs if with_alert_monitor else None,
         "env_file": env_file,
         "results": results,
     }
@@ -170,6 +180,10 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="In live mode, have the companion resolution worker submit redemption transactions. Default is dry-run summaries only.")
     parser.add_argument("--resolution-rpc-url", default=None,
                         help="Optional Polygon RPC URL override for the companion resolution worker.")
+    parser.add_argument("--with-alert-monitor", action="store_true",
+                        help="Also run the alert monitor alongside the node run.")
+    parser.add_argument("--alert-monitor-interval-secs", type=int, default=15,
+                        help="Polling interval for the companion alert monitor (default: 15)")
     return parser
 
 
@@ -212,6 +226,8 @@ def _run_profile(
     resolution_interval_secs: int,
     resolution_execute_redemptions: bool,
     resolution_rpc_url: str | None,
+    with_alert_monitor: bool,
+    alert_monitor_interval_secs: int,
     env_file: str | None,
 ) -> dict[str, object]:
     run_dir = batch_dir / f"{index:02d}_{_safe_name(profile.name)}"
@@ -243,18 +259,84 @@ def _run_profile(
         )
         command.extend(["--sandbox-wallet-state-path", str(wallet_state_path)])
     events_path = run_dir / "events.jsonl"
+    status_path = run_dir / "status.json"
+    status_history_path = run_dir / "status_history.jsonl"
     command.extend(["--events-path", str(events_path)])
+    command.extend(["--status-path", str(status_path)])
+    command.extend(["--status-history-path", str(status_history_path)])
 
     started_at = _utc_now()
     log_path = run_dir / "runner.log"
     worker_log_path: Path | None = None
+    worker_status_path: Path | None = None
+    worker_status_history_path: Path | None = None
     worker_command: list[str] | None = None
     worker_process: subprocess.Popen[str] | None = None
     worker_exit_code: int | None = None
     worker_terminated = False
+    alerts_path: Path | None = None
+    alert_monitor_log_path: Path | None = None
+    alert_monitor_command: list[str] | None = None
+    alert_monitor_process: subprocess.Popen[str] | None = None
+    alert_monitor_exit_code: int | None = None
+    alert_monitor_terminated = False
 
     _write_json(run_dir / "profile.json", profile.to_dict())
     (run_dir / "command.txt").write_text(" ".join(command) + "\n", encoding="utf-8")
+
+    preflight_error: str | None = None
+    try:
+        validate_required_env_vars(sandbox=profile.sandbox, env_file=env_file)
+    except SystemExit as exc:
+        preflight_error = str(exc)
+
+    if preflight_error is not None:
+        started_at = _utc_now()
+        finished_at = _utc_now()
+        log_path = run_dir / "runner.log"
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write(f"# profile={profile.name}\n")
+            handle.write(f"# started_at={started_at.isoformat()}\n")
+            handle.write(f"# command={' '.join(command)}\n\n")
+            handle.write(preflight_error + "\n")
+        result = {
+            "profile_name": profile.name,
+            "profile_ref": profile_ref,
+            "status": "failed",
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_secs": round((finished_at - started_at).total_seconds(), 3),
+            "exit_code": 1,
+            "hours_ahead": profile.hours_ahead,
+            "run_secs": profile.run_secs,
+            "sandbox": profile.sandbox,
+            "sandbox_starting_usdc": effective_sandbox_starting_usdc,
+            "wallet_state_path": None if wallet_state_path is None else str(wallet_state_path),
+            "run_dir": str(run_dir),
+            "log_path": str(log_path),
+            "events_path": str(events_path),
+            "status_path": str(status_path),
+            "status_history_path": str(status_history_path),
+            "command": command,
+            "resolution_worker": with_resolution_worker,
+            "worker_log_path": None,
+            "worker_status_path": None,
+            "worker_status_history_path": None,
+            "worker_command": None,
+            "worker_exit_code": None,
+            "worker_terminated_by_harness": False,
+            "worker_execute_redemptions": resolution_execute_redemptions if with_resolution_worker else None,
+            "worker_rpc_url": resolution_rpc_url if with_resolution_worker else None,
+            "alert_monitor": with_alert_monitor,
+            "alerts_path": None,
+            "alert_monitor_log_path": None,
+            "alert_monitor_command": None,
+            "alert_monitor_exit_code": None,
+            "alert_monitor_terminated_by_harness": False,
+            "alert_monitor_interval_secs": alert_monitor_interval_secs if with_alert_monitor else None,
+        }
+        _write_json(run_dir / "summary.json", result)
+        return result
 
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write(f"# profile={profile.name}\n")
@@ -262,9 +344,12 @@ def _run_profile(
         handle.write(f"# command={' '.join(command)}\n\n")
         handle.flush()
         worker_handle = None
+        alert_monitor_handle = None
         try:
             if with_resolution_worker:
                 worker_log_path = run_dir / "worker.log"
+                worker_status_path = run_dir / "worker_status.json"
+                worker_status_history_path = run_dir / "worker_status_history.jsonl"
                 worker_command = [
                     sys.executable,
                     "-u",
@@ -289,6 +374,8 @@ def _run_profile(
                 if resolution_rpc_url is not None:
                     worker_command.extend(["--rpc-url", resolution_rpc_url])
                 worker_command.extend(["--interval-secs", str(resolution_interval_secs)])
+                worker_command.extend(["--status-path", str(worker_status_path)])
+                worker_command.extend(["--status-history-path", str(worker_status_history_path)])
                 (run_dir / "worker_command.txt").write_text(
                     " ".join(worker_command) + "\n",
                     encoding="utf-8",
@@ -305,6 +392,37 @@ def _run_profile(
                     stderr=subprocess.STDOUT,
                     text=True,
                 )
+            if with_alert_monitor:
+                alerts_path = run_dir / "alerts.jsonl"
+                alert_monitor_log_path = run_dir / "alert_monitor.log"
+                alert_monitor_command = [
+                    sys.executable,
+                    str(PROJECT_ROOT / "live" / "alert_monitor.py"),
+                    str(run_dir),
+                    "--alerts-path",
+                    str(alerts_path),
+                    "--interval-secs",
+                    str(alert_monitor_interval_secs),
+                    "--allow-missing-startup-status",
+                ]
+                (run_dir / "alert_monitor_command.txt").write_text(
+                    " ".join(alert_monitor_command) + "\n",
+                    encoding="utf-8",
+                )
+                alert_monitor_handle = alert_monitor_log_path.open("w", encoding="utf-8")
+                alert_monitor_handle.write(f"# profile={profile.name}\n")
+                alert_monitor_handle.write(f"# started_at={started_at.isoformat()}\n")
+                alert_monitor_handle.write(
+                    f"# command={' '.join(alert_monitor_command)}\n\n"
+                )
+                alert_monitor_handle.flush()
+                alert_monitor_process = subprocess.Popen(
+                    alert_monitor_command,
+                    cwd=PROJECT_ROOT,
+                    stdout=alert_monitor_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
 
             completed = subprocess.run(
                 command,
@@ -316,13 +434,25 @@ def _run_profile(
             )
         finally:
             if worker_process is not None:
-                worker_exit_code, worker_terminated = _stop_worker(worker_process)
+                worker_exit_code, worker_terminated = _stop_companion_process(worker_process)
             if worker_handle is not None:
                 worker_handle.close()
+            if alert_monitor_process is not None:
+                alert_monitor_exit_code, alert_monitor_terminated = _stop_companion_process(
+                    alert_monitor_process
+                )
+            if alert_monitor_handle is not None:
+                alert_monitor_handle.close()
 
     finished_at = _utc_now()
     status = "passed" if completed.returncode == 0 else "failed"
     if worker_process is not None and not worker_terminated and worker_exit_code not in {0, None}:
+        status = "failed"
+    if (
+        alert_monitor_process is not None
+        and not alert_monitor_terminated
+        and alert_monitor_exit_code not in {0, None}
+    ):
         status = "failed"
     result = {
         "profile_name": profile.name,
@@ -340,20 +470,35 @@ def _run_profile(
         "run_dir": str(run_dir),
         "log_path": str(log_path),
         "events_path": str(events_path),
+        "status_path": str(status_path),
+        "status_history_path": str(status_history_path),
         "command": command,
         "resolution_worker": with_resolution_worker,
         "worker_log_path": None if worker_log_path is None else str(worker_log_path),
+        "worker_status_path": None if worker_status_path is None else str(worker_status_path),
+        "worker_status_history_path": (
+            None if worker_status_history_path is None else str(worker_status_history_path)
+        ),
         "worker_command": worker_command,
         "worker_exit_code": worker_exit_code,
         "worker_terminated_by_harness": worker_terminated,
         "worker_execute_redemptions": resolution_execute_redemptions if with_resolution_worker else None,
         "worker_rpc_url": resolution_rpc_url if with_resolution_worker else None,
+        "alert_monitor": with_alert_monitor,
+        "alerts_path": None if alerts_path is None else str(alerts_path),
+        "alert_monitor_log_path": (
+            None if alert_monitor_log_path is None else str(alert_monitor_log_path)
+        ),
+        "alert_monitor_command": alert_monitor_command,
+        "alert_monitor_exit_code": alert_monitor_exit_code,
+        "alert_monitor_terminated_by_harness": alert_monitor_terminated,
+        "alert_monitor_interval_secs": alert_monitor_interval_secs if with_alert_monitor else None,
     }
     _write_json(run_dir / "summary.json", result)
     return result
 
 
-def _stop_worker(process: subprocess.Popen[str]) -> tuple[int | None, bool]:
+def _stop_companion_process(process: subprocess.Popen[str]) -> tuple[int | None, bool]:
     exit_code = process.poll()
     if exit_code is not None:
         return exit_code, False
@@ -402,9 +547,12 @@ def _print_batch_summary(batch: dict[str, object]) -> None:
         worker_suffix = ""
         if result.get("resolution_worker"):
             worker_suffix = f", worker={result['worker_log_path']}"
+        monitor_suffix = ""
+        if result.get("alert_monitor"):
+            monitor_suffix = f", alerts={result['alert_monitor_log_path']}"
         print(
             f"  - {result['profile_name']}: {result['status']} "
-            f"(exit={result['exit_code']}, log={result['log_path']}{worker_suffix})"
+            f"(exit={result['exit_code']}, log={result['log_path']}{worker_suffix}{monitor_suffix})"
         )
 
 

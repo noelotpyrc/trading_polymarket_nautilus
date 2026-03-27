@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from live import env as live_env
 from live.market_metadata import ResolvedWindowMetadata
 from live.node import (
     _parse_interval_secs,
@@ -204,6 +205,7 @@ class TestResolveUpcomingWindows:
 class TestPrepareRun:
     def test_rejects_missing_sandbox_env_vars(self, monkeypatch):
         _clear_env(monkeypatch)
+        monkeypatch.setattr(live_env, "project_dotenv_values", lambda env_file=None: {})
 
         with pytest.raises(SystemExit, match="Missing required sandbox env vars"):
             prepare_run(
@@ -217,6 +219,7 @@ class TestPrepareRun:
 
     def test_rejects_missing_live_env_vars(self, monkeypatch):
         _clear_env(monkeypatch)
+        monkeypatch.setattr(live_env, "project_dotenv_values", lambda env_file=None: {})
 
         with pytest.raises(SystemExit, match="Missing required live env vars"):
             prepare_run(

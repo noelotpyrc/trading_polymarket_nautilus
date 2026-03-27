@@ -194,6 +194,38 @@ Current behavior:
 - internal node resolution remains advisory only; wallet truth is the authoritative settlement signal
 - open-order truth still stays inside the Nautilus node
 
+## Status and Alerts
+
+Stage 13 adds a lightweight operator surface on top of the existing logs:
+
+- node status snapshot:
+  - `status.json`
+- node status history:
+  - `status_history.jsonl`
+- worker status snapshot:
+  - `worker_status.json`
+- worker status history:
+  - `worker_status_history.jsonl`
+- alert stream:
+  - `alerts.jsonl`
+
+Use the compact status reader:
+
+```bash
+python live/status.py logs/soak/<batch>/01_<profile_dir>
+```
+
+Use the alert monitor in one-shot mode:
+
+```bash
+python live/alert_monitor.py logs/soak/<batch>/01_<profile_dir> --once
+```
+
+Expected clean one-shot result:
+- `No alerts.`
+
+The alert monitor is notify-only in this first pass. It does not restart processes or take trading actions.
+
 ## Stage 11 Live Rehearsal
 
 Use [rehearsal.py](/Users/noel/projects/trading_polymarket_nautilus/live/rehearsal.py) for the first live control-plane check before any intended fill risk. It submits one tiny post-only resting BUY, confirms it opens, cancels it, then confirms no token balance remains.
@@ -362,16 +394,38 @@ python live/soak.py random_signal_15m_resolution_sandbox --with-resolution-worke
 
 # One-command Stage 9 stale-IOC reconciliation validation
 python live/soak.py random_signal_15m_order_reconciliation_sandbox --with-resolution-worker --label stage9_order_truth_smoke
+
+# One-command bounded live session with companion worker and alert monitor
+python live/soak.py btc_updown_15m_live \
+  --allow-live \
+  --env-file /abs/path/live_wallet.env \
+  --run-secs 600 \
+  --with-resolution-worker \
+  --with-alert-monitor
 ```
 
 Safety defaults:
 - sandbox profiles only unless `--allow-live` is passed
 - bounded runtime required unless `--allow-unbounded` is passed
 
+Companion-process flags:
+- `--with-resolution-worker`
+  - start the external resolution worker alongside the node
+- `--resolution-execute-redemptions`
+  - in live mode, let the companion worker submit real redemption transactions
+- `--with-alert-monitor`
+  - start the notify-only alert monitor alongside the node and worker
+
 Artifacts:
 - `runner.log` — combined stdout/stderr for the profile run
 - `worker.log` — companion resolution-worker output when `--with-resolution-worker` is used
+- `alert_monitor.log` — companion alert-monitor output when `--with-alert-monitor` is used
 - `profile.json` — resolved profile settings used for the run
+- `status.json` — latest node status snapshot
+- `status_history.jsonl` — append-only node status history
+- `worker_status.json` — latest worker status snapshot
+- `worker_status_history.jsonl` — append-only worker status history
+- `alerts.jsonl` — structured alert records when alert conditions fire
 - `summary.json` — exit code, duration, log path, and status
 - `wallet_state.json` — synthetic sandbox wallet truth for Stage 8 resolution tests
 - batch-level `summary.json` — overall batch status across all profiles

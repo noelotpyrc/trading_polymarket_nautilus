@@ -26,6 +26,10 @@ def _profile(
     )
 
 
+def _allow_env_validation(monkeypatch) -> None:
+    monkeypatch.setattr(soak, "validate_required_env_vars", lambda sandbox, env_file=None: None)
+
+
 class TestPrepareProfile:
     def test_rejects_live_profile_by_default(self):
         with pytest.raises(ProfileError, match="sandbox profiles by default"):
@@ -83,6 +87,7 @@ class TestRunSoakBatch:
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
 
         def fake_run(command, cwd, stdout, stderr, text, check):
             stdout.write("runner output\n")
@@ -117,10 +122,16 @@ class TestRunSoakBatch:
         assert "--hours-ahead 8" in (run_dir / "command.txt").read_text(encoding="utf-8")
         assert batch["results"][0]["wallet_state_path"] == str(run_dir / "wallet_state.json")
         assert batch["results"][0]["events_path"] == str(run_dir / "events.jsonl")
+        assert batch["results"][0]["status_path"] == str(run_dir / "status.json")
+        assert batch["results"][0]["status_history_path"] == str(run_dir / "status_history.jsonl")
         command_text = (run_dir / "command.txt").read_text(encoding="utf-8")
         assert "--sandbox-wallet-state-path" in command_text
         assert "--events-path" in command_text
+        assert "--status-path" in command_text
+        assert "--status-history-path" in command_text
         assert str(run_dir / "events.jsonl") in command_text
+        assert str(run_dir / "status.json") in command_text
+        assert str(run_dir / "status_history.jsonl") in command_text
         assert str(run_dir / "wallet_state.json") in command_text
 
     def test_batch_stops_after_first_failure_without_keep_going(self, tmp_path, monkeypatch):
@@ -134,10 +145,12 @@ class TestRunSoakBatch:
             datetime(2026, 3, 12, 15, 0, 2, tzinfo=timezone.utc),
             datetime(2026, 3, 12, 15, 0, 3, tzinfo=timezone.utc),
             datetime(2026, 3, 12, 15, 0, 4, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
         ])
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profiles[ref])
+        _allow_env_validation(monkeypatch)
 
         seen_commands = []
 
@@ -180,6 +193,7 @@ class TestRunSoakBatch:
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profiles[ref])
+        _allow_env_validation(monkeypatch)
 
         returncodes = iter([3, 0])
 
@@ -215,6 +229,7 @@ class TestRunSoakBatch:
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
         monkeypatch.setattr(
             soak.subprocess,
             "run",
@@ -250,6 +265,7 @@ class TestRunSoakBatch:
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
 
         def fake_run(command, cwd, stdout, stderr, text, check):
             stdout.write("runner output\n")
@@ -303,9 +319,82 @@ class TestRunSoakBatch:
         assert result["resolution_worker"] is True
         assert result["worker_terminated_by_harness"] is True
         assert result["worker_log_path"] == str(run_dir / "worker.log")
+        assert result["worker_status_path"] == str(run_dir / "worker_status.json")
+        assert result["worker_status_history_path"] == str(run_dir / "worker_status_history.jsonl")
         assert "--sandbox-starting-usdc 10.0" in (run_dir / "command.txt").read_text(encoding="utf-8")
         assert "--interval-secs 15" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
         assert "--sandbox-starting-usdc 10.0" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
+        assert "--status-path" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
+        assert "--status-history-path" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
+
+    def test_batch_can_run_companion_alert_monitor(self, tmp_path, monkeypatch):
+        profile = _profile(name="random_signal_15m_alert_monitor_sandbox", run_secs=600)
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
+
+        def fake_run(command, cwd, stdout, stderr, text, check):
+            stdout.write("runner output\n")
+            return SimpleNamespace(returncode=0)
+
+        class FakeMonitorProcess:
+            def __init__(self, command, cwd, stdout, stderr, text):
+                self.command = command
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(soak.subprocess, "run", fake_run)
+        monkeypatch.setattr(soak.subprocess, "Popen", FakeMonitorProcess)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["random_signal_15m_alert_monitor_sandbox"],
+            run_secs=None,
+            hours_ahead=None,
+            output_root=tmp_path,
+            label="stage13",
+            keep_going=False,
+            allow_live=False,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            with_alert_monitor=True,
+            alert_monitor_interval_secs=11,
+        )
+
+        run_dir = Path(batch["batch_dir"]) / "01_random_signal_15m_alert_monitor_sandbox"
+        result = batch["results"][0]
+        monitor_command_text = (run_dir / "alert_monitor_command.txt").read_text(encoding="utf-8")
+
+        assert batch["status"] == "passed"
+        assert batch["with_alert_monitor"] is True
+        assert batch["alert_monitor_interval_secs"] == 11
+        assert result["alert_monitor"] is True
+        assert result["alert_monitor_terminated_by_harness"] is True
+        assert result["alert_monitor_log_path"] == str(run_dir / "alert_monitor.log")
+        assert result["alerts_path"] == str(run_dir / "alerts.jsonl")
+        assert "--interval-secs 11" in monitor_command_text
+        assert "--allow-missing-startup-status" in monitor_command_text
+        assert str(run_dir) in monitor_command_text
 
     def test_batch_forwards_env_file_to_runner_and_worker(self, tmp_path, monkeypatch):
         profile = _profile(name="random_signal_15m_resolution_sandbox", run_secs=600)
@@ -319,6 +408,7 @@ class TestRunSoakBatch:
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
 
         def fake_run(command, cwd, stdout, stderr, text, check):
             stdout.write("runner output\n")
@@ -377,10 +467,12 @@ class TestRunSoakBatch:
             datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
             datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
             datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 15, tzinfo=timezone.utc),
         ])
 
         monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
         monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
 
         def fake_run(command, cwd, stdout, stderr, text, check):
             stdout.write("runner output\n")
@@ -443,6 +535,70 @@ class TestRunSoakBatch:
             "--env-file",
             "/tmp/live_wallet.env",
         ]
+
+    def test_batch_fails_fast_on_missing_live_env_before_spawning_companions(self, tmp_path, monkeypatch):
+        profile = _profile(name="btc_updown_15m_live_missing_env", mode="live", run_secs=600)
+        timestamps = [
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 2, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 3, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 4, tzinfo=timezone.utc),
+        ]
+        times = iter(timestamps)
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times, timestamps[-1]))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+
+        popen_calls: list[list[str]] = []
+
+        def fake_popen(*args, **kwargs):
+            popen_calls.append(args[0])
+            raise AssertionError("companion processes should not start on env preflight failure")
+
+        monkeypatch.setattr(
+            soak,
+            "validate_required_env_vars",
+            lambda sandbox, env_file=None: (_ for _ in ()).throw(
+                SystemExit("Missing required live env vars: PRIVATE_KEY")
+            ),
+        )
+        monkeypatch.setattr(soak.subprocess, "Popen", fake_popen)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["btc_updown_15m_live_missing_env"],
+            run_secs=600,
+            hours_ahead=2,
+            output_root=tmp_path,
+            label="live_missing_env",
+            keep_going=False,
+            allow_live=True,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            sandbox_starting_usdc=None,
+            with_resolution_worker=True,
+            resolution_interval_secs=20,
+            resolution_execute_redemptions=True,
+            resolution_rpc_url="https://rpc.example",
+            with_alert_monitor=True,
+            alert_monitor_interval_secs=15,
+            env_file="/tmp/live_wallet.env",
+        )
+
+        run_dir = Path(batch["batch_dir"]) / "01_btc_updown_15m_live_missing_env"
+        result = batch["results"][0]
+
+        assert batch["status"] == "failed"
+        assert result["status"] == "failed"
+        assert result["exit_code"] == 1
+        assert result["worker_command"] is None
+        assert result["alert_monitor_command"] is None
+        assert result["worker_log_path"] is None
+        assert result["alert_monitor_log_path"] is None
+        assert popen_calls == []
+        assert "Missing required live env vars: PRIVATE_KEY" in (
+            run_dir / "runner.log"
+        ).read_text(encoding="utf-8")
 
 
 class TestMain:

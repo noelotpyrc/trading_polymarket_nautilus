@@ -1,4 +1,5 @@
 """Tests for the external resolution worker CLI and wiring."""
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -45,7 +46,7 @@ def test_main_lists_profiles(monkeypatch, capsys):
     assert capsys.readouterr().out == "one\ntwo\n"
 
 
-def test_main_once_runs_single_scan(monkeypatch, capsys):
+def test_main_once_runs_single_scan(monkeypatch, capsys, tmp_path):
     class FakeWorker:
         def scan_once(self):
             return [
@@ -69,19 +70,37 @@ def test_main_once_runs_single_scan(monkeypatch, capsys):
     )
     monkeypatch.setattr(run_resolution, "_build_worker", lambda **kwargs: FakeWorker())
 
+    status_path = tmp_path / "status.json"
+    status_history_path = tmp_path / "status_history.jsonl"
+
     run_resolution.main([
         "btc_updown_15m_sandbox",
         "--once",
         "--sandbox-wallet-state-path",
         "/tmp/wallet.json",
+        "--status-path",
+        str(status_path),
+        "--status-history-path",
+        str(status_history_path),
     ])
 
     out = capsys.readouterr().out
     assert "Sandbox mode: startup window metadata is authoritative." in out
     assert "cond-1-yes-1.POLYMARKET size=2.500000 status=settled settled=1.00" in out
+    latest = json.loads(status_path.read_text(encoding="utf-8"))
+    history = [
+        json.loads(line)
+        for line in status_history_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert latest["component"] == "resolution_worker"
+    assert latest["mode"] == "sandbox"
+    assert latest["status"] == "tracking_positions"
+    assert latest["status_counts"] == {"settled": 1}
+    assert len(history) == 1
 
 
-def test_main_once_live_prints_reference_only_note(monkeypatch, capsys):
+def test_main_once_live_prints_reference_only_note(monkeypatch, capsys, tmp_path):
     class FakeWorker:
         def scan_once(self):
             return []
@@ -94,14 +113,22 @@ def test_main_once_live_prints_reference_only_note(monkeypatch, capsys):
     )
     monkeypatch.setattr(run_resolution, "_build_worker", lambda **kwargs: FakeWorker())
 
+    status_path = tmp_path / "status.json"
+
     run_resolution.main([
         "btc_updown_15m_live",
         "--once",
+        "--status-path",
+        str(status_path),
     ])
 
     out = capsys.readouterr().out
     assert "Live mode: startup window metadata is reference-only." in out
     assert "No Polymarket wallet positions found." in out
+    latest = json.loads(status_path.read_text(encoding="utf-8"))
+    assert latest["mode"] == "live"
+    assert latest["status"] == "idle"
+    assert latest["position_count"] == 0
 
 
 def test_build_worker_requires_sandbox_state_path():

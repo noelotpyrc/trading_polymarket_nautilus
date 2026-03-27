@@ -24,7 +24,7 @@ from datetime import datetime, timezone
 
 import requests
 
-from live.env import add_env_file_arg, load_project_env
+from live.env import add_env_file_arg, load_project_env, validate_required_env_vars
 from live.market_metadata import ResolvedWindowMetadata
 
 load_project_env()
@@ -126,6 +126,7 @@ def build_node(
     sandbox: bool = False,
     binance_us: bool = False,
     sandbox_starting_usdc: float | None = None,
+    log_path: str | None = None,
 ):
     """Build a TradingNode with Binance + Polymarket clients attached."""
     from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory
@@ -134,7 +135,7 @@ def build_node(
         PolymarketLiveExecClientFactory,
     )
     from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
-    from nautilus_trader.config import TradingNodeConfig
+    from nautilus_trader.config import LoggingConfig, TradingNodeConfig
     from nautilus_trader.live.config import LiveExecEngineConfig
     from nautilus_trader.live.node import TradingNode
 
@@ -144,6 +145,18 @@ def build_node(
         polymarket_exec_config,
         sandbox_exec_config,
     )
+
+    logging_config = None
+    if log_path is not None:
+        log_file = os.path.abspath(log_path)
+        logging_config = LoggingConfig(
+            log_level="INFO",
+            log_level_file="INFO",
+            log_directory=os.path.dirname(log_file),
+            log_file_name=os.path.basename(log_file),
+            log_colors=False,
+            clear_log_file=False,
+        )
 
     node = TradingNode(config=TradingNodeConfig(
         exec_engine=LiveExecEngineConfig(
@@ -163,6 +176,7 @@ def build_node(
                 else polymarket_exec_config()
             ),
         },
+        logging=logging_config,
     ))
     node.add_data_client_factory("BINANCE", BinanceLiveDataClientFactory)
     node.add_data_client_factory("POLYMARKET", PolymarketLiveDataClientFactory)
@@ -289,38 +303,7 @@ def _validate_outcome_side(outcome_side: str) -> None:
 
 
 def _validate_required_env_vars(*, sandbox: bool) -> None:
-    required = []
-
-    if sandbox:
-        required.extend([
-            ("POLYMARKET_TEST_PRIVATE_KEY",),
-            ("POLYMARKET_TEST_API_KEY",),
-            ("POLYMARKET_TEST_API_SECRET",),
-            ("POLYMARKET_TEST_API_PASSPHRASE",),
-            ("POLYMARKET_TEST_WALLET_ADDRESS",),
-        ])
-    else:
-        required.extend([
-            ("PRIVATE_KEY",),
-            ("POLYMARKET_API_KEY",),
-            ("POLYMARKET_API_SECRET",),
-            ("POLYMARKET_PASSPHRASE", "POLYMARKET_API_PASSPHRASE"),
-            ("POLYMARKET_FUNDER", "WALLET_ADDRESS"),
-        ])
-
-    missing = []
-    for candidates in required:
-        if any(os.getenv(name) for name in candidates):
-            continue
-        if len(candidates) == 1:
-            missing.append(candidates[0])
-        else:
-            missing.append(" or ".join(candidates))
-
-    if missing:
-        mode = "sandbox" if sandbox else "live"
-        joined = ", ".join(missing)
-        raise SystemExit(f"Missing required {mode} env vars: {joined}")
+    validate_required_env_vars(sandbox=sandbox)
 
 
 def _validate_sandbox_starting_usdc(*, sandbox: bool, sandbox_starting_usdc: float | None) -> None:

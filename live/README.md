@@ -176,6 +176,22 @@ The live Polymarket feed now keeps one-sided books visible by allowing synthetic
 
 Stage 8 now has a first-pass external worker surface for wallet-based resolution handling:
 
+Recommended live setup:
+- store your private Polygon RPC in the same live env file as the wallet secrets:
+
+```dotenv
+PRIVATE_KEY=0x...
+WALLET_ADDRESS=0x...
+POLYMARKET_API_KEY=...
+POLYMARKET_API_SECRET=...
+POLYMARKET_API_PASSPHRASE=...
+POLYGON_RPC_URL=https://rpc.ankr.com/your-private-endpoint
+```
+
+- `run_resolution.py` now reads `POLYGON_RPC_URL` from the env file automatically
+- use CLI `--rpc-url` only for one-off overrides
+- for live redemption flow, prefer a private Polygon RPC over the default public endpoint
+
 ```bash
 # Dry-run one sandbox scan against a shared synthetic wallet-state file
 python live/run_resolution.py btc_updown_15m_sandbox --hours-ahead 8 --once --sandbox-wallet-state-path logs/soak/.../wallet_state.json
@@ -191,6 +207,7 @@ Current behavior:
 - sandbox mode reads/writes a shared `wallet_state.json`, and the startup window registry is authoritative for sandbox position lookup
 - live mode reads wallet truth from Polymarket APIs, and the startup window scan is reference metadata only
 - live redemptions default to dry-run summaries unless `--execute-redemptions` is passed
+- live redemption RPC defaults to `POLYGON_RPC_URL` from the loaded env file, otherwise the built-in public Polygon RPC default
 - internal node resolution remains advisory only; wallet truth is the authoritative settlement signal
 - open-order truth still stays inside the Nautilus node
 
@@ -326,6 +343,8 @@ python live/redeem_oneoff.py \
   --yes
 ```
 
+`redeem_oneoff.py` also reads `POLYGON_RPC_URL` from the env file by default.
+
 ## Runner Profiles
 
 - Profile files live in [live/profiles/catalog](/Users/noel/projects/trading_polymarket_nautilus/live/profiles/catalog).
@@ -389,19 +408,27 @@ python live/soak.py btc_updown_15m_sandbox --hours-ahead 8 --run-secs 28800 --la
 # 8h soak on two profiles, continue even if the first fails
 python live/soak.py random_signal_15m_sandbox btc_updown_15m_sandbox --run-secs 28800 --label stage7_8h --keep-going
 
-# One-command Stage 8 deterministic residual + worker validation
-python live/soak.py random_signal_15m_resolution_sandbox --with-resolution-worker --label stage8_resolution_smoke
-
-# One-command Stage 9 stale-IOC reconciliation validation
-python live/soak.py random_signal_15m_order_reconciliation_sandbox --with-resolution-worker --label stage9_order_truth_smoke
-
-# One-command bounded live session with companion worker and alert monitor
+# Bounded live session with alert monitor
 python live/soak.py btc_updown_15m_live \
   --allow-live \
   --env-file /abs/path/live_wallet.env \
   --run-secs 600 \
-  --with-resolution-worker \
   --with-alert-monitor
+
+# Separate resolution worker against the same profile/env
+python live/run_resolution.py btc_updown_15m_live \
+  --env-file /abs/path/live_wallet.env \
+  --artifacts-dir /Users/noel/projects/trading_polymarket_nautilus/logs/resolution/bounded_live_session \
+  --interval-secs 30 \
+  --execute-redemptions
+
+# Separate market-data capture for the same market family
+python live/run_market_data_capture.py \
+  --slug-pattern btc-updown-15m \
+  --hours-ahead 24 \
+  --binance-symbol BTCUSDT \
+  --artifacts-dir /Users/noel/projects/trading_polymarket_nautilus/logs/market_data/bounded_live_session \
+  --sample-interval-secs 5
 ```
 
 Safety defaults:
@@ -409,26 +436,43 @@ Safety defaults:
 - bounded runtime required unless `--allow-unbounded` is passed
 
 Companion-process flags:
-- `--with-resolution-worker`
-  - start the external resolution worker alongside the node
-- `--resolution-execute-redemptions`
-  - in live mode, let the companion worker submit real redemption transactions
 - `--with-alert-monitor`
-  - start the notify-only alert monitor alongside the node and worker
+  - start the notify-only alert monitor alongside the node
+
+Resolution worker:
+- `live/soak.py` no longer launches the resolution worker
+- run [run_resolution.py](/Users/noel/projects/trading_polymarket_nautilus/live/run_resolution.py) separately, either:
+  - continuously with `--interval-secs`
+  - or manually with `--once`
+- use `--execute-redemptions` and `--rpc-url` on `run_resolution.py`, not on `soak.py`
+- use `--artifacts-dir` on `run_resolution.py` if you want simple worker-side artifacts without shell redirection
+
+Market-data capture:
+- run [run_market_data_capture.py](/Users/noel/projects/trading_polymarket_nautilus/live/run_market_data_capture.py) separately when you want analysis-grade quote sampling without adding more load to the trading node
+- it is market-scope based, not profile-based
+- first pass writes one sampled row every `5s`
+- each sample includes:
+  - PM `YES` top-of-book
+  - PM `NO` top-of-book
+  - Binance real-time BTCUSDT quote
+- use `--artifacts-dir` to get:
+  - `market_data.log`
+  - `market_data_samples.jsonl`
 
 Artifacts:
 - `runner.log` — combined stdout/stderr for the profile run
-- `worker.log` — companion resolution-worker output when `--with-resolution-worker` is used
 - `alert_monitor.log` — companion alert-monitor output when `--with-alert-monitor` is used
 - `profile.json` — resolved profile settings used for the run
 - `status.json` — latest node status snapshot
 - `status_history.jsonl` — append-only node status history
-- `worker_status.json` — latest worker status snapshot
-- `worker_status_history.jsonl` — append-only worker status history
 - `alerts.jsonl` — structured alert records when alert conditions fire
 - `summary.json` — exit code, duration, log path, and status
 - `wallet_state.json` — synthetic sandbox wallet truth for Stage 8 resolution tests
 - batch-level `summary.json` — overall batch status across all profiles
+- separate worker artifact dir via `run_resolution.py --artifacts-dir`:
+  - `worker.log`
+  - `worker_status.json`
+  - `worker_status_history.jsonl`
 
 ## Next Steps
 

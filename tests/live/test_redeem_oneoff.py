@@ -119,6 +119,46 @@ def test_main_dry_run_prints_redemption_results(monkeypatch, capsys):
     assert calls["executor"]["dry_run"] is True
 
 
+def test_main_uses_polygon_rpc_url_from_env_when_cli_omitted(monkeypatch):
+    metadata = _metadata()
+    snapshot = _snapshot()
+    calls = {}
+
+    monkeypatch.setenv("PRIVATE_KEY", "0x" + ("11" * 32))
+    monkeypatch.setenv("WALLET_ADDRESS", "0xwallet")
+    monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.example")
+    monkeypatch.setattr(redeem_oneoff, "resolve_market_metadata_by_slug", lambda *args, **kwargs: metadata)
+    monkeypatch.setattr(redeem_oneoff, "make_polymarket_balance_client", lambda sandbox: (object(), "0xwallet"))
+    monkeypatch.setattr(
+        redeem_oneoff,
+        "ProdWalletTruthProvider",
+        lambda wallet_address, balance_client, registry: SimpleNamespace(snapshot=lambda: snapshot),
+    )
+    monkeypatch.setattr(
+        redeem_oneoff,
+        "fetch_market_resolution",
+        lambda condition_id, token_id: SimpleNamespace(
+            resolved=True,
+            winning_outcome="Up",
+            winning_token_id="yes-token",
+        ),
+    )
+
+    def fake_executor_ctor(**kwargs):
+        calls["executor"] = kwargs
+        return SimpleNamespace(settle=lambda positions, resolution: [])
+
+    monkeypatch.setattr(redeem_oneoff, "ProdRedemptionExecutor", fake_executor_ctor)
+
+    redeem_oneoff.main([
+        "--market-slug",
+        "btc-updown-15m-1773869400",
+        "--yes",
+    ])
+
+    assert calls["executor"]["rpc_url"] == "https://rpc.example"
+
+
 def test_main_requires_position(monkeypatch):
     metadata = _metadata()
 

@@ -12,7 +12,7 @@ import requests
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(PROJECT_ROOT))
 
-from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env, resolve_polygon_rpc_url
 from live.market_metadata import ResolvedWindowMetadata, WindowMetadataRegistry
 from live.node import _parse_interval_secs, _window_metadata_from_market
 from live.redemption import DEFAULT_POLYGON_RPC_URL, ProdRedemptionExecutor
@@ -110,8 +110,8 @@ def _make_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--rpc-url",
-        default=DEFAULT_POLYGON_RPC_URL,
-        help=f"Polygon RPC URL for live redemptions (default: {DEFAULT_POLYGON_RPC_URL})",
+        default=resolve_polygon_rpc_url(DEFAULT_POLYGON_RPC_URL),
+        help=f"Polygon RPC URL for live redemptions (default: env POLYGON_RPC_URL or {DEFAULT_POLYGON_RPC_URL})",
     )
     parser.add_argument("--yes", action="store_true", help="Skip confirmation prompt")
     return parser

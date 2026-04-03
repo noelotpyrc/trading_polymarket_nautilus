@@ -132,7 +132,6 @@ def build_node(
     from nautilus_trader.adapters.binance.factories import BinanceLiveDataClientFactory
     from nautilus_trader.adapters.polymarket import (
         PolymarketLiveDataClientFactory,
-        PolymarketLiveExecClientFactory,
     )
     from nautilus_trader.adapters.sandbox.factory import SandboxLiveExecClientFactory
     from nautilus_trader.config import LoggingConfig, TradingNodeConfig
@@ -145,6 +144,7 @@ def build_node(
         polymarket_exec_config,
         sandbox_exec_config,
     )
+    from live.polymarket_exec_client import FillAwarePolymarketLiveExecClientFactory
 
     logging_config = None
     if log_path is not None:
@@ -182,7 +182,7 @@ def build_node(
     node.add_data_client_factory("POLYMARKET", PolymarketLiveDataClientFactory)
     node.add_exec_client_factory(
         "POLYMARKET",
-        SandboxLiveExecClientFactory if sandbox else PolymarketLiveExecClientFactory,
+        SandboxLiveExecClientFactory if sandbox else FillAwarePolymarketLiveExecClientFactory,
     )
     return node
 

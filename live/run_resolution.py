@@ -13,7 +13,7 @@ import time
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(PROJECT_ROOT))
 
-from live.env import add_env_file_arg, bootstrap_env_file, load_project_env
+from live.env import add_env_file_arg, bootstrap_env_file, load_project_env, resolve_polygon_rpc_url
 from live.market_metadata import WindowMetadataRegistry
 from live.node import resolve_upcoming_window_metadata
 from live.profiles import ProfileError, available_profile_names, load_profile
@@ -31,6 +31,32 @@ try:
     sys.stderr.reconfigure(line_buffering=True)
 except AttributeError:
     pass
+
+
+class _TeeTextIO:
+    def __init__(self, primary, secondary) -> None:
+        self._primary = primary
+        self._secondary = secondary
+        self.encoding = getattr(primary, "encoding", "utf-8")
+        self.errors = getattr(primary, "errors", "strict")
+
+    def write(self, data: str) -> int:
+        self._primary.write(data)
+        self._secondary.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._secondary.flush()
+
+    def isatty(self) -> bool:
+        return bool(getattr(self._primary, "isatty", lambda: False)())
+
+    def writable(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str):
+        return getattr(self._primary, name)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -55,52 +81,72 @@ def main(argv: list[str] | None = None) -> None:
     except ProfileError as exc:
         raise SystemExit(str(exc)) from exc
 
-    metadata = resolve_upcoming_window_metadata(
-        profile.slug_pattern,
-        hours_ahead=profile.hours_ahead,
-        outcome_side=profile.outcome_side,
-    )
-    if not metadata:
-        raise SystemExit("No window metadata resolved for the requested profile")
-
-    registry = WindowMetadataRegistry(metadata)
-    _print_scope_note(
-        sandbox=profile.sandbox,
-        slug_pattern=profile.slug_pattern,
-        hours_ahead=profile.hours_ahead,
-    )
-    effective_sandbox_starting_usdc = (
-        profile.sandbox_starting_usdc
-        if args.sandbox_starting_usdc is None
-        else args.sandbox_starting_usdc
-    )
-    worker = _build_worker(
-        registry=registry,
-        sandbox=profile.sandbox,
-        sandbox_wallet_state_path=args.sandbox_wallet_state_path,
-        sandbox_starting_usdc=effective_sandbox_starting_usdc,
-        execute_redemptions=args.execute_redemptions,
-        rpc_url=args.rpc_url,
-    )
-    status_writer = _build_status_writer(
+    artifact_paths = _resolve_artifact_paths(
+        artifacts_dir=args.artifacts_dir,
         status_path=args.status_path,
         status_history_path=args.status_history_path,
     )
+    restore_streams = _install_worker_log(artifact_paths["log_path"])
 
-    while True:
-        scanned_at = datetime.now(tz=timezone.utc)
-        results = worker.scan_once()
-        _print_scan(results, sandbox=profile.sandbox)
-        _write_status_snapshot(
-            writer=status_writer,
-            profile=profile,
-            scanned_at=scanned_at,
-            execute_redemptions=args.execute_redemptions,
-            results=results,
+    try:
+        metadata = resolve_upcoming_window_metadata(
+            profile.slug_pattern,
+            hours_ahead=profile.hours_ahead,
+            outcome_side=profile.outcome_side,
         )
-        if args.once:
-            return
-        time.sleep(args.interval_secs)
+        if not metadata:
+            raise SystemExit("No window metadata resolved for the requested profile")
+
+        registry = WindowMetadataRegistry(metadata)
+        _print_scope_note(
+            sandbox=profile.sandbox,
+            slug_pattern=profile.slug_pattern,
+            hours_ahead=profile.hours_ahead,
+        )
+        effective_sandbox_starting_usdc = (
+            profile.sandbox_starting_usdc
+            if args.sandbox_starting_usdc is None
+            else args.sandbox_starting_usdc
+        )
+        worker = _build_worker(
+            registry=registry,
+            sandbox=profile.sandbox,
+            sandbox_wallet_state_path=args.sandbox_wallet_state_path,
+            sandbox_starting_usdc=effective_sandbox_starting_usdc,
+            execute_redemptions=args.execute_redemptions,
+            rpc_url=args.rpc_url,
+        )
+        status_writer = _build_status_writer(
+            status_path=artifact_paths["status_path"],
+            status_history_path=artifact_paths["status_history_path"],
+        )
+
+        while True:
+            scanned_at = datetime.now(tz=timezone.utc)
+            scan_error = None
+            results: list[object] = []
+            try:
+                results = worker.scan_once()
+                _print_scan(results, sandbox=profile.sandbox)
+            except Exception as exc:
+                if args.once:
+                    raise
+                scan_error = f"{exc.__class__.__name__}: {exc}"
+                print(f"Resolution worker scan error: {scan_error}", flush=True)
+            _write_status_snapshot(
+                writer=status_writer,
+                profile=profile,
+                scanned_at=scanned_at,
+                execute_redemptions=args.execute_redemptions,
+                results=results,
+                worker_status="scan_error" if scan_error is not None else None,
+                worker_error=scan_error,
+            )
+            if args.once:
+                return
+            time.sleep(args.interval_secs)
+    finally:
+        _restore_worker_log(restore_streams)
 
 
 def _make_arg_parser() -> argparse.ArgumentParser:
@@ -120,13 +166,62 @@ def _make_arg_parser() -> argparse.ArgumentParser:
                         help="Polling interval when running continuously (default: 30)")
     parser.add_argument("--execute-redemptions", action="store_true",
                         help="In live mode, actually submit redemption transactions instead of dry-run summaries")
-    parser.add_argument("--rpc-url", default=DEFAULT_POLYGON_RPC_URL,
-                        help=f"Polygon RPC URL for live redemptions (default: {DEFAULT_POLYGON_RPC_URL})")
+    parser.add_argument("--rpc-url", default=resolve_polygon_rpc_url(DEFAULT_POLYGON_RPC_URL),
+                        help=f"Polygon RPC URL for live redemptions (default: env POLYGON_RPC_URL or {DEFAULT_POLYGON_RPC_URL})")
     parser.add_argument("--status-path", default=None,
                         help="Optional path for the latest machine-readable worker status JSON")
     parser.add_argument("--status-history-path", default=None,
                         help="Optional path for append-only machine-readable worker status history JSONL")
+    parser.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="Optional directory for worker.log, worker_status.json, and worker_status_history.jsonl",
+    )
     return parser
+
+
+def _resolve_artifact_paths(
+    *,
+    artifacts_dir: str | None,
+    status_path: str | None,
+    status_history_path: str | None,
+) -> dict[str, str | None]:
+    if artifacts_dir is None:
+        return {
+            "log_path": None,
+            "status_path": status_path,
+            "status_history_path": status_history_path,
+        }
+
+    artifacts_path = Path(artifacts_dir).expanduser().resolve()
+    artifacts_path.mkdir(parents=True, exist_ok=True)
+    return {
+        "log_path": str(artifacts_path / "worker.log"),
+        "status_path": status_path or str(artifacts_path / "worker_status.json"),
+        "status_history_path": status_history_path or str(artifacts_path / "worker_status_history.jsonl"),
+    }
+
+
+def _install_worker_log(log_path: str | None) -> tuple[object, object, object] | None:
+    if log_path is None:
+        return None
+    log_file = Path(log_path).expanduser().resolve().open("a", encoding="utf-8", buffering=1)
+    original_stdout = sys.stdout
+    original_stderr = sys.stderr
+    sys.stdout = _TeeTextIO(original_stdout, log_file)
+    sys.stderr = _TeeTextIO(original_stderr, log_file)
+    return log_file, original_stdout, original_stderr
+
+
+def _restore_worker_log(state: tuple[object, object, object] | None) -> None:
+    if state is None:
+        return
+    log_file, original_stdout, original_stderr = state
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.stdout = original_stdout
+    sys.stderr = original_stderr
+    log_file.close()
 
 
 def _build_worker(
@@ -204,9 +299,10 @@ def _print_scan(results, *, sandbox: bool) -> None:
     for result in results:
         settlement = "n/a" if result.settlement_price is None else f"{result.settlement_price:.2f}"
         tx = "" if result.transaction_hash is None else f" tx={result.transaction_hash}"
+        error = "" if getattr(result, "error_message", None) is None else f" error={result.error_message}"
         print(
             f"{result.instrument_id} size={result.position_size:.6f} "
-            f"status={result.status} settled={settlement}{tx}",
+            f"status={result.status} settled={settlement}{tx}{error}",
             flush=True,
         )
 
@@ -238,6 +334,8 @@ def _write_status_snapshot(
     scanned_at: datetime,
     execute_redemptions: bool,
     results: list,
+    worker_status: str | None = None,
+    worker_error: str | None = None,
 ) -> None:
     if writer is None:
         return
@@ -251,7 +349,12 @@ def _write_status_snapshot(
         "slug_pattern": profile.slug_pattern,
         "hours_ahead": profile.hours_ahead,
         "execute_redemptions": execute_redemptions,
-        "status": "idle" if not results else "tracking_positions",
+        "status": (
+            worker_status
+            if worker_status is not None
+            else ("idle" if not results else "tracking_positions")
+        ),
+        "last_error": worker_error,
         "position_count": len(results),
         "status_counts": dict(sorted(counts.items())),
         "results": [
@@ -265,6 +368,7 @@ def _write_status_snapshot(
                 "token_won": result.token_won,
                 "status": result.status,
                 "transaction_hash": result.transaction_hash,
+                "error_message": getattr(result, "error_message", None),
             }
             for result in results
         ],

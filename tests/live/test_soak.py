@@ -252,80 +252,22 @@ class TestRunSoakBatch:
         result = batch["results"][0]
         assert result["wallet_state_path"] == str(wallet_state_path)
 
-    def test_batch_can_run_companion_resolution_worker(self, tmp_path, monkeypatch):
-        profile = _profile(name="random_signal_15m_resolution_sandbox", run_secs=600)
-        profile = profile.with_sandbox_starting_usdc(10.0)
-        times = iter([
-            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
-            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
-            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
-            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
-            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
-        ])
-
-        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
-        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
-        _allow_env_validation(monkeypatch)
-
-        def fake_run(command, cwd, stdout, stderr, text, check):
-            stdout.write("runner output\n")
-            return SimpleNamespace(returncode=0)
-
-        class FakeWorkerProcess:
-            def __init__(self, command, cwd, stdout, stderr, text):
-                self.command = command
-                self.cwd = cwd
-                self.stdout = stdout
-                self.stderr = stderr
-                self.text = text
-                self.returncode = None
-                self.terminated = False
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self):
-                self.terminated = True
-                self.returncode = -15
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def kill(self):
-                self.returncode = -9
-
-        monkeypatch.setattr(soak.subprocess, "run", fake_run)
-        monkeypatch.setattr(soak.subprocess, "Popen", FakeWorkerProcess)
-
-        batch = soak.run_soak_batch(
-            profile_refs=["random_signal_15m_resolution_sandbox"],
-            run_secs=None,
-            hours_ahead=None,
-            output_root=tmp_path,
-            label="stage8",
-            keep_going=False,
-            allow_live=False,
-            allow_unbounded=False,
-            sandbox_wallet_state_path=None,
-            sandbox_starting_usdc=None,
-            with_resolution_worker=True,
-            resolution_interval_secs=15,
-        )
-
-        run_dir = Path(batch["batch_dir"]) / "01_random_signal_15m_resolution_sandbox"
-        result = batch["results"][0]
-
-        assert batch["status"] == "passed"
-        assert result["resolution_worker"] is True
-        assert result["worker_terminated_by_harness"] is True
-        assert result["worker_log_path"] == str(run_dir / "worker.log")
-        assert result["worker_status_path"] == str(run_dir / "worker_status.json")
-        assert result["worker_status_history_path"] == str(run_dir / "worker_status_history.jsonl")
-        assert "--sandbox-starting-usdc 10.0" in (run_dir / "command.txt").read_text(encoding="utf-8")
-        assert "--interval-secs 15" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
-        assert "--sandbox-starting-usdc 10.0" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
-        assert "--status-path" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
-        assert "--status-history-path" in (run_dir / "worker_command.txt").read_text(encoding="utf-8")
+    def test_batch_rejects_companion_resolution_worker(self, tmp_path):
+        with pytest.raises(ValueError, match="no longer launches the resolution worker"):
+            soak.run_soak_batch(
+                profile_refs=["random_signal_15m_resolution_sandbox"],
+                run_secs=None,
+                hours_ahead=None,
+                output_root=tmp_path,
+                label="stage8",
+                keep_going=False,
+                allow_live=False,
+                allow_unbounded=False,
+                sandbox_wallet_state_path=None,
+                sandbox_starting_usdc=None,
+                with_resolution_worker=True,
+                resolution_interval_secs=15,
+            )
 
     def test_batch_can_run_companion_alert_monitor(self, tmp_path, monkeypatch):
         profile = _profile(name="random_signal_15m_alert_monitor_sandbox", run_secs=600)
@@ -396,7 +338,67 @@ class TestRunSoakBatch:
         assert "--allow-missing-startup-status" in monitor_command_text
         assert str(run_dir) in monitor_command_text
 
-    def test_batch_forwards_env_file_to_runner_and_worker(self, tmp_path, monkeypatch):
+    def test_batch_does_not_fail_when_alert_monitor_exits_nonzero(self, tmp_path, monkeypatch):
+        profile = _profile(name="random_signal_15m_alert_monitor_nonfatal_sandbox", run_secs=600)
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
+
+        def fake_run(command, cwd, stdout, stderr, text, check):
+            stdout.write("runner output\n")
+            return SimpleNamespace(returncode=0)
+
+        class FakeMonitorProcess:
+            def __init__(self, command, cwd, stdout, stderr, text):
+                self.command = command
+                self.returncode = 1
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                self.returncode = -15
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        monkeypatch.setattr(soak.subprocess, "run", fake_run)
+        monkeypatch.setattr(soak.subprocess, "Popen", FakeMonitorProcess)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["random_signal_15m_alert_monitor_nonfatal_sandbox"],
+            run_secs=None,
+            hours_ahead=None,
+            output_root=tmp_path,
+            label="stage13",
+            keep_going=False,
+            allow_live=False,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            with_alert_monitor=True,
+            alert_monitor_interval_secs=11,
+        )
+
+        result = batch["results"][0]
+
+        assert batch["status"] == "passed"
+        assert result["status"] == "passed"
+        assert result["alert_monitor_exit_code"] == 1
+        assert result["alert_monitor_failed"] is True
+        assert result["alert_monitor_terminated_by_harness"] is False
+
+    def test_batch_forwards_env_file_to_runner(self, tmp_path, monkeypatch):
         profile = _profile(name="random_signal_15m_resolution_sandbox", run_secs=600)
         times = iter([
             datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
@@ -414,25 +416,7 @@ class TestRunSoakBatch:
             stdout.write("runner output\n")
             return SimpleNamespace(returncode=0)
 
-        class FakeWorkerProcess:
-            def __init__(self, command, cwd, stdout, stderr, text):
-                self.command = command
-                self.returncode = None
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self):
-                self.returncode = -15
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def kill(self):
-                self.returncode = -9
-
         monkeypatch.setattr(soak.subprocess, "run", fake_run)
-        monkeypatch.setattr(soak.subprocess, "Popen", FakeWorkerProcess)
 
         batch = soak.run_soak_batch(
             profile_refs=["random_signal_15m_resolution_sandbox"],
@@ -445,21 +429,15 @@ class TestRunSoakBatch:
             allow_unbounded=False,
             sandbox_wallet_state_path=None,
             sandbox_starting_usdc=None,
-            with_resolution_worker=True,
-            resolution_interval_secs=15,
             env_file="/tmp/live_wallet.env",
         )
 
         result = batch["results"][0]
 
         assert result["command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
-        worker_env_index = result["worker_command"].index("--env-file")
-        assert result["worker_command"][worker_env_index:worker_env_index + 2] == [
-            "--env-file",
-            "/tmp/live_wallet.env",
-        ]
+        assert result["worker_command"] is None
 
-    def test_batch_can_run_live_profile_with_companion_resolution_worker(self, tmp_path, monkeypatch):
+    def test_batch_can_run_live_profile_without_resolution_worker(self, tmp_path, monkeypatch):
         profile = _profile(name="btc_updown_15m_live_worker", mode="live", run_secs=600)
         times = iter([
             datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
@@ -478,25 +456,7 @@ class TestRunSoakBatch:
             stdout.write("runner output\n")
             return SimpleNamespace(returncode=0)
 
-        class FakeWorkerProcess:
-            def __init__(self, command, cwd, stdout, stderr, text):
-                self.command = command
-                self.returncode = None
-
-            def poll(self):
-                return self.returncode
-
-            def terminate(self):
-                self.returncode = -15
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def kill(self):
-                self.returncode = -9
-
         monkeypatch.setattr(soak.subprocess, "run", fake_run)
-        monkeypatch.setattr(soak.subprocess, "Popen", FakeWorkerProcess)
 
         batch = soak.run_soak_batch(
             profile_refs=["btc_updown_15m_live_worker"],
@@ -509,34 +469,21 @@ class TestRunSoakBatch:
             allow_unbounded=False,
             sandbox_wallet_state_path=None,
             sandbox_starting_usdc=None,
-            with_resolution_worker=True,
-            resolution_interval_secs=20,
-            resolution_execute_redemptions=True,
-            resolution_rpc_url="https://rpc.example",
             env_file="/tmp/live_wallet.env",
         )
 
-        run_dir = Path(batch["batch_dir"]) / "01_btc_updown_15m_live_worker"
         result = batch["results"][0]
-        worker_command_text = (run_dir / "worker_command.txt").read_text(encoding="utf-8")
 
         assert batch["status"] == "passed"
         assert result["sandbox"] is False
         assert result["wallet_state_path"] is None
-        assert result["resolution_worker"] is True
-        assert result["worker_execute_redemptions"] is True
-        assert result["worker_rpc_url"] == "https://rpc.example"
-        assert "--sandbox-wallet-state-path" not in worker_command_text
-        assert "--execute-redemptions" in worker_command_text
-        assert "--rpc-url https://rpc.example" in worker_command_text
-        assert "--interval-secs 20" in worker_command_text
-        worker_env_index = result["worker_command"].index("--env-file")
-        assert result["worker_command"][worker_env_index:worker_env_index + 2] == [
-            "--env-file",
-            "/tmp/live_wallet.env",
-        ]
+        assert result["resolution_worker"] is False
+        assert result["worker_command"] is None
+        assert result["worker_execute_redemptions"] is None
+        assert result["worker_rpc_url"] is None
+        assert result["command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
 
-    def test_batch_fails_fast_on_missing_live_env_before_spawning_companions(self, tmp_path, monkeypatch):
+    def test_batch_fails_fast_on_missing_live_env_before_spawning_alert_monitor(self, tmp_path, monkeypatch):
         profile = _profile(name="btc_updown_15m_live_missing_env", mode="live", run_secs=600)
         timestamps = [
             datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
@@ -576,10 +523,6 @@ class TestRunSoakBatch:
             allow_unbounded=False,
             sandbox_wallet_state_path=None,
             sandbox_starting_usdc=None,
-            with_resolution_worker=True,
-            resolution_interval_secs=20,
-            resolution_execute_redemptions=True,
-            resolution_rpc_url="https://rpc.example",
             with_alert_monitor=True,
             alert_monitor_interval_secs=15,
             env_file="/tmp/live_wallet.env",
@@ -608,3 +551,9 @@ class TestMain:
         soak.main(["--list"])
 
         assert capsys.readouterr().out == "a_profile\nb_profile\n"
+
+    def test_main_rejects_resolution_worker_flag(self, capsys):
+        with pytest.raises(SystemExit):
+            soak.main(["demo_profile", "--with-resolution-worker"])
+
+        assert "no longer supported by soak.py" in capsys.readouterr().err

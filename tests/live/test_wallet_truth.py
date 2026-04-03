@@ -1,8 +1,13 @@
 """Tests for wallet-truth metadata, providers, and sandbox settlement."""
+from types import SimpleNamespace
+
+import pytest
+from web3.exceptions import TimeExhausted, Web3RPCError
+
 from live.market_metadata import ResolvedWindowMetadata, WindowMetadataRegistry
-from live.redemption import ProdRedemptionExecutor, _bytes32
+from live.redemption import ProdRedemptionExecutor, _bytes32, _format_tx_hash
 from live.resolution import MarketResolution
-from live.resolution_worker import ResolutionWorker, SandboxResolutionExecutor
+from live.resolution_worker import ResolutionScanResult, ResolutionWorker, SandboxResolutionExecutor
 from live.sandbox_wallet import SandboxWalletStore, SandboxWalletTruthProvider
 from live.wallet_truth import ProdWalletTruthProvider, WalletTokenPosition
 
@@ -291,6 +296,56 @@ def test_resolution_worker_can_process_unregistered_positions_when_enabled():
     assert results[0].status == "ready_to_redeem"
 
 
+def test_resolution_worker_converts_redemption_exception_into_retryable_results():
+    registry = _registry()
+    store = SandboxWalletStore(wallet_address="sandbox-wallet", collateral_balance=10.0)
+    store.set_position_size("yes-1", 3.0)
+    store.set_position_size("yes-2", 4.0)
+    provider = SandboxWalletTruthProvider(wallet_store=store, registry=registry)
+
+    class FlakyExecutor:
+        def settle(self, *, positions, resolution):
+            if resolution.condition_id == "cond-1":
+                raise ConnectionError("rpc dropped")
+            return [
+                ResolutionScanResult(
+                    condition_id=positions[0].condition_id,
+                    instrument_id=positions[0].instrument_id,
+                    token_id=positions[0].token_id,
+                    position_size=positions[0].size,
+                    resolved=True,
+                    settlement_price=1.0,
+                    token_won=True,
+                    status="ready_to_redeem",
+                )
+            ]
+
+    worker = ResolutionWorker(
+        registry=registry,
+        wallet_truth_provider=provider,
+        executor=FlakyExecutor(),
+        resolution_fetcher=lambda condition_id, token_id: MarketResolution(
+            condition_id=condition_id,
+            token_id=token_id,
+            market_closed=True,
+            target_token_outcome="Up",
+            winning_token_id=token_id,
+            winning_outcome="Up",
+        ),
+    )
+
+    results = worker.scan_once()
+
+    assert len(results) == 2
+    results_by_token = {result.token_id: result for result in results}
+    assert results_by_token["yes-1"].status == "redemption_error_transport"
+    assert results_by_token["yes-1"].resolved is True
+    assert results_by_token["yes-1"].settlement_price == 1.0
+    assert results_by_token["yes-1"].token_won is True
+    assert "rpc dropped" in results_by_token["yes-1"].error_message
+    assert results_by_token["yes-2"].status == "ready_to_redeem"
+
+
 def test_sandbox_wallet_store_persists_and_provider_reload_reads_new_state(tmp_path):
     registry = _registry()
     state_path = tmp_path / "wallet.json"
@@ -423,6 +478,199 @@ def test_prod_redemption_executor_requires_redeemable_position_by_default():
     assert [result.settlement_price for result in results] == [1.0, 0.0]
 
 
+def test_prod_redemption_executor_retries_underpriced_replacement(monkeypatch):
+    executor = ProdRedemptionExecutor(
+        private_key="0x" + ("11" * 32),
+        wallet_address="0x0000000000000000000000000000000000000001",
+        rpc_url="http://localhost:8545",
+        dry_run=False,
+    )
+    resolution = MarketResolution(
+        condition_id="0x" + ("22" * 32),
+        token_id="yes-1",
+        market_closed=True,
+        target_token_outcome="Up",
+        winning_token_id="yes-1",
+        winning_outcome="Up",
+    )
+    sent_gas_prices: list[int] = []
+
+    class FakeTxHash:
+        def __init__(self, value: str) -> None:
+            self._value = value
+
+        def hex(self) -> str:
+            return self._value
+
+    class FakeAccount:
+        def sign_transaction(self, tx, private_key):
+            return SimpleNamespace(raw_transaction=tx)
+
+    class FakeEth:
+        gas_price = 100
+        account = FakeAccount()
+
+        def get_transaction_count(self, wallet_address):
+            return 7
+
+        def estimate_gas(self, tx):
+            return 55_000
+
+        def send_raw_transaction(self, raw_tx):
+            sent_gas_prices.append(raw_tx["gasPrice"])
+            if len(sent_gas_prices) == 1:
+                raise Web3RPCError({"code": -32000, "message": "replacement transaction underpriced"})
+            return FakeTxHash("0xabc")
+
+        def wait_for_transaction_receipt(self, tx_hash):
+            return {"status": 1}
+
+    class FakeRedeemCall:
+        def build_transaction(self, params):
+            return dict(params)
+
+    class FakeFunctions:
+        def redeemPositions(self, *args):
+            return FakeRedeemCall()
+
+    executor._w3 = SimpleNamespace(eth=FakeEth())
+    executor._ctf = SimpleNamespace(functions=FakeFunctions())
+
+    results = executor.settle(
+        positions=(
+            _position(token_id="yes-1", instrument_id="cond-1-yes-1.POLYMARKET", redeemable=True),
+        ),
+        resolution=resolution,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "redeemed"
+    assert results[0].transaction_hash == "0xabc"
+    assert sent_gas_prices == [100, 113]
+
+
+def test_prod_redemption_executor_marks_timeout_as_pending_receipt():
+    executor = ProdRedemptionExecutor(
+        private_key="0x" + ("11" * 32),
+        wallet_address="0x0000000000000000000000000000000000000001",
+        rpc_url="http://localhost:8545",
+        dry_run=False,
+    )
+    resolution = MarketResolution(
+        condition_id="0x" + ("22" * 32),
+        token_id="yes-1",
+        market_closed=True,
+        target_token_outcome="Up",
+        winning_token_id="yes-1",
+        winning_outcome="Up",
+    )
+
+    class FakeTxHash:
+        def hex(self) -> str:
+            return "0xdef"
+
+    class FakeAccount:
+        def sign_transaction(self, tx, private_key):
+            return SimpleNamespace(raw_transaction=tx)
+
+    class FakeEth:
+        gas_price = 100
+        account = FakeAccount()
+
+        def get_transaction_count(self, wallet_address):
+            return 7
+
+        def estimate_gas(self, tx):
+            return 55_000
+
+        def send_raw_transaction(self, raw_tx):
+            return FakeTxHash()
+
+        def wait_for_transaction_receipt(self, tx_hash):
+            raise TimeExhausted("receipt timeout")
+
+    class FakeRedeemCall:
+        def build_transaction(self, params):
+            return dict(params)
+
+    class FakeFunctions:
+        def redeemPositions(self, *args):
+            return FakeRedeemCall()
+
+    executor._w3 = SimpleNamespace(eth=FakeEth())
+    executor._ctf = SimpleNamespace(functions=FakeFunctions())
+
+    results = executor.settle(
+        positions=(
+            _position(token_id="yes-1", instrument_id="cond-1-yes-1.POLYMARKET", redeemable=True),
+        ),
+        resolution=resolution,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "submitted_pending_receipt"
+    assert results[0].transaction_hash == "0xdef"
+
+
+def test_prod_redemption_executor_marks_exhausted_underpriced_replacement_as_blocked():
+    executor = ProdRedemptionExecutor(
+        private_key="0x" + ("11" * 32),
+        wallet_address="0x0000000000000000000000000000000000000001",
+        rpc_url="http://localhost:8545",
+        dry_run=False,
+    )
+    resolution = MarketResolution(
+        condition_id="0x" + ("22" * 32),
+        token_id="yes-1",
+        market_closed=True,
+        target_token_outcome="Up",
+        winning_token_id="yes-1",
+        winning_outcome="Up",
+    )
+
+    class FakeAccount:
+        def sign_transaction(self, tx, private_key):
+            return SimpleNamespace(raw_transaction=tx)
+
+    class FakeEth:
+        gas_price = 100
+        account = FakeAccount()
+
+        def get_transaction_count(self, wallet_address):
+            return 7
+
+        def estimate_gas(self, tx):
+            return 55_000
+
+        def send_raw_transaction(self, raw_tx):
+            raise Web3RPCError({"code": -32000, "message": "replacement transaction underpriced"})
+
+        def wait_for_transaction_receipt(self, tx_hash):
+            raise AssertionError("wait_for_transaction_receipt should not be called")
+
+    class FakeRedeemCall:
+        def build_transaction(self, params):
+            return dict(params)
+
+    class FakeFunctions:
+        def redeemPositions(self, *args):
+            return FakeRedeemCall()
+
+    executor._w3 = SimpleNamespace(eth=FakeEth())
+    executor._ctf = SimpleNamespace(functions=FakeFunctions())
+
+    results = executor.settle(
+        positions=(
+            _position(token_id="yes-1", instrument_id="cond-1-yes-1.POLYMARKET", redeemable=True),
+        ),
+        resolution=resolution,
+    )
+
+    assert len(results) == 1
+    assert results[0].status == "submission_blocked_underpriced"
+    assert results[0].transaction_hash is None
+
+
 def test_bytes32_rejects_non_32_byte_hex():
     try:
         _bytes32("0x1234")
@@ -430,3 +678,11 @@ def test_bytes32_rejects_non_32_byte_hex():
         assert "Expected 32-byte hex value" in str(exc)
     else:
         raise AssertionError("Expected _bytes32 to reject short hex input")
+
+
+def test_format_tx_hash_adds_missing_0x_prefix():
+    class FakeTxHash:
+        def hex(self) -> str:
+            return "abcd"
+
+    assert _format_tx_hash(FakeTxHash()) == "0xabcd"

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 from web3 import Web3
+from web3.exceptions import TimeExhausted, Web3RPCError
 from web3.middleware import ExtraDataToPOAMiddleware
 
 from live.resolution import MarketResolution
@@ -15,6 +17,8 @@ DEFAULT_POLYGON_RPC_URL = "https://polygon-bor-rpc.publicnode.com"
 CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_CONTRACT_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 _BINARY_INDEX_SETS = [1, 2]
+_REPLACEMENT_SEND_MAX_ATTEMPTS = 5
+_REPLACEMENT_GAS_BUMP_FACTOR = 1.125
 
 CTF_REDEEM_ABI = [
     {
@@ -35,6 +39,11 @@ CTF_REDEEM_ABI = [
 @dataclass(frozen=True)
 class RedemptionTxResult:
     tx_hash: str
+    receipt_confirmed: bool
+
+
+class RedemptionSubmissionBlocked(RuntimeError):
+    """Raised when a replacement-style resend cannot dislodge an existing pending tx."""
 
 
 class ProdRedemptionExecutor(ResolutionExecutor):
@@ -85,8 +94,18 @@ class ProdRedemptionExecutor(ResolutionExecutor):
                 for position in positions
             ]
 
-        tx_hash = None if self._dry_run else self._redeem_condition(resolution.condition_id)
-        status = "ready_to_redeem" if self._dry_run else "redeemed"
+        if self._dry_run:
+            status = "ready_to_redeem"
+            tx_hash = None
+        else:
+            try:
+                tx_result = self._redeem_condition(resolution.condition_id)
+            except RedemptionSubmissionBlocked:
+                status = "submission_blocked_underpriced"
+                tx_hash = None
+            else:
+                status = "redeemed" if tx_result.receipt_confirmed else "submitted_pending_receipt"
+                tx_hash = tx_result.tx_hash
         return [
             ResolutionScanResult(
                 condition_id=position.condition_id,
@@ -102,25 +121,47 @@ class ProdRedemptionExecutor(ResolutionExecutor):
             for position in positions
         ]
 
-    def _redeem_condition(self, condition_id: str) -> str:
-        tx = self._ctf.functions.redeemPositions(
-            self._collateral_address,
-            bytes(32),
-            _bytes32(condition_id),
-            _BINARY_INDEX_SETS,
-        ).build_transaction(
-            {
-                "from": self._wallet_address,
-                "nonce": self._w3.eth.get_transaction_count(self._wallet_address),
-                "chainId": self._chain_id,
-                "gasPrice": self._w3.eth.gas_price,
-            }
-        )
-        tx["gas"] = self._w3.eth.estimate_gas(tx)
-        signed = self._w3.eth.account.sign_transaction(tx, self._private_key)
-        tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-        self._w3.eth.wait_for_transaction_receipt(tx_hash)
-        return tx_hash.hex()
+    def _redeem_condition(self, condition_id: str) -> RedemptionTxResult:
+        nonce = self._w3.eth.get_transaction_count(self._wallet_address)
+        gas_price = self._w3.eth.gas_price
+        tx_hash = None
+        last_underpriced_exc: Web3RPCError | None = None
+        for _ in range(_REPLACEMENT_SEND_MAX_ATTEMPTS):
+            tx = self._ctf.functions.redeemPositions(
+                self._collateral_address,
+                bytes(32),
+                _bytes32(condition_id),
+                _BINARY_INDEX_SETS,
+            ).build_transaction(
+                {
+                    "from": self._wallet_address,
+                    "nonce": nonce,
+                    "chainId": self._chain_id,
+                    "gasPrice": gas_price,
+                }
+            )
+            tx["gas"] = self._w3.eth.estimate_gas(tx)
+            signed = self._w3.eth.account.sign_transaction(tx, self._private_key)
+            try:
+                tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
+                break
+            except Web3RPCError as exc:
+                if not _is_underpriced_replacement(exc):
+                    raise
+                last_underpriced_exc = exc
+                gas_price = _bump_gas_price(gas_price)
+        else:
+            raise RedemptionSubmissionBlocked(
+                f"Could not replace pending redemption transaction for nonce={nonce} "
+                f"after {_REPLACEMENT_SEND_MAX_ATTEMPTS} attempts"
+            ) from last_underpriced_exc
+
+        try:
+            self._w3.eth.wait_for_transaction_receipt(tx_hash)
+        except TimeExhausted:
+            return RedemptionTxResult(tx_hash=_format_tx_hash(tx_hash), receipt_confirmed=False)
+
+        return RedemptionTxResult(tx_hash=_format_tx_hash(tx_hash), receipt_confirmed=True)
 
 
 def _bytes32(value: str) -> bytes:
@@ -129,3 +170,16 @@ def _bytes32(value: str) -> bytes:
     if len(raw) != 32:
         raise ValueError(f"Expected 32-byte hex value, got {len(raw)} bytes")
     return raw
+
+
+def _is_underpriced_replacement(exc: Web3RPCError) -> bool:
+    return "replacement transaction underpriced" in str(exc).lower()
+
+
+def _bump_gas_price(gas_price: int) -> int:
+    return max(gas_price + 1, math.ceil(gas_price * _REPLACEMENT_GAS_BUMP_FACTOR))
+
+
+def _format_tx_hash(tx_hash) -> str:
+    value = tx_hash.hex()
+    return value if value.startswith("0x") else f"0x{value}"

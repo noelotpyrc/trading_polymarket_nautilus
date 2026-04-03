@@ -4,6 +4,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+try:
+    from web3.exceptions import TimeExhausted, Web3RPCError
+except Exception:  # pragma: no cover - optional dependency guard for tests/imports
+    TimeExhausted = ()
+    Web3RPCError = ()
+
+try:
+    from requests import RequestException
+except Exception:  # pragma: no cover - optional dependency guard for tests/imports
+    RequestException = ()
+
 from live.market_metadata import WindowMetadataRegistry
 from live.resolution import MarketResolution, fetch_market_resolution
 from live.sandbox_wallet import SandboxSettlementResult, SandboxWalletStore
@@ -21,6 +32,7 @@ class ResolutionScanResult:
     token_won: bool | None
     status: str
     transaction_hash: str | None = None
+    error_message: str | None = None
 
 
 class ResolutionExecutor(Protocol):
@@ -103,7 +115,17 @@ class ResolutionWorker:
 
         results: list[ResolutionScanResult] = []
         for condition_id, positions in grouped_positions.items():
-            resolution = self._resolution_fetcher(condition_id, positions[0].token_id)
+            try:
+                resolution = self._resolution_fetcher(condition_id, positions[0].token_id)
+            except Exception as exc:
+                results.extend(
+                    self._error_results_for_positions(
+                        positions=positions,
+                        status=_classify_worker_exception(stage="resolution", exc=exc),
+                        error_message=f"{exc.__class__.__name__}: {exc}",
+                    )
+                )
+                continue
             if not resolution.resolved or resolution.token_won is None:
                 for position in positions:
                     results.append(
@@ -120,8 +142,63 @@ class ResolutionWorker:
                     )
                 continue
 
-            results.extend(
-                self._executor.settle(positions=tuple(positions), resolution=resolution)
-            )
+            try:
+                results.extend(
+                    self._executor.settle(positions=tuple(positions), resolution=resolution)
+                )
+            except Exception as exc:
+                results.extend(
+                    self._error_results_for_positions(
+                        positions=positions,
+                        resolution=resolution,
+                        status=_classify_worker_exception(stage="redemption", exc=exc),
+                        error_message=f"{exc.__class__.__name__}: {exc}",
+                    )
+                )
 
         return results
+
+    def _error_results_for_positions(
+        self,
+        *,
+        positions: list[WalletTokenPosition],
+        status: str,
+        error_message: str,
+        resolution: MarketResolution | None = None,
+    ) -> list[ResolutionScanResult]:
+        results: list[ResolutionScanResult] = []
+        for position in positions:
+            token_won = (
+                None
+                if resolution is None or resolution.winning_token_id is None
+                else position.token_id == resolution.winning_token_id
+            )
+            settlement_price = None
+            if token_won is True:
+                settlement_price = 1.0
+            elif token_won is False:
+                settlement_price = 0.0
+            results.append(
+                ResolutionScanResult(
+                    condition_id=position.condition_id,
+                    instrument_id=position.instrument_id,
+                    token_id=position.token_id,
+                    position_size=position.size,
+                    resolved=resolution is not None and resolution.resolved,
+                    settlement_price=settlement_price,
+                    token_won=token_won,
+                    status=status,
+                    error_message=error_message,
+                )
+            )
+        return results
+
+
+def _classify_worker_exception(*, stage: str, exc: Exception) -> str:
+    if isinstance(exc, TimeExhausted):
+        return f"{stage}_error_confirmation"
+    if isinstance(exc, Web3RPCError):
+        return f"{stage}_error_rpc"
+    if isinstance(exc, (RequestException, ConnectionError, TimeoutError, OSError)):
+        return f"{stage}_error_transport"
+    return f"{stage}_error_unexpected"

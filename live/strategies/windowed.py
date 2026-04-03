@@ -32,6 +32,7 @@ class _InstrumentCleanupState:
 class WindowedPolymarketStrategy(Strategy):
     _QUOTE_STALE_AFTER_NS = 120_000_000_000
     _SIGNAL_BAR_STALE_AFTER_NS = 150_000_000_000
+    _ENTRY_SUBMIT_ACK_AFTER_NS = 5_000_000_000
     _ENTRY_ORDER_CANCEL_AFTER_NS = 90_000_000_000
     _ENTRY_ORDER_ESCALATE_AFTER_NS = 180_000_000_000
     _POSITION_CLEANUP_RETRY_INTERVAL_NS = 5_000_000_000
@@ -74,6 +75,8 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_order_instruments: dict[object, InstrumentId] = {}
         self._entry_orders_by_id: dict[object, object] = {}
         self._entry_orders_flatten_on_fill: set[object] = set()
+        self._entry_submit_ack_timer_names: dict[object, str] = {}
+        self._entry_submit_ack_order_ids: dict[str, object] = {}
         self._entry_order_timer_names: dict[object, tuple[str, str]] = {}
         self._entry_order_timeout_order_ids: dict[str, object] = {}
         self._position_cleanup_timer_names: dict[InstrumentId, str] = {}
@@ -124,7 +127,6 @@ class WindowedPolymarketStrategy(Strategy):
         self._process_stop_reason = reason
         self.log.warning(reason)
         self._cancel_pending_entry_order(reason)
-        self._close_positions_for_all_windows(reason=reason, monitor_cleanup=True)
         self._maybe_finalize_process_stop()
 
     def _window_alert_name(self) -> str:
@@ -137,7 +139,7 @@ class WindowedPolymarketStrategy(Strategy):
     def _stop_window_lifecycle(self) -> None:
         self._cancel_pending_entry_order("strategy stop")
         self._cancel_all_position_cleanup()
-        self._cancel_all_resolution_tracking()
+        self._cancel_all_resolution_polling()
         self._close_positions_for_all_windows(reason="strategy stop", monitor_cleanup=False)
 
     def _start_balance_guard(self) -> None:
@@ -595,6 +597,7 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_orders_by_id.pop(client_order_id, None)
         self._entry_orders_flatten_on_fill.discard(client_order_id)
         self._cancel_entry_order_timeouts(client_order_id)
+        self._cancel_entry_submit_ack_timeout(client_order_id)
 
     def _terminalize_ioc_order_from_truth(self, order, truth_status: OrderTruthStatus) -> bool:
         if self._is_order_closed(order):
@@ -734,6 +737,8 @@ class WindowedPolymarketStrategy(Strategy):
             self._pm_mid_ts_ns = tick.ts_event
 
     def _entry_guard_reason(self, signal_ts_ns: int) -> str | None:
+        if self._process_stop_requested or self._process_stop_dispatched:
+            return "process stop requested"
         balance_reason = self._operating_balance_shortfall_reason()
         if balance_reason is not None:
             return balance_reason
@@ -807,6 +812,7 @@ class WindowedPolymarketStrategy(Strategy):
         self._entry_orders_by_id[order.client_order_id] = order
         self._sync_order_in_sandbox_truth(order)
         self._schedule_entry_order_timeouts(order.client_order_id)
+        self._schedule_entry_submit_ack_timeout(order.client_order_id)
         self.submit_order(order)
 
     def _selected_outcome_label(self) -> str:
@@ -1004,6 +1010,29 @@ class WindowedPolymarketStrategy(Strategy):
             self._on_entry_order_escalation_timeout,
         )
 
+    def _schedule_entry_submit_ack_timeout(self, client_order_id) -> None:
+        timer_name = self._guard_timer_name(
+            "ENTRY-SUBMIT-ACK",
+            self._client_order_ref(client_order_id),
+        )
+        self._entry_submit_ack_timer_names[client_order_id] = timer_name
+        self._entry_submit_ack_order_ids[timer_name] = client_order_id
+        self._set_guard_time_alert(
+            timer_name,
+            self._now_ns() + self._ENTRY_SUBMIT_ACK_AFTER_NS,
+            self._on_entry_submit_ack_timeout,
+        )
+
+    def _cancel_entry_submit_ack_timeout(self, client_order_id) -> None:
+        timer_name = self._entry_submit_ack_timer_names.pop(client_order_id, None)
+        if timer_name is None:
+            return
+        self._entry_submit_ack_order_ids.pop(timer_name, None)
+        self._cancel_guard_timer(timer_name)
+
+    def _ack_entry_submit(self, client_order_id) -> None:
+        self._cancel_entry_submit_ack_timeout(client_order_id)
+
     def _cancel_entry_order_timeouts(self, client_order_id) -> None:
         timer_names = self._entry_order_timer_names.pop(client_order_id, None)
         if timer_names is None:
@@ -1012,6 +1041,28 @@ class WindowedPolymarketStrategy(Strategy):
         for timer_name in timer_names:
             self._entry_order_timeout_order_ids.pop(timer_name, None)
             self._cancel_guard_timer(timer_name)
+
+    def _handle_entry_submit_ack_timeout_for(self, client_order_id) -> None:
+        if not self._entry_order_pending or client_order_id != self._entry_order_client_id:
+            return
+
+        order = self._entry_orders_by_id.get(client_order_id)
+        if order is not None and getattr(order, "venue_order_id", None) is not None:
+            self._ack_entry_submit(client_order_id)
+            return
+
+        self._forget_entry_order_tracking(client_order_id)
+        self.log.warning(
+            f"Entry order {self._client_order_ref(client_order_id)} never received venue "
+            f"acknowledgement within {self._ENTRY_SUBMIT_ACK_AFTER_NS // 1_000_000_000}s "
+            "— clearing local state"
+        )
+
+    def _on_entry_submit_ack_timeout(self, event) -> None:
+        client_order_id = self._entry_submit_ack_order_ids.pop(self._guard_event_name(event), None)
+        if client_order_id is None:
+            return
+        self._handle_entry_submit_ack_timeout_for(client_order_id)
 
     def _handle_entry_order_cancel_timeout_for(self, client_order_id) -> None:
         if (
@@ -1116,6 +1167,10 @@ class WindowedPolymarketStrategy(Strategy):
         for instrument_id in list(self._resolution_timer_names):
             self._cancel_resolution_tracking(instrument_id)
 
+    def _cancel_all_resolution_polling(self) -> None:
+        for instrument_id in list(self._resolution_timer_names):
+            self._cancel_resolution_polling(instrument_id)
+
     def _carry_positions_to_resolution(self, instrument_id: InstrumentId, reason: str) -> None:
         self._cancel_position_cleanup(instrument_id)
         self._resolution_settled_instruments.discard(instrument_id)
@@ -1124,6 +1179,7 @@ class WindowedPolymarketStrategy(Strategy):
             f"Carrying residual position on {instrument_id} to market resolution ({reason})"
         )
         self._schedule_resolution_check(instrument_id)
+        self._maybe_finalize_process_stop()
 
     def _fetch_market_resolution(self, instrument_id: InstrumentId):
         return fetch_market_resolution(
@@ -1260,13 +1316,13 @@ class WindowedPolymarketStrategy(Strategy):
             return
         if self._position_cleanup_states:
             return
-        if self._resolution_pending_instruments:
-            return
         if self._ioc_orders_requiring_reconciliation():
             return
 
         for instrument_id_str, _ in self._windows:
             instrument_id = InstrumentId.from_str(instrument_id_str)
+            if instrument_id in self._resolution_pending_instruments:
+                continue
             if self._has_open_position_on_instrument(instrument_id):
                 return
 
@@ -1277,6 +1333,8 @@ class WindowedPolymarketStrategy(Strategy):
             return
 
         self._process_stop_dispatched = True
+        if reason is not None:
+            self._process_stop_reason = reason
         stop_reason = reason or self._process_stop_reason or "process stop requested"
         self.log.warning(f"Stopping node: {stop_reason}")
 
@@ -1329,6 +1387,7 @@ class WindowedPolymarketStrategy(Strategy):
         if client_order_id != self._entry_order_client_id:
             return
         self._cancel_entry_order_timeouts(client_order_id)
+        self._cancel_entry_submit_ack_timeout(client_order_id)
         self._entry_order = None
         self._entry_order_pending = False
         self._entry_order_client_id = None
@@ -1352,34 +1411,47 @@ class WindowedPolymarketStrategy(Strategy):
         self.log.warning(message)
         self._maybe_finalize_process_stop()
 
+    def on_order_submitted(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
+
+    def on_order_accepted(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
+
     def on_order_denied(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
         self._handle_entry_order_terminal(
             event.client_order_id,
             f"Entry order denied: {event.reason}",
         )
 
     def on_order_rejected(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
         self._handle_entry_order_terminal(
             event.client_order_id,
             f"Entry order rejected: {event.reason}",
         )
 
     def on_order_canceled(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
         self._handle_entry_order_terminal(
             event.client_order_id,
             f"Entry order canceled: {event.client_order_id}",
         )
 
     def on_order_expired(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
         self._handle_entry_order_terminal(
             event.client_order_id,
             f"Entry order expired: {event.client_order_id}",
         )
 
     def on_order_filled(self, event) -> None:
+        self._ack_entry_submit(event.client_order_id)
         self._record_fill_in_sandbox_wallet(event)
         self._record_fill_in_sandbox_order_truth(event)
         tracked_instrument_id = self._entry_order_instruments.get(event.client_order_id)
+        if event.order_side == OrderSide.BUY and event.instrument_id == self._pm_instrument_id:
+            self._entered_this_window = True
         is_late_fill = (
             tracked_instrument_id is not None
             and (
@@ -1403,7 +1475,6 @@ class WindowedPolymarketStrategy(Strategy):
             event.client_order_id == self._entry_order_client_id
             and event.order_side == OrderSide.BUY
         ):
-            self._entered_this_window = True
             self._clear_active_entry_order(event.client_order_id)
 
         self._trade_count += 1

@@ -270,6 +270,19 @@ class TestWindowedPolymarketStrategy:
 
         assert reason == "Free collateral 5.000000 below required entry cash 5.500000"
 
+    def test_entry_guard_rejects_when_process_stop_requested(self):
+        strategy = _strategy()
+        strategy._process_stop_requested = True
+        strategy._pm_mid_ts_ns = 0
+        strategy._pm_bid = 0.51
+        strategy._pm_bid_size = 100.0
+        strategy._pm_ask = 0.52
+        strategy._pm_ask_size = 100.0
+
+        reason = strategy._entry_guard_reason(30_000_000_000)
+
+        assert reason == "process stop requested"
+
     def test_entry_guard_allows_when_free_collateral_covers_trade_amount_plus_fee_buffer(self):
         strategy = _strategy()
         strategy._trade_amount = 5.0
@@ -307,6 +320,32 @@ class TestWindowedPolymarketStrategy:
         assert strategy.entry_order_kwargs["time_in_force"] == TimeInForce.IOC
         assert strategy._entry_orders_by_id["O-IOC"].client_order_id == "O-IOC"
         assert strategy.submitted_orders[0].client_order_id == "O-IOC"
+
+    def test_submit_entry_ack_timeout_clears_local_pending_state(self):
+        strategy = _strategy()
+
+        strategy._submit_entry_order(5.0)
+        strategy._handle_entry_submit_ack_timeout_for("O-IOC")
+
+        assert strategy._entry_order is None
+        assert strategy._entry_order_pending is False
+        assert strategy._entry_order_client_id is None
+        assert "O-IOC" not in strategy._entry_order_instruments
+        assert "O-IOC" not in strategy._entry_orders_by_id
+
+    def test_submit_entry_ack_timeout_callback_uses_timer_event_name(self):
+        strategy = _strategy()
+
+        strategy._submit_entry_order(5.0)
+        timer_name = strategy._entry_submit_ack_timer_names["O-IOC"]
+
+        strategy.trigger_guard(timer_name)
+
+        assert strategy._entry_order is None
+        assert strategy._entry_order_pending is False
+        assert strategy._entry_order_client_id is None
+        assert "O-IOC" not in strategy._entry_order_instruments
+        assert "O-IOC" not in strategy._entry_orders_by_id
 
     def test_reject_terminal_event_clears_pending_and_unblocks_reentry(self):
         strategy = _strategy()
@@ -585,6 +624,14 @@ class TestWindowedPolymarketStrategy:
 
         assert strategy.stop_called is True
 
+    def test_dispatch_process_stop_persists_explicit_reason(self):
+        strategy = _strategy()
+
+        strategy._dispatch_process_stop("manual reconciliation")
+
+        assert strategy.stop_called is True
+        assert strategy._process_stop_reason == "manual reconciliation"
+
     def test_rollover_cancels_pending_and_subscribes_new_before_old(self):
         strategy = _strategy()
         strategy._entry_order = DummyOrder("O-1")
@@ -735,6 +782,27 @@ class TestWindowedPolymarketStrategy:
         assert strategy.canceled_timer_names == ["POSITION-CLEANUP:a.POLYMARKET"]
         assert instrument not in strategy._position_cleanup_states
 
+    def test_late_buy_fill_on_current_window_consumes_entry_budget(self):
+        strategy = _strategy()
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy._pm_instrument_id = instrument
+        strategy._entry_order_instruments["O-1"] = instrument
+        strategy._entry_orders_flatten_on_fill.add("O-1")
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 5.0)]
+
+        strategy.on_order_filled(SimpleNamespace(
+            client_order_id="O-1",
+            instrument_id=instrument,
+            order_side=OrderSide.BUY,
+            last_px="0.99",
+            last_qty="5.0",
+        ))
+
+        assert strategy._entered_this_window is True
+        assert len(strategy.exit_submissions) == 1
+        assert strategy.exit_submissions[0]["instrument_id"] == instrument
+        assert strategy.exit_submissions[0]["quantity"] == 5.0
+
     def test_position_closed_cancels_residual_entry_order_for_instrument(self):
         strategy = _strategy()
         instrument = InstrumentId.from_str("a.POLYMARKET")
@@ -812,7 +880,7 @@ class TestWindowedPolymarketStrategy:
         assert instrument not in strategy._resolution_settled_instruments
         assert "RESOLUTION-CHECK:a.POLYMARKET" not in strategy.guard_alerts
 
-    def test_process_stop_does_not_dispatch_on_internal_resolution_only(self):
+    def test_process_stop_keeps_live_position_open_until_it_becomes_carried(self):
         strategy = _strategy()
         instrument = InstrumentId.from_str("a.POLYMARKET")
         strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 0.4)]
@@ -832,17 +900,19 @@ class TestWindowedPolymarketStrategy:
         strategy.request_process_stop("test stop")
 
         assert callbacks == []
-        assert strategy._resolution_pending_instruments == {instrument: "test stop"}
+        assert strategy.exit_submissions == []
+        assert strategy._process_stop_requested is True
+        assert strategy._resolution_pending_instruments == {}
 
-        strategy.trigger_guard("RESOLUTION-CHECK:a.POLYMARKET")
+        strategy._carry_positions_to_resolution(instrument, "window end")
 
-        assert callbacks == []
-        assert strategy._resolution_pending_instruments == {instrument: "test stop"}
-        assert "RESOLUTION-CHECK:a.POLYMARKET" not in strategy.guard_alerts
+        assert callbacks == ["stop"]
+        assert strategy._resolution_pending_instruments == {instrument: "window end"}
+        assert "RESOLUTION-CHECK:a.POLYMARKET" in strategy.guard_alerts
         assert instrument not in strategy._resolution_settled_instruments
         assert strategy.stop_called is False
 
-    def test_process_stop_dispatches_after_wallet_truth_reconciles_carried_residual(self):
+    def test_wallet_truth_still_reconciles_carried_residual_after_process_stop_dispatch(self):
         strategy = _wallet_strategy()
         instrument = InstrumentId.from_str("conda-tokena.POLYMARKET")
         strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 2.0)]
@@ -870,12 +940,41 @@ class TestWindowedPolymarketStrategy:
         strategy.set_wallet_truth_provider(FakeWalletTruthProvider())
 
         strategy.request_process_stop("test stop")
-        assert callbacks == []
+        assert callbacks == ["stop"]
 
         strategy._refresh_wallet_truth()
 
         assert callbacks == ["stop"]
         assert strategy.stop_called is False
+        assert strategy._resolution_pending_instruments == {}
+        assert strategy.positions_by_instrument[instrument] == []
+
+    def test_stop_window_lifecycle_preserves_carried_resolution_positions(self):
+        strategy = _strategy()
+        instrument = InstrumentId.from_str("a.POLYMARKET")
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 5.0)]
+        strategy._carry_positions_to_resolution(instrument, "window end")
+
+        strategy._stop_window_lifecycle()
+
+        assert strategy._resolution_pending_instruments == {instrument: "window end"}
+        assert "RESOLUTION-CHECK:a.POLYMARKET" not in strategy.guard_alerts
+        assert strategy.exit_submissions == []
+        assert strategy.positions_by_instrument[instrument][0].quantity == 5.0
+
+    def test_process_stop_still_waits_for_non_resolution_open_position(self):
+        strategy = _strategy()
+        instrument = strategy._pm_instrument_id
+        strategy.positions_by_instrument[instrument] = [DummyPosition(instrument, 1.0)]
+        callbacks = []
+        strategy.set_process_stop_callback(lambda: callbacks.append("stop"))
+        strategy._process_stop_requested = True
+        strategy._process_stop_reason = "test stop"
+
+        strategy._maybe_finalize_process_stop()
+
+        assert callbacks == []
+        assert strategy._process_stop_dispatched is False
 
     def test_process_stop_waits_for_stale_ioc_order_truth_reconciliation(self):
         strategy = _strategy()

@@ -37,3 +37,9 @@ def test_bootstrap_env_file_strips_flag_and_sets_env_path(tmp_path, monkeypatch)
 
     assert remaining == ["--once", "--interval-secs", "10"]
     assert Path(env.resolve_env_path()) == env_path.resolve()
+
+
+def test_resolve_polygon_rpc_url_prefers_env(monkeypatch):
+    monkeypatch.setenv(env.POLYGON_RPC_URL_VAR, "https://rpc.example")
+
+    assert env.resolve_polygon_rpc_url("https://default.example") == "https://rpc.example"

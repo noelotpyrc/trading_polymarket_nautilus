@@ -11,6 +11,7 @@ from dotenv import dotenv_values, load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_PATH = PROJECT_ROOT / ".env"
 ENV_FILE_VAR = "POLY_ENV_FILE"
+POLYGON_RPC_URL_VAR = "POLYGON_RPC_URL"
 
 
 def add_env_file_arg(parser: argparse.ArgumentParser) -> None:
@@ -42,6 +43,10 @@ def load_project_env(env_file: str | os.PathLike[str] | None = None) -> Path:
 
 def project_dotenv_values(env_file: str | os.PathLike[str] | None = None) -> dict[str, str | None]:
     return dotenv_values(resolve_env_path(env_file))
+
+
+def resolve_polygon_rpc_url(default: str) -> str:
+    return os.getenv(POLYGON_RPC_URL_VAR) or default
 
 
 def validate_required_env_vars(

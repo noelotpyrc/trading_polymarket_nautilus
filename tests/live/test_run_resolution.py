@@ -131,6 +131,127 @@ def test_main_once_live_prints_reference_only_note(monkeypatch, capsys, tmp_path
     assert latest["position_count"] == 0
 
 
+def test_main_once_artifacts_dir_writes_default_worker_artifacts(monkeypatch, tmp_path):
+    class FakeWorker:
+        def scan_once(self):
+            return [
+                ResolutionScanResult(
+                    condition_id="cond-1",
+                    instrument_id="cond-1-yes-1.POLYMARKET",
+                    token_id="yes-1",
+                    position_size=2.5,
+                    resolved=True,
+                    settlement_price=1.0,
+                    token_won=True,
+                    status="settled",
+                )
+            ]
+
+    monkeypatch.setattr(run_resolution, "load_profile", lambda name: _profile(mode="sandbox"))
+    monkeypatch.setattr(
+        run_resolution,
+        "resolve_upcoming_window_metadata",
+        lambda slug_pattern, **kwargs: _metadata(),
+    )
+    monkeypatch.setattr(run_resolution, "_build_worker", lambda **kwargs: FakeWorker())
+
+    artifacts_dir = tmp_path / "worker_artifacts"
+
+    run_resolution.main([
+        "btc_updown_15m_sandbox",
+        "--once",
+        "--sandbox-wallet-state-path",
+        "/tmp/wallet.json",
+        "--artifacts-dir",
+        str(artifacts_dir),
+    ])
+
+    log_text = (artifacts_dir / "worker.log").read_text(encoding="utf-8")
+    status = json.loads((artifacts_dir / "worker_status.json").read_text(encoding="utf-8"))
+    history = [
+        json.loads(line)
+        for line in (artifacts_dir / "worker_status_history.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert "Sandbox mode: startup window metadata is authoritative." in log_text
+    assert "cond-1-yes-1.POLYMARKET size=2.500000 status=settled settled=1.00" in log_text
+    assert status["component"] == "resolution_worker"
+    assert status["status_counts"] == {"settled": 1}
+    assert len(history) == 1
+
+
+def test_main_live_uses_polygon_rpc_url_from_env_when_cli_omitted(monkeypatch, tmp_path):
+    class FakeWorker:
+        def scan_once(self):
+            return []
+
+    calls = {}
+
+    monkeypatch.setenv("POLYGON_RPC_URL", "https://rpc.example")
+    monkeypatch.setattr(run_resolution, "load_profile", lambda name: _profile(mode="live"))
+    monkeypatch.setattr(
+        run_resolution,
+        "resolve_upcoming_window_metadata",
+        lambda slug_pattern, **kwargs: _metadata(),
+    )
+
+    def fake_build_worker(**kwargs):
+        calls.update(kwargs)
+        return FakeWorker()
+
+    monkeypatch.setattr(run_resolution, "_build_worker", fake_build_worker)
+
+    run_resolution.main([
+        "btc_updown_15m_live",
+        "--once",
+        "--status-path",
+        str(tmp_path / "status.json"),
+    ])
+
+    assert calls["rpc_url"] == "https://rpc.example"
+
+
+def test_main_continuous_survives_scan_exception_and_writes_error_status(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    class StopLoop(Exception):
+        pass
+
+    class FakeWorker:
+        def scan_once(self):
+            raise RuntimeError("scan exploded")
+
+    monkeypatch.setattr(run_resolution, "load_profile", lambda name: _profile(mode="live"))
+    monkeypatch.setattr(
+        run_resolution,
+        "resolve_upcoming_window_metadata",
+        lambda slug_pattern, **kwargs: _metadata(),
+    )
+    monkeypatch.setattr(run_resolution, "_build_worker", lambda **kwargs: FakeWorker())
+    monkeypatch.setattr(run_resolution.time, "sleep", lambda secs: (_ for _ in ()).throw(StopLoop()))
+
+    status_path = tmp_path / "status.json"
+
+    with pytest.raises(StopLoop):
+        run_resolution.main([
+            "btc_updown_15m_live",
+            "--status-path",
+            str(status_path),
+            "--interval-secs",
+            "30",
+        ])
+
+    out = capsys.readouterr().out
+    assert "Resolution worker scan error: RuntimeError: scan exploded" in out
+    latest = json.loads(status_path.read_text(encoding="utf-8"))
+    assert latest["status"] == "scan_error"
+    assert latest["last_error"] == "RuntimeError: scan exploded"
+    assert latest["position_count"] == 0
+
+
 def test_build_worker_requires_sandbox_state_path():
     registry = WindowMetadataRegistry(_metadata())
 

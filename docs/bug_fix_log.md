@@ -53,10 +53,12 @@ Each entry records:
 
 - Symptom:
   - guard/timer callbacks crashed because code assumed a synthetic event API
+  - this same failure pattern later resurfaced in submit-ack timeout handlers when a real runtime callback path was exercised without matching the production event shape
 - Root cause:
   - the runtime assumed `TimeEvent.to_str()`, but real Nautilus timer events use `.name`
 - Fix pattern:
   - bind timer logic to the real Nautilus event API, not test doubles
+  - cover the actual timer callback path in tests, not just the helper logic behind it
 - Main files:
   - [windowed.py](/Users/noel/projects/trading_polymarket_nautilus/live/strategies/windowed.py)
 - Proof:
@@ -316,6 +318,49 @@ Each entry records:
   - [test_soak.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_soak.py)
 - Current rule:
   - if the policy is unclear, improve telemetry before adding more stop logic
+
+## BF-16 — Synchronous Submit Failure Must Roll Back Local Pending State Immediately
+
+- Symptom:
+  - an order submit can fail immediately on the node side, but local strategy state can still remain latched as "pending"
+  - that then degrades into noisy cancel attempts and, later, manual-reconciliation stop guards
+- Root cause:
+  - local pending state was armed before a submit path that could fail synchronously
+  - if the submit failed before venue acknowledgement, no normal order callback existed to clean that state up
+- Fix pattern:
+  - add a short submit-ack guard that rolls back local pending state when no venue acknowledgement arrives
+  - treat synchronous submit failure as a first-class cleanup case, not something left to later cancel/reconcile paths
+- Main files:
+  - [windowed.py](/Users/noel/projects/trading_polymarket_nautilus/live/strategies/windowed.py)
+- Proof:
+  - [test_windowed_strategy.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_windowed_strategy.py)
+- Current rule:
+  - any submit path that can fail before venue acknowledgement needs an immediate local rollback path
+
+## TBD-09 — Resolution Worker Crashes On Redemption-Path Failures
+
+- Symptom:
+  - the external resolution worker could die on redemption-path exceptions
+  - after that:
+    - worker status stops updating
+    - carried positions can remain unresolved longer than intended
+    - operator alerts degrade from a business-state issue into a liveness issue too
+- Current diagnosis:
+  - redemption-path failures were able to escape the scan loop and kill the whole worker process instead of becoming retryable worker results
+- Fix pattern now landed in code:
+  - convert per-condition redemption failures into retryable/degraded worker results instead of process-fatal exceptions
+  - keep the continuous worker loop alive across scan failures
+  - keep node trading/stop orchestration separate from the standalone resolution worker process
+- Main files:
+  - [resolution_worker.py](/Users/noel/projects/trading_polymarket_nautilus/live/resolution_worker.py)
+  - [redemption.py](/Users/noel/projects/trading_polymarket_nautilus/live/redemption.py)
+  - [run_resolution.py](/Users/noel/projects/trading_polymarket_nautilus/live/run_resolution.py)
+  - [soak.py](/Users/noel/projects/trading_polymarket_nautilus/live/soak.py)
+- Proof:
+  - [test_run_resolution.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_run_resolution.py)
+  - [test_wallet_truth.py](/Users/noel/projects/trading_polymarket_nautilus/tests/live/test_wallet_truth.py)
+- Current rule:
+  - resolution/redeem failures should degrade worker state and retry later, not terminate the whole process
 
 ---
 

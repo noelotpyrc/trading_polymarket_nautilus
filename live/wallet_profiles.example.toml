@@ -1,0 +1,6 @@
+# Copy this file to live/wallet_profiles.toml and customize locally.
+# The real wallet profile file is ignored by git because it can reveal
+# operational wallet segmentation and env-file names.
+
+[example_profile]
+env_file = "vault/.env.example_profile"

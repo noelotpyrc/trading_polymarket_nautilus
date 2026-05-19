@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -12,7 +13,15 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from live.env import add_env_file_arg, bootstrap_env_file, load_project_env, validate_required_env_vars
+from live.env import (
+    ENV_FILE_VAR,
+    WALLET_PROFILE_VAR,
+    add_env_file_arg,
+    bootstrap_env_file,
+    load_project_env,
+    resolve_env_path,
+    validate_required_env_vars,
+)
 from live.profiles import ProfileError, RunnerProfile, available_profile_names, load_profile
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "logs" / "soak"
@@ -46,6 +55,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.with_alert_monitor and args.alert_monitor_interval_secs <= 0:
         parser.error("--alert-monitor-interval-secs must be positive")
 
+    wallet_profile = args.wallet_profile or os.getenv(WALLET_PROFILE_VAR)
+    env_file = None if wallet_profile is not None else args.env_file or os.getenv(ENV_FILE_VAR)
+
     try:
         batch = run_soak_batch(
             profile_refs=args.profiles,
@@ -64,7 +76,8 @@ def main(argv: list[str] | None = None) -> None:
             resolution_rpc_url=args.resolution_rpc_url,
             with_alert_monitor=args.with_alert_monitor,
             alert_monitor_interval_secs=args.alert_monitor_interval_secs,
-            env_file=args.env_file,
+            env_file=env_file,
+            wallet_profile=wallet_profile,
         )
     except (ProfileError, ValueError) as exc:
         raise SystemExit(str(exc)) from exc
@@ -93,7 +106,10 @@ def run_soak_batch(
     with_alert_monitor: bool = False,
     alert_monitor_interval_secs: int = 15,
     env_file: str | None = None,
+    wallet_profile: str | None = None,
 ) -> dict[str, object]:
+    if env_file is not None and wallet_profile is not None:
+        raise ValueError("env_file and wallet_profile are mutually exclusive")
     if with_resolution_worker:
         raise ValueError(
             "soak.py no longer launches the resolution worker; run live/run_resolution.py separately"
@@ -136,6 +152,7 @@ def run_soak_batch(
             with_alert_monitor=with_alert_monitor,
             alert_monitor_interval_secs=alert_monitor_interval_secs,
             env_file=env_file,
+            wallet_profile=wallet_profile,
         )
         results.append(result)
         if result["status"] != "passed":
@@ -161,6 +178,7 @@ def run_soak_batch(
         "with_alert_monitor": with_alert_monitor,
         "alert_monitor_interval_secs": alert_monitor_interval_secs if with_alert_monitor else None,
         "env_file": env_file,
+        "wallet_profile": wallet_profile,
         "results": results,
     }
     _write_json(batch_dir / "summary.json", batch_summary)
@@ -247,6 +265,7 @@ def _run_profile(
     with_alert_monitor: bool,
     alert_monitor_interval_secs: int,
     env_file: str | None,
+    wallet_profile: str | None,
 ) -> dict[str, object]:
     run_dir = batch_dir / f"{index:02d}_{_safe_name(profile.name)}"
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -256,7 +275,9 @@ def _run_profile(
         str(PROJECT_ROOT / "live" / "runs" / "profile.py"),
         _command_profile_ref(profile_ref, fallback_name=profile.name),
     ]
-    if env_file is not None:
+    if wallet_profile is not None:
+        command.extend(["--wallet-profile", wallet_profile])
+    elif env_file is not None:
         command.extend(["--env-file", env_file])
     command.extend(["--hours-ahead", str(profile.hours_ahead)])
     if profile.run_secs is not None:
@@ -304,7 +325,12 @@ def _run_profile(
 
     preflight_error: str | None = None
     try:
-        validate_required_env_vars(sandbox=profile.sandbox, env_file=env_file)
+        validation_env_file = (
+            str(resolve_env_path(wallet_profile=wallet_profile))
+            if wallet_profile is not None
+            else env_file
+        )
+        validate_required_env_vars(sandbox=profile.sandbox, env_file=validation_env_file)
     except SystemExit as exc:
         preflight_error = str(exc)
 
@@ -352,6 +378,7 @@ def _run_profile(
             "alert_monitor_exit_code": None,
             "alert_monitor_terminated_by_harness": False,
             "alert_monitor_interval_secs": alert_monitor_interval_secs if with_alert_monitor else None,
+            "wallet_profile": wallet_profile,
         }
         _write_json(run_dir / "summary.json", result)
         return result
@@ -458,6 +485,7 @@ def _run_profile(
         "alert_monitor_failed": alert_monitor_failed,
         "alert_monitor_terminated_by_harness": alert_monitor_terminated,
         "alert_monitor_interval_secs": alert_monitor_interval_secs if with_alert_monitor else None,
+        "wallet_profile": wallet_profile,
     }
     _write_json(run_dir / "summary.json", result)
     return result

@@ -437,6 +437,46 @@ class TestRunSoakBatch:
         assert result["command"][3:5] == ["--env-file", "/tmp/live_wallet.env"]
         assert result["worker_command"] is None
 
+    def test_batch_forwards_wallet_profile_to_runner(self, tmp_path, monkeypatch):
+        profile = _profile(name="random_signal_15m_resolution_sandbox", run_secs=600)
+        times = iter([
+            datetime(2026, 3, 12, 15, 0, 0, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 1, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 5, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 10, tzinfo=timezone.utc),
+            datetime(2026, 3, 12, 15, 0, 14, tzinfo=timezone.utc),
+        ])
+
+        monkeypatch.setattr(soak, "_utc_now", lambda: next(times))
+        monkeypatch.setattr(soak, "load_profile", lambda ref: profile)
+        _allow_env_validation(monkeypatch)
+
+        def fake_run(command, cwd, stdout, stderr, text, check):
+            stdout.write("runner output\n")
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(soak.subprocess, "run", fake_run)
+
+        batch = soak.run_soak_batch(
+            profile_refs=["random_signal_15m_resolution_sandbox"],
+            run_secs=600,
+            hours_ahead=None,
+            output_root=tmp_path,
+            label=None,
+            keep_going=False,
+            allow_live=False,
+            allow_unbounded=False,
+            sandbox_wallet_state_path=None,
+            sandbox_starting_usdc=None,
+            wallet_profile="prod_vol_signal_yes_ff",
+        )
+
+        result = batch["results"][0]
+
+        assert batch["wallet_profile"] == "prod_vol_signal_yes_ff"
+        assert result["command"][3:5] == ["--wallet-profile", "prod_vol_signal_yes_ff"]
+        assert "--env-file" not in result["command"]
+
     def test_batch_can_run_live_profile_without_resolution_worker(self, tmp_path, monkeypatch):
         profile = _profile(name="btc_updown_15m_live_worker", mode="live", run_secs=600)
         times = iter([
